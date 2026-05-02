@@ -34,11 +34,14 @@
 
 #include "../menu_driver.h"
 #include "../../configuration.h"
+#include "../../content.h"
+#include "../../core_info.h"
 #include "../../defaults.h"
 #include "../../gfx/gfx_display.h"
 #include "../../gfx/font_driver.h"
 #include "../../gfx/video_driver.h"
 #include "../../playlist.h"
+#include "../../tasks/task_content.h"
 #include "../../verbosity.h"
 
 /* Reference design height in pixels — the mockup was drawn at this size,
@@ -56,12 +59,28 @@
 
 /* One Roms/<folder> that conformed to the "Display Name (core_ident)"
  * convention.  Folders without that suffix are dropped during scan, so
- * by the time a downplay_system_t exists, both fields are non-empty. */
+ * by the time a downplay_system_t exists, both fields are non-empty.
+ * full_path is the absolute folder path (used to scan its contents on
+ * drill-in). */
 typedef struct
 {
    char *display_name;
    char *core_ident;
+   char *full_path;
 } downplay_system_t;
+
+/* One ROM file inside a system folder, expanded for the system view. */
+typedef struct
+{
+   char *display_name;   /* basename minus extension */
+   char *full_path;
+} downplay_rom_t;
+
+enum downplay_view
+{
+   DOWNPLAY_VIEW_TOP = 0,    /* recents header + system list */
+   DOWNPLAY_VIEW_SYSTEM      /* drilled into one system; showing its ROMs */
+};
 
 typedef struct
 {
@@ -91,13 +110,21 @@ typedef struct
     * NULL when system_count == 0. */
    downplay_system_t  *systems;
    size_t              system_count;
-   uintptr_t           pill_cap_tex;  /* RGBA circle, used for rounded ends */
+   /* Populated only while view == DOWNPLAY_VIEW_SYSTEM. */
+   downplay_rom_t     *roms;
+   size_t              rom_count;
+   size_t              active_system;     /* index into systems */
+   size_t              top_selection;     /* saved cursor for return-to-top */
+   uintptr_t           pill_cap_tex;      /* RGBA circle, rounded pill ends */
    downplay_layout_t   layout;
+   /* Cursor for whichever view is active. */
    size_t              selection;
+   enum downplay_view  view;
    /* Number of entries in g_defaults.content_history at last rebuild.
     * 0 hides the "Recently Played" row entirely. */
    size_t              recent_count;
-   /* Cached: (recent_count > 0 ? 1 : 0) + system_count. */
+   /* Cached: rows in the current view (TOP: recents header + systems;
+    * SYSTEM: rom_count). */
    size_t              total_rows;
 } downplay_handle_t;
 
@@ -130,16 +157,23 @@ static float DP_COLOR_PILL_DARK[16] = {
 
 /* ---------- list (systems + recents) ---------- */
 
-/* True when row 0 is the "Recently Played" header and rows 1.. are systems;
- * false when there are no recents and rows 0.. are systems directly. */
+/* TOP-view only: row 0 is "Recently Played" iff there are recent entries. */
 static bool downplay_has_recents_row(const downplay_handle_t *dp)
 {
-   return dp->recent_count > 0;
+   return dp->view == DOWNPLAY_VIEW_TOP && dp->recent_count > 0;
 }
 
 static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
 {
    size_t sys_idx;
+
+   if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+   {
+      if (dp->roms && row < dp->rom_count)
+         return dp->roms[row].display_name;
+      return "";
+   }
+
    if (downplay_has_recents_row(dp))
    {
       if (row == 0)
@@ -244,8 +278,22 @@ static void downplay_systems_free(downplay_system_t *systems, size_t count)
    {
       free(systems[i].display_name);
       free(systems[i].core_ident);
+      free(systems[i].full_path);
    }
    free(systems);
+}
+
+static void downplay_roms_free(downplay_rom_t *roms, size_t count)
+{
+   size_t i;
+   if (!roms)
+      return;
+   for (i = 0; i < count; i++)
+   {
+      free(roms[i].display_name);
+      free(roms[i].full_path);
+   }
+   free(roms);
 }
 
 /* True if the folder contains at least one regular file anywhere in its
@@ -337,9 +385,19 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
          systems = grown;
          cap     = new_cap;
       }
-      systems[count].display_name = display;
-      systems[count].core_ident   = ident;
-      count++;
+      {
+         char *full = strdup(raw->elems[i].data);
+         if (!full)
+         {
+            free(display);
+            free(ident);
+            break;
+         }
+         systems[count].display_name = display;
+         systems[count].core_ident   = ident;
+         systems[count].full_path    = full;
+         count++;
+      }
    }
    string_list_free(raw);
 
@@ -350,11 +408,196 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
    return systems;
 }
 
+static int downplay_rom_cmp(const void *a, const void *b)
+{
+   const downplay_rom_t *ra = (const downplay_rom_t*)a;
+   const downplay_rom_t *rb = (const downplay_rom_t*)b;
+   return strcasecmp(ra->display_name, rb->display_name);
+}
+
+/* Scan one system folder for ROMs.  Top-level files only (subfolders
+ * deferred); .zip and other archives included since libretro cores
+ * read them directly via the VFS layer. */
+static downplay_rom_t *downplay_scan_roms(const char *system_path,
+      size_t *out_count)
+{
+   struct string_list *raw;
+   downplay_rom_t     *roms  = NULL;
+   size_t              cap   = 0;
+   size_t              count = 0;
+   size_t              i;
+
+   *out_count = 0;
+   if (!system_path || !*system_path)
+      return NULL;
+
+   raw = dir_list_new(system_path, NULL,
+         false /* include_dirs */, false, false, false /* not recursive */);
+   if (!raw)
+      return NULL;
+
+   for (i = 0; i < raw->size; i++)
+   {
+      const char *full = raw->elems[i].data;
+      char        base[NAME_MAX_LENGTH];
+      char       *display;
+
+      if (!full || !*full)
+         continue;
+      fill_pathname_base(base, full, sizeof(base));
+      if (!*base || base[0] == '.')
+         continue;
+      path_remove_extension(base);
+      if (!*base)
+         continue;
+
+      if (count == cap)
+      {
+         size_t          new_cap = cap ? cap * 2 : 16;
+         downplay_rom_t *grown   = (downplay_rom_t*)realloc(roms,
+               new_cap * sizeof(*roms));
+         if (!grown)
+            break;
+         roms = grown;
+         cap  = new_cap;
+      }
+      {
+         char *path_dup;
+         if (!(display = strdup(base)))
+            break;
+         if (!(path_dup = strdup(full)))
+         {
+            free(display);
+            break;
+         }
+         roms[count].display_name = display;
+         roms[count].full_path    = path_dup;
+         count++;
+      }
+   }
+   string_list_free(raw);
+
+   if (count > 1)
+      qsort(roms, count, sizeof(*roms), downplay_rom_cmp);
+
+   *out_count = count;
+   return roms;
+}
+
+static void downplay_recompute_total_rows(downplay_handle_t *dp)
+{
+   if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+      dp->total_rows = dp->rom_count;
+   else
+      dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0)
+                     + dp->system_count;
+
+   if (dp->total_rows == 0)
+      dp->selection = 0;
+   else if (dp->selection >= dp->total_rows)
+      dp->selection = dp->total_rows - 1;
+}
+
+/* Drill into a system's ROM list.  Saves the top-level cursor so we can
+ * restore it on return.  No-op when sys_idx is out of range. */
+static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
+{
+   if (!dp->systems || sys_idx >= dp->system_count)
+      return;
+
+   downplay_roms_free(dp->roms, dp->rom_count);
+   dp->roms      = NULL;
+   dp->rom_count = 0;
+   dp->roms      = downplay_scan_roms(dp->systems[sys_idx].full_path,
+         &dp->rom_count);
+
+   dp->top_selection = dp->selection;
+   dp->active_system = sys_idx;
+   dp->view          = DOWNPLAY_VIEW_SYSTEM;
+   dp->selection     = 0;
+   downplay_recompute_total_rows(dp);
+}
+
+static void downplay_close_system(downplay_handle_t *dp)
+{
+   downplay_roms_free(dp->roms, dp->rom_count);
+   dp->roms      = NULL;
+   dp->rom_count = 0;
+   dp->view      = DOWNPLAY_VIEW_TOP;
+   dp->selection = dp->top_selection;
+   downplay_recompute_total_rows(dp);
+}
+
+/* Resolve "<core_ident>_libretro" via core_info_find into a caller-owned
+ * buffer.  The match keys on the filename's "core file id"; an
+ * extensionless stem hits the same path.  Returns false (and leaves
+ * out_path empty) if no installed core matches.  Lazy-download for the
+ * missing case is plan M3.
+ *
+ * Copying out the path matters: core_info_t->path is owned by the global
+ * core_info list, which the load-content path may reload mid-call. */
+static bool downplay_resolve_core_path(const char *core_ident,
+      char *out_path, size_t out_len)
+{
+   char         lookup[NAME_MAX_LENGTH];
+   core_info_t *info = NULL;
+
+   if (out_path && out_len)
+      out_path[0] = '\0';
+   if (!core_ident || !*core_ident || !out_path || !out_len)
+      return false;
+   snprintf(lookup, sizeof(lookup), "%s_libretro", core_ident);
+   if (!core_info_find(lookup, &info) || !info || !info->path)
+      return false;
+   strlcpy(out_path, info->path, out_len);
+   return true;
+}
+
+static void downplay_launch_rom(const char *core_ident, const char *rom_path)
+{
+   char               core_path[PATH_MAX_LENGTH];
+   content_ctx_info_t content_info;
+
+   if (!downplay_resolve_core_path(core_ident, core_path, sizeof(core_path)))
+   {
+      /* Lazy-download lands in plan M3.  For now, surface the miss to
+       * the log so it's diagnosable. */
+      RARCH_WARN("[Downplay] core not installed: %s\n", core_ident);
+      return;
+   }
+
+   content_info.argc        = 0;
+   content_info.argv        = NULL;
+   content_info.args        = NULL;
+   content_info.environ_get = NULL;
+
+   /* Note: PLAN.md mentions calling menu_driver_set_last_start_content for
+    * state consistency, but that helper is static in menu_cbs_ok.c.  Skip
+    * for now; revisit if the omission shows up as a visible bug. */
+   if (!task_push_load_content_with_new_core_from_menu(
+            core_path, rom_path, &content_info,
+            CORE_TYPE_PLAIN, NULL, NULL))
+      RARCH_ERR("[Downplay] task_push_load_content failed for '%s'\n",
+            rom_path);
+}
+
 static void downplay_rebuild_lists(downplay_handle_t *dp)
 {
    char        expanded[PATH_MAX_LENGTH];
    settings_t *settings   = config_get_ptr();
    const char *root       = settings ? settings->paths.directory_menu_content : NULL;
+
+   /* If a future caller triggers rebuild while drilled in, drop ROM state
+    * and snap back to TOP.  active_system would otherwise index into a
+    * stale systems array. */
+   if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+   {
+      downplay_roms_free(dp->roms, dp->rom_count);
+      dp->roms      = NULL;
+      dp->rom_count = 0;
+      dp->view      = DOWNPLAY_VIEW_TOP;
+      dp->selection = 0;
+   }
 
    /* directory_menu_content is stored verbatim — RA doesn't expand "~" or
     * ":/" prefixes for this setting (see configuration.c).  Expand here so
@@ -377,12 +620,7 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
    dp->recent_count = g_defaults.content_history
                       ? playlist_size(g_defaults.content_history) : 0;
 
-   dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0) + dp->system_count;
-
-   if (dp->total_rows == 0)
-      dp->selection = 0;
-   else if (dp->selection >= dp->total_rows)
-      dp->selection = dp->total_rows - 1;
+   downplay_recompute_total_rows(dp);
 }
 
 /* ---------- layout ---------- */
@@ -814,11 +1052,33 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          return 0;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:
-         RARCH_LOG("[Downplay] open: %s\n",
-               downplay_row_label(dp, dp->selection));
+         if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+         {
+            const downplay_system_t *sys = &dp->systems[dp->active_system];
+            const downplay_rom_t    *rom = &dp->roms[dp->selection];
+            downplay_launch_rom(sys->core_ident, rom->full_path);
+            return 0;
+         }
+         /* TOP view */
+         if (downplay_has_recents_row(dp) && dp->selection == 0)
+         {
+            /* Recents drill-in is plan M4. */
+            RARCH_LOG("[Downplay] recents (TODO)\n");
+            return 0;
+         }
+         {
+            size_t sys_idx = downplay_has_recents_row(dp)
+               ? dp->selection - 1 : dp->selection;
+            downplay_open_system(dp, sys_idx);
+         }
          return 0;
       case MENU_ACTION_CANCEL:
-         RARCH_LOG("[Downplay] cancel\n");
+         if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+         {
+            downplay_close_system(dp);
+            return 0;
+         }
+         /* TOP view: nothing to back out to.  Stay put. */
          return 0;
       default:
          break;
@@ -869,9 +1129,10 @@ static void downplay_menu_free(void *data)
    if (!dp)
       return;
    downplay_menu_context_destroy(dp);
-   /* systems is CPU-only state, freed here rather than in context_destroy
-    * so it survives GPU context loss/reset cycles. */
+   /* systems / roms are CPU-only state, freed here rather than in
+    * context_destroy so they survive GPU context loss/reset cycles. */
    downplay_systems_free(dp->systems, dp->system_count);
+   downplay_roms_free(dp->roms, dp->rom_count);
    free(dp);
 }
 

@@ -137,22 +137,22 @@ The roadmap is a sequence of derisking milestones. Each milestone is a working, 
 
 - [ ] Implement `downplay_paths.c`: locate `Downplay/` at storage root. On desktop, look at `~/Downplay/`. On Android, walk the three storage tiers from `frontend/drivers/platform_unix.c:105–109,1810–1867` and pick the first writable one with a `Downplay/` directory (or the first writable one at all, for bootstrap). *(Deferred. Currently we read `settings->paths.directory_menu_content` (RA's `rgui_browser_directory`) and let the user point it at `~/Downplay/Roms`. Factoring into `downplay_paths.c` lands with M5/M6 when Android needs it.)*
 - [x] Implement `downplay_systems.c`: enumerate `Roms/` via `dir_list_new()`. Parse each subfolder name with the `^(.+) \(([a-z0-9_]+)\)$` rule. Folders without a parens suffix are dropped. Returns a list of `{ display_name, core_ident, path }`. *(Lives inline in `menu/drivers/downplay.c` for now; extract to its own module when a second consumer appears. Also drops empty folders so the launcher only shows rows the user can drill into.)*
-- [ ] Render the system list as the top of the Browse view; selecting a system reveals its ROMs. *(System list ✅. ROM drill-in pending.)*
+- [x] Render the system list as the top of the Browse view; selecting a system reveals its ROMs.
 - [x] Use `gfx_display_*` APIs and `gfx_display_font_file()`. Reuse RGUI's font path for the prototype (no custom asset bundle yet). *(Using bundled InterTight-Bold.ttf instead — per the MinUI-style visual direction; falls back to the renderer's built-in font.)*
 - [x] Standard navigation only (`MENU_ACTION_UP/DOWN/OK/CANCEL`) via driver navigation callbacks. *(Implemented as an `entry_action` override since we own a single hardcoded list, not a `file_list_t`.)*
-- [ ] Selecting a ROM still just logs — no launch yet. *(Selecting a system logs today; ROM list comes with the drill-in.)*
+- [x] Selecting a ROM still just logs — no launch yet. *(Superseded — actual launch is implemented in M2 below; this milestone's exit criterion is met by reaching the ROM list.)*
 
-**Exit criterion:** drop ROMs into `Downplay/Roms/Super Nintendo (snes9x)/`, see the system and ROMs in the UI. *(Systems visible; ROM drill-in still TODO.)*
+**Exit criterion:** drop ROMs into `Downplay/Roms/Super Nintendo (snes9x)/`, see the system and ROMs in the UI. ✅
 
-### M2 — Launch using the parsed core ident *(derisks: content-load path from our driver)*
+### M2 — Launch using the parsed core ident *(derisks: content-load path from our driver)* ✅
 
-- [ ] Resolve `core_ident` → installed core path: lookup in `core_info_list` (`core_info.h`); if installed, get the local file path. Defer the not-installed case to M3.
-- [ ] On select, call `task_push_load_content_with_new_core_from_menu(core_path, fullpath, &content_info, CORE_TYPE_PLAIN, NULL, NULL)` (`tasks/task_content.c:2312`). Pattern crib: `menu/cbs/menu_cbs_ok.c:2095–2110`.
-- [ ] Call `menu_driver_set_last_start_content()` for state consistency.
-- [ ] Stash any custom driver state in `menu_st->driver_data` before launch.
-- [ ] Returning from the core lands back in Downplay, not XMB.
+- [x] Resolve `core_ident` → installed core path: lookup in `core_info_list` (`core_info.h`); if installed, get the local file path. Defer the not-installed case to M3. *(Via `core_info_find("<ident>_libretro", …)`; missing-core case logs and stays put.)*
+- [x] On select, call `task_push_load_content_with_new_core_from_menu(core_path, fullpath, &content_info, CORE_TYPE_PLAIN, NULL, NULL)` (`tasks/task_content.c:2312`). Pattern crib: `menu/cbs/menu_cbs_ok.c:2095–2110`.
+- [ ] Call `menu_driver_set_last_start_content()` for state consistency. *(Skipped — the helper is `static` in `menu_cbs_ok.c`. Revisit only if its absence shows up as a visible bug; otherwise fold into M7 polish.)*
+- [x] Stash any custom driver state in `menu_st->driver_data` before launch. *(Already there — Downplay's handle is the second arg to `init`, which the framework stores as `driver_data`.)*
+- [x] Returning from the core lands back in Downplay, not XMB. *(Verified live with gambatte.)*
 
-**Exit criterion:** with snes9x already installed, picking a ROM in `Super Nintendo (snes9x)/` launches and returns cleanly.
+**Exit criterion:** with snes9x already installed, picking a ROM in `Super Nintendo (snes9x)/` launches and returns cleanly. *(Met live with gambatte/Game Boy.)*
 
 ### M3 — Lazy core download *(derisks: the MinUI "magic")*
 
