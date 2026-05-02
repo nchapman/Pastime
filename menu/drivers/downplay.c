@@ -34,6 +34,7 @@
 #include "../../gfx/gfx_display.h"
 #include "../../gfx/font_driver.h"
 #include "../../gfx/video_driver.h"
+#include "../../verbosity.h"
 
 /* Reference design height in pixels — the mockup was drawn at this size,
  * and every dimension below is a fraction of it.  Scaling to any actual
@@ -504,6 +505,44 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    }
 }
 
+/* ---------- input ---------- */
+
+/* M2: own the navigation entirely.  We don't have a backing menu list, so
+ * generic_menu_entry_action() (which assumes file_list_t-driven entries)
+ * isn't useful — we mutate dp->selection directly and consume the action.
+ * OK/CANCEL just log for now; real navigation targets land in M3+. */
+static int downplay_entry_action(void *userdata, menu_entry_t *entry,
+      size_t i, enum menu_action action)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   if (!dp)
+      return -1;
+
+   switch (action)
+   {
+      case MENU_ACTION_UP:
+         dp->selection = (dp->selection + DOWNPLAY_STUB_COUNT - 1)
+                       % DOWNPLAY_STUB_COUNT;
+         return 0;
+      case MENU_ACTION_DOWN:
+         dp->selection = (dp->selection + 1) % DOWNPLAY_STUB_COUNT;
+         return 0;
+      case MENU_ACTION_OK:
+      case MENU_ACTION_SELECT:
+         RARCH_LOG("[Downplay] open: %s\n",
+               downplay_stub_items[dp->selection]);
+         return 0;
+      case MENU_ACTION_CANCEL:
+         RARCH_LOG("[Downplay] cancel\n");
+         return 0;
+      default:
+         break;
+   }
+   /* Returning 0 = action not consumed but no error; the framework
+    * iterate loop treats any non-zero return as fatal and aborts. */
+   return 0;
+}
+
 /* ---------- lifecycle ---------- */
 
 static void *downplay_menu_init(void **userdata, bool video_is_threaded)
@@ -613,5 +652,5 @@ menu_ctx_driver_t menu_ctx_downplay = {
    NULL,                              /* update_savestate_thumbnail_image */
    NULL,                              /* pointer_down */
    NULL,                              /* pointer_up */
-   NULL                               /* entry_action */
+   downplay_entry_action
 };
