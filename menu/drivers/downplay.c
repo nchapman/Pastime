@@ -22,8 +22,11 @@
  * layout works at any resolution / DPI. */
 
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
 
 #include <boolean.h>
 #include <file/file_path.h>
@@ -39,6 +42,7 @@
 #include "../../core_info.h"
 #include "../../defaults.h"
 #include "../../gfx/gfx_display.h"
+#include "../../gfx/gfx_thumbnail.h"
 #include "../../gfx/font_driver.h"
 #include "../../gfx/video_driver.h"
 #include "../../paths.h"
@@ -96,8 +100,50 @@ enum downplay_view
    DOWNPLAY_VIEW_TOP = 0,    /* recents header + system list */
    DOWNPLAY_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
    DOWNPLAY_VIEW_RECENTS,    /* drilled into recents history */
-   DOWNPLAY_VIEW_INGAME      /* core running; show Continue/Quit overlay */
+   DOWNPLAY_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
+   DOWNPLAY_VIEW_SAVE_PICKER /* drilled into save-state list (M7) */
 };
+
+/* INGAME row composition is conditional: Save hidden when the core
+ * doesn't support savestates; Load hidden when no manual saves exist
+ * yet.  We build this small action array on view enter so row labels
+ * and OK dispatch share one source of truth (no parallel arrays
+ * drifting). */
+enum downplay_ingame_action
+{
+   DP_INGAME_CONTINUE = 0,
+   DP_INGAME_SAVE,
+   DP_INGAME_LOAD,
+   DP_INGAME_QUIT
+};
+
+/* Save-state UX (M7).  RetroArch supports slots 0..999 but 10 manual
+ * slots is the MinUI cap — comfortably fits a list of thumbnails on
+ * one screen and keeps flash wear bounded for handhelds. */
+#define DOWNPLAY_MAX_MANUAL_SLOTS  10
+#define DOWNPLAY_MAX_SAVE_ENTRIES (DOWNPLAY_MAX_MANUAL_SLOTS + 1) /* +1 for .auto */
+
+typedef struct
+{
+   /* slot in {-1, 0..9}.  -1 means the .auto autosave. */
+   int        slot;
+   /* Filesystem mtime in seconds (0 if stat failed; entries with mtime
+    * == 0 are dropped during enumeration so we never present them). */
+   int64_t    mtime;
+   /* GPU texture for the per-state thumbnail PNG.  0 when the file
+    * doesn't exist or upload failed; renderer falls back to a flat
+    * placeholder rect in that case. */
+   uintptr_t  thumb_tex;
+   unsigned   thumb_w;
+   unsigned   thumb_h;
+   /* Reserved for the future Lock feature (PLAN.md M7 follow-up).
+    * pick_next_save_slot already filters on this so a future on-disk
+    * lock-sidecar reader can flip it without further plumbing. */
+   bool       locked;
+   /* Pre-formatted relative-time label, e.g. "5 minutes ago" or
+    * "Auto".  Built once on enumeration; the picker just draws it. */
+   char       label[40];
+} downplay_save_entry_t;
 
 typedef struct
 {
@@ -183,6 +229,32 @@ typedef struct
     * future footgun. */
    char                pending_launch_core[PATH_MAX_LENGTH];
    char                pending_launch_rom[PATH_MAX_LENGTH];
+
+   /* INGAME view row composition.  Built on the running→ingame
+    * transition (and refreshed after a Save action), so row_label and
+    * OK dispatch read the same array.  ingame_action_count is in
+    * [2,4]: Continue + Quit are unconditional, Save and Load are
+    * conditional on core_info_current_supports_savestate() and
+    * whether manual saves exist on disk. */
+   enum downplay_ingame_action ingame_actions[4];
+   size_t              ingame_action_count;
+
+   /* Save-state picker (DOWNPLAY_VIEW_SAVE_PICKER).  Cached on view
+    * enter, freed (textures unloaded) on view exit.  Sorted desc by
+    * mtime; entry 0 is always the most recent.  Includes .auto if it
+    * exists alongside manual slots. */
+   downplay_save_entry_t save_picker[DOWNPLAY_MAX_SAVE_ENTRIES];
+   size_t              save_picker_count;
+
+   /* Cached "Resume <Game>" availability for the launcher's TOP view.
+    * Refreshed on rebuild_lists; if true, a Resume row is prepended
+    * above Recents.  Stores the most-recent recents playlist index so
+    * selection dispatches to downplay_launch_recent without re-
+    * searching. */
+   bool                resume_available;
+   size_t              resume_pl_idx;
+   /* Pre-formatted "Resume Foo" label, mutated only on rebuild. */
+   char                resume_label[NAME_MAX_LENGTH];
 } downplay_handle_t;
 
 /* Solid colors expressed as 4×RGBA (one vertex each, flat shaded).  Kept
@@ -219,10 +291,29 @@ static float DP_COLOR_PILL_DARK[16] = {
 
 /* ---------- list (systems + recents) ---------- */
 
-/* TOP-view only: row 0 is "Recently Played" iff there are recent entries. */
+/* TOP-view only: row 0 is "Recently Played" iff there are recent entries.
+ * If a Resume row is present (M7), it sits *above* the Recents row, so
+ * the Recents-row index in TOP becomes (resume_available ? 1 : 0). */
 static bool downplay_has_recents_row(const downplay_handle_t *dp)
 {
    return dp->view == DOWNPLAY_VIEW_TOP && dp->recent_count > 0;
+}
+
+static bool downplay_has_resume_row(const downplay_handle_t *dp)
+{
+   return dp->view == DOWNPLAY_VIEW_TOP && dp->resume_available;
+}
+
+static const char *downplay_ingame_label(enum downplay_ingame_action a)
+{
+   switch (a)
+   {
+      case DP_INGAME_CONTINUE: return "Continue";
+      case DP_INGAME_SAVE:     return "Save";
+      case DP_INGAME_LOAD:     return "Load";
+      case DP_INGAME_QUIT:     return "Quit";
+   }
+   return "";
 }
 
 static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
@@ -231,12 +322,16 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
 
    if (dp->view == DOWNPLAY_VIEW_INGAME)
    {
-      switch (row)
-      {
-         case 0: return "Continue";
-         case 1: return "Quit";
-         default: return "";
-      }
+      if (row < dp->ingame_action_count)
+         return downplay_ingame_label(dp->ingame_actions[row]);
+      return "";
+   }
+
+   if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+   {
+      if (row < dp->save_picker_count)
+         return dp->save_picker[row].label;
+      return "";
    }
 
    if (dp->view == DOWNPLAY_VIEW_SYSTEM)
@@ -253,6 +348,16 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
       return "";
    }
 
+   /* TOP view: Resume row (if present) sits above Recents (if present)
+    * sits above Systems.  Order matters here — both flags are
+    * independent, so we walk them in sequence rather than using a
+    * single conditional offset. */
+   if (downplay_has_resume_row(dp))
+   {
+      if (row == 0)
+         return dp->resume_label;
+      row--;
+   }
    if (downplay_has_recents_row(dp))
    {
       if (row == 0)
@@ -566,13 +671,16 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
 static void downplay_recompute_total_rows(downplay_handle_t *dp)
 {
    if (dp->view == DOWNPLAY_VIEW_INGAME)
-      dp->total_rows = 2;
+      dp->total_rows = dp->ingame_action_count;
+   else if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+      dp->total_rows = dp->save_picker_count;
    else if (dp->view == DOWNPLAY_VIEW_SYSTEM)
       dp->total_rows = dp->rom_count;
    else if (dp->view == DOWNPLAY_VIEW_RECENTS)
       dp->total_rows = dp->recent_row_count;
    else
-      dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0)
+      dp->total_rows = (downplay_has_resume_row(dp)  ? 1 : 0)
+                     + (downplay_has_recents_row(dp) ? 1 : 0)
                      + dp->system_count;
 
    if (dp->total_rows == 0)
@@ -650,6 +758,350 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
    }
    *out_count = count;
    return out;
+}
+
+/* ---------- save state UX (M7) ---------- */
+
+/* Filesystem mtime in seconds since epoch.  Returns 0 on stat failure
+ * — callers treat 0 as "absent" and skip the entry, so we never sort
+ * stat-failed files into the picker.  POSIX stat is fine on macOS,
+ * Linux, and Android (Downplay's target platforms).  Windows ports
+ * would need a `_stat` / `_stati64` shim around `<sys/stat.h>` —
+ * downplay.c is HAVE_DOWNPLAY-gated and the fork doesn't ship for
+ * Windows yet, so the unconditional POSIX call is fine for now. */
+static int64_t downplay_file_mtime(const char *path)
+{
+   struct stat st;
+   if (!path || !*path)
+      return 0;
+   if (stat(path, &st) != 0)
+      return 0;
+   return (int64_t)st.st_mtime;
+}
+
+/* Format a relative-time label like "5 minutes ago".  Caps at days
+ * since for our use case (10 manual slots that rotate) entries older
+ * than a few weeks are a corner case, not the norm.  Returns the
+ * string unconditionally (always NUL-terminated). */
+static void downplay_format_relative_time(int64_t mtime,
+      char *out, size_t out_len)
+{
+   int64_t now;
+   int64_t delta;
+   int     n;
+
+   if (out_len == 0)
+      return;
+   out[0] = '\0';
+   if (mtime <= 0)
+   {
+      strlcpy(out, "Unknown", out_len);
+      return;
+   }
+
+   /* time_t is 32-bit on some old Android ABIs (armeabi-v7a, older
+    * NDKs); st.st_mtime there is also 32-bit.  The (int64_t) casts on
+    * both sides truncate identically so the delta is safe — we're not
+    * doing absolute-epoch comparisons that would care about wrap. */
+   now   = (int64_t)time(NULL);
+   delta = now - mtime;
+   if (delta < 0)
+      delta = 0;
+
+   if (delta < 60)
+      strlcpy(out, "Just now", out_len);
+   else if (delta < 60 * 60)
+   {
+      n = (int)(delta / 60);
+      snprintf(out, out_len, "%d minute%s ago", n, n == 1 ? "" : "s");
+   }
+   else if (delta < 24 * 60 * 60)
+   {
+      n = (int)(delta / (60 * 60));
+      snprintf(out, out_len, "%d hour%s ago", n, n == 1 ? "" : "s");
+   }
+   else if (delta < 2 * 24 * 60 * 60)
+      strlcpy(out, "Yesterday", out_len);
+   else
+   {
+      n = (int)(delta / (24 * 60 * 60));
+      snprintf(out, out_len, "%d days ago", n);
+   }
+}
+
+/* Free GPU textures held by the picker entries and zero the array.
+ * Safe to call repeatedly (entries with thumb_tex == 0 are skipped). */
+static void downplay_save_picker_free(downplay_handle_t *dp)
+{
+   size_t i;
+   for (i = 0; i < dp->save_picker_count; i++)
+   {
+      if (dp->save_picker[i].thumb_tex)
+         video_driver_texture_unload(&dp->save_picker[i].thumb_tex);
+   }
+   memset(dp->save_picker, 0, sizeof(dp->save_picker));
+   dp->save_picker_count = 0;
+}
+
+/* Synchronously decode a PNG file into a GPU texture.  Mirrors the
+ * pill_cap_tex pattern at the bottom of this file (image_texture_load
+ * → video_driver_texture_load).  Returns 0 if the file is missing or
+ * the decode/upload failed; caller treats 0 as "no thumbnail" and
+ * draws a placeholder rect.
+ *
+ * `filter` picks the GPU sampler.  NEAREST is right for retro
+ * framebuffer screenshots (savestate thumbs) — bilinear blurs every
+ * non-integer scale step, including the final compositor upscale to
+ * the display, and even at exact integer multiples the result reads
+ * blurry because the menu framebuffer itself is rescaled.  LINEAR is
+ * right for hand-drawn / photographic assets where smoothing helps. */
+static uintptr_t downplay_load_png_texture(const char *path,
+      enum texture_filter_type filter,
+      unsigned *out_w, unsigned *out_h)
+{
+   struct texture_image ti;
+   uintptr_t            tex_id = 0;
+
+   if (out_w) *out_w = 0;
+   if (out_h) *out_h = 0;
+   if (!path || !*path || !path_is_valid(path))
+      return 0;
+
+   memset(&ti, 0, sizeof(ti));
+   /* All RA video drivers used on Downplay's targets accept RGBA;
+    * mirror what build_cap_texture below does. */
+   ti.supports_rgba = true;
+
+   if (!image_texture_load(&ti, path))
+      return 0;
+
+   video_driver_texture_load(&ti, filter, &tex_id);
+   if (out_w) *out_w = ti.width;
+   if (out_h) *out_h = ti.height;
+   image_texture_free(&ti);
+   return tex_id;
+}
+
+/* mtime-desc qsort comparator. */
+static int downplay_save_entry_cmp(const void *a, const void *b)
+{
+   const downplay_save_entry_t *ea = (const downplay_save_entry_t*)a;
+   const downplay_save_entry_t *eb = (const downplay_save_entry_t*)b;
+   if (ea->mtime > eb->mtime) return -1;
+   if (ea->mtime < eb->mtime) return  1;
+   return 0;
+}
+
+/* Walk slots {-1, 0..9}, populate `out` with entries that exist on
+ * disk, sorted desc by mtime.  Caller must have freed any previous
+ * picker state (textures) before calling.  load_thumbs == true loads
+ * the PNG thumbnails synchronously — the picker view passes true; the
+ * INGAME row-count refresh passes false (it just needs the count). */
+static void downplay_savestate_enumerate(downplay_save_entry_t *out,
+      size_t *out_count, bool load_thumbs)
+{
+   size_t           count = 0;
+   int              slot;
+   int64_t          mtime;
+   char             state_path[PATH_MAX_LENGTH];
+   char             thumb_path[PATH_MAX_LENGTH];
+   char             rel[40];
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   const char      *base_savestate;
+
+   *out_count = 0;
+   if (!runloop_st)
+      return;
+   base_savestate = runloop_st->name.savestate;
+   if (!base_savestate || !*base_savestate)
+      return;
+
+   for (slot = -1; slot < DOWNPLAY_MAX_MANUAL_SLOTS; slot++)
+   {
+      if (!runloop_get_savestate_path(state_path, sizeof(state_path), slot))
+         continue;
+      mtime = downplay_file_mtime(state_path);
+      if (mtime == 0)
+         continue;
+
+      out[count].slot   = slot;
+      out[count].mtime  = mtime;
+      out[count].locked = false;
+      downplay_format_relative_time(mtime,
+            out[count].label, sizeof(out[count].label));
+      /* Tag the autosave so the user can tell it apart from manual
+       * saves (esp. when "Just now" matches a recent quit). */
+      if (slot < 0)
+      {
+         strlcpy(rel, out[count].label, sizeof(rel));
+         snprintf(out[count].label, sizeof(out[count].label),
+               "Auto - %s", rel);
+      }
+
+      if (load_thumbs)
+      {
+         gfx_savestate_thumbnail_get_path(thumb_path, sizeof(thumb_path),
+               base_savestate, slot);
+         out[count].thumb_tex = downplay_load_png_texture(thumb_path,
+               TEXTURE_FILTER_NEAREST,
+               &out[count].thumb_w, &out[count].thumb_h);
+      }
+      count++;
+   }
+
+   if (count > 1)
+      qsort(out, count, sizeof(*out), downplay_save_entry_cmp);
+   *out_count = count;
+}
+
+/* For the in-game Save action: pick the slot we should overwrite next.
+ * Strategy: first empty manual slot 0..9, else oldest (lowest mtime)
+ * unlocked manual slot.  Ignores the .auto slot — that's reserved for
+ * RA's autosave-on-quit and is never our target. */
+static int downplay_pick_next_save_slot(void)
+{
+   int              slot;
+   int64_t          mt;
+   int              oldest_slot = 0;
+   int64_t          oldest_mt   = INT64_MAX;
+   char             state_path[PATH_MAX_LENGTH];
+   runloop_state_t *runloop_st  = runloop_state_get_ptr();
+
+   if (!runloop_st || !*runloop_st->name.savestate)
+      return 0;
+
+   for (slot = 0; slot < DOWNPLAY_MAX_MANUAL_SLOTS; slot++)
+   {
+      if (!runloop_get_savestate_path(state_path, sizeof(state_path), slot))
+         continue;
+      mt = downplay_file_mtime(state_path);
+      if (mt == 0)
+         return slot;       /* first empty wins */
+      if (mt < oldest_mt)
+      {
+         oldest_mt   = mt;
+         oldest_slot = slot;
+      }
+   }
+   return oldest_slot;
+}
+
+/* Save / load to a specific slot WITHOUT permanently disturbing the
+ * user's state_slot cursor (which OSD widgets, hotkeys, and Settings
+ * UI all read from).  Stash → set → fire command → restore. */
+static void downplay_save_to_slot(int slot)
+{
+   settings_t *settings = config_get_ptr();
+   int         saved_slot;
+
+   if (!settings)
+      return;
+   saved_slot                      = settings->ints.state_slot;
+   configuration_set_int(settings, settings->ints.state_slot, slot);
+   command_event(CMD_EVENT_SAVE_STATE, NULL);
+   configuration_set_int(settings, settings->ints.state_slot, saved_slot);
+}
+
+static void downplay_load_from_slot(int slot)
+{
+   settings_t *settings = config_get_ptr();
+   int         saved_slot;
+
+   if (!settings)
+      return;
+   saved_slot                      = settings->ints.state_slot;
+   configuration_set_int(settings, settings->ints.state_slot, slot);
+   command_event(CMD_EVENT_LOAD_STATE, NULL);
+   configuration_set_int(settings, settings->ints.state_slot, saved_slot);
+}
+
+/* Recompute INGAME row composition based on core capability + on-disk
+ * save count.  Save row hidden when the core can't savestate; Load
+ * row hidden when zero manual saves exist (auto-only doesn't count —
+ * that's loaded via Resume from the launcher, not the in-game menu).
+ * Selection is clamped to the new bounds. */
+static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
+{
+   downplay_save_entry_t scratch[DOWNPLAY_MAX_SAVE_ENTRIES];
+   size_t                scratch_count = 0;
+   bool                  supports;
+   size_t                manual_count  = 0;
+   size_t                i;
+   size_t                n             = 0;
+
+   supports = core_info_current_supports_savestate();
+
+   if (supports)
+   {
+      downplay_savestate_enumerate(scratch, &scratch_count, false);
+      for (i = 0; i < scratch_count; i++)
+         if (scratch[i].slot >= 0)
+            manual_count++;
+   }
+
+   dp->ingame_actions[n++] = DP_INGAME_CONTINUE;
+   if (supports)
+      dp->ingame_actions[n++] = DP_INGAME_SAVE;
+   if (supports && manual_count > 0)
+      dp->ingame_actions[n++] = DP_INGAME_LOAD;
+   dp->ingame_actions[n++] = DP_INGAME_QUIT;
+   dp->ingame_action_count = n;
+
+   if (dp->view == DOWNPLAY_VIEW_INGAME && dp->selection >= n)
+      dp->selection = n - 1;
+}
+
+/* Build "Resume <Game>" availability from the head of recents.  No
+ * runtime state is loaded (we're on the launcher home), so we
+ * reproduce RA's path-construction for `<savestate_dir>/<content
+ * basename minus extension>.state.auto`.  This matches the branch in
+ * runloop_path_set_redirect (runloop.c:8408) that fires when
+ * directory_savestate is set — Downplay always sets it via the
+ * defaults overlay.  Crucially, RA strips the content extension
+ * before appending `.state` (see runloop_path_set_basename at
+ * runloop.c:8174), so we must too — otherwise `foo.nes` would map
+ * to `foo.nes.state.auto` and the Resume row would never appear. */
+static void downplay_refresh_resume(downplay_handle_t *dp)
+{
+   playlist_t                  *pl    = g_defaults.content_history;
+   const struct playlist_entry *entry = NULL;
+   const char                  *savestate_dir;
+   char                         basename[NAME_MAX_LENGTH];
+   char                         auto_path[PATH_MAX_LENGTH];
+   const char                  *label;
+
+   dp->resume_available = false;
+   dp->resume_label[0]  = '\0';
+
+   if (!pl || playlist_size(pl) == 0)
+      return;
+   playlist_get_index(pl, 0, &entry);
+   if (!entry || !entry->path || !*entry->path)
+      return;
+
+   savestate_dir = dir_get_ptr(RARCH_DIR_SAVESTATE);
+   if (!savestate_dir || !*savestate_dir)
+      return;
+
+   fill_pathname_base(basename, entry->path, sizeof(basename));
+   path_remove_extension(basename);
+   if (!*basename)
+      return;
+
+   fill_pathname_join_special(auto_path, savestate_dir, basename,
+         sizeof(auto_path));
+   strlcat(auto_path, ".state.auto", sizeof(auto_path));
+   if (!path_is_valid(auto_path))
+      return;
+
+   if (entry->label && *entry->label)
+      label = entry->label;
+   else
+      label = basename;
+
+   snprintf(dp->resume_label, sizeof(dp->resume_label), "Resume %s", label);
+   dp->resume_available = true;
+   dp->resume_pl_idx    = 0;
 }
 
 static void downplay_open_recents(downplay_handle_t *dp)
@@ -878,6 +1330,11 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
     * playlist->size unlocked, so don't call rebuild from a task callback. */
    dp->recent_count = g_defaults.content_history
                       ? playlist_size(g_defaults.content_history) : 0;
+
+   /* M7: launcher's "Resume <Game>" row appears when the most-recent
+    * recents entry has a `.state.auto` on disk.  Refreshed here so a
+    * fresh boot picks up an autosave from a previous process. */
+   downplay_refresh_resume(dp);
 
    downplay_recompute_total_rows(dp);
 }
@@ -1431,6 +1888,127 @@ static void downplay_draw_list_row(gfx_display_t *p_disp, void *userdata,
          (float)text_x, (float)text_y, L, txt_color, TEXT_ALIGN_LEFT);
 }
 
+/* Right-pane preview: draw `tex` (texture_w × texture_h) centred in
+ * the right half of the screen with a light placeholder when the
+ * texture is 0.  Reusable for any future view that wants a one-image
+ * preview of the selected list entry.
+ *
+ * Pane geometry: the right half minus the outer right margin
+ * horizontally; vertically matches the list area (below the status
+ * row, above the footer hint).
+ *
+ * Scaling policy is a parameter so different content types can
+ * request the right behaviour — savestate thumbs are typically the
+ * core's native framebuffer (e.g. 256×240 NES) and want crisp
+ * integer scaling; cover art / hand-drawn assets want smooth aspect-
+ * fit; tiny icons might want to render at 1:1. */
+enum downplay_preview_scale
+{
+   /* Aspect-preserving fit: scale up or down so one axis touches the
+    * pane edge.  Bilinear-smoothed.  Use for non-pixel art. */
+   DOWNPLAY_PREVIEW_SCALE_FIT = 0,
+   /* Native pixels when the texture fits; aspect-fit shrink when it
+    * overflows.  Never scales up. */
+   DOWNPLAY_PREVIEW_SCALE_NATIVE,
+   /* Largest integer multiplier (1×, 2×, 3×…) that fits in the pane;
+    * preserves aspect implicitly because both axes scale by the same
+    * factor.  Falls back to NATIVE / aspect-fit when even 1× doesn't
+    * fit.  Right choice for retro framebuffers. */
+   DOWNPLAY_PREVIEW_SCALE_INTEGER
+};
+
+static float DP_COLOR_PREVIEW_PLACEHOLDER[16] = {
+   1.0f, 1.0f, 1.0f, 0.06f,   1.0f, 1.0f, 1.0f, 0.06f,
+   1.0f, 1.0f, 1.0f, 0.06f,   1.0f, 1.0f, 1.0f, 0.06f
+};
+
+static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
+      const downplay_layout_t *L,
+      uintptr_t tex, unsigned texture_w, unsigned texture_h,
+      enum downplay_preview_scale scale)
+{
+   int pane_left   = (int)L->vid_w / 2;
+   int pane_right  = (int)L->vid_w - L->margin_x;
+   int pane_top    = L->margin_y + L->row_h + (int)(16.0f * L->scale);
+   int pane_bottom = (int)L->vid_h - L->margin_y - L->row_h;
+   int pane_w      = pane_right  - pane_left;
+   int pane_h      = pane_bottom - pane_top;
+   int img_w       = 0;
+   int img_h       = 0;
+   int img_x;
+   int img_y;
+   bool fits_natively;
+
+   if (pane_w < L->row_h || pane_h < L->row_h)
+      return;
+
+   if (tex && texture_w && texture_h)
+   {
+      fits_natively = (texture_w <= (unsigned)pane_w
+                   && texture_h <= (unsigned)pane_h);
+
+      if (scale == DOWNPLAY_PREVIEW_SCALE_INTEGER && fits_natively)
+      {
+         /* Largest integer multiplier where both axes still fit. */
+         int mx = pane_w / (int)texture_w;
+         int my = pane_h / (int)texture_h;
+         int m  = mx < my ? mx : my;
+         if (m < 1)
+            m = 1;
+         img_w = (int)texture_w * m;
+         img_h = (int)texture_h * m;
+      }
+      else if (scale == DOWNPLAY_PREVIEW_SCALE_NATIVE && fits_natively)
+      {
+         img_w = (int)texture_w;
+         img_h = (int)texture_h;
+      }
+      else
+      {
+         /* Aspect-fit (FIT, or NATIVE/INTEGER fallback when too big).
+          * Cross-product comparison avoids float math + zero-div. */
+         if ((unsigned)pane_w * texture_h <= (unsigned)pane_h * texture_w)
+         {
+            img_w = pane_w;
+            img_h = (int)((unsigned)pane_w * texture_h / texture_w);
+         }
+         else
+         {
+            img_h = pane_h;
+            img_w = (int)((unsigned)pane_h * texture_w / texture_h);
+         }
+      }
+   }
+   else
+   {
+      /* Placeholder: square at min(pane_w, pane_h), gives a hint of
+       * "preview goes here" without claiming a particular aspect. */
+      img_w = img_h = (pane_w < pane_h) ? pane_w : pane_h;
+   }
+   if (img_w < 1 || img_h < 1)
+      return;
+
+   img_x = pane_left + (pane_w - img_w) / 2;
+   img_y = pane_top  + (pane_h - img_h) / 2;
+
+   if (tex)
+   {
+      /* DP_COLOR_PILL_LIGHT is pure white (1,1,1,1) — gfx_display_draw_quad
+       * multiplies the texture sample by this colour, so passing white
+       * is the no-tint identity (texture renders verbatim).  Local
+       * uintptr_t copy because the function signature is non-const. */
+      uintptr_t tex_local = tex;
+      gfx_display_draw_quad(p_disp, userdata,
+            L->vid_w, L->vid_h,
+            img_x, img_y, (unsigned)img_w, (unsigned)img_h,
+            L->vid_w, L->vid_h,
+            DP_COLOR_PILL_LIGHT, &tex_local);
+   }
+   else
+      downplay_draw_rect(p_disp, userdata, L,
+            img_x, img_y, img_w, img_h, DP_COLOR_PREVIEW_PLACEHOLDER);
+}
+
 static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       const downplay_layout_t *L, uintptr_t cap_tex,
       const downplay_handle_t *dp)
@@ -1453,6 +2031,18 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             dp->font_centre_offset, L, cap_tex,
             list_x, row_y, row_max_w,
             downplay_row_label(dp, i), i == dp->selection);
+   }
+
+   /* Right-pane preview: SAVE_PICKER shows the selected save's
+    * thumbnail.  Easy to extend to other views later — just plumb a
+    * texture handle from whatever the selected entry refers to. */
+   if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER
+         && dp->selection < dp->save_picker_count)
+   {
+      const downplay_save_entry_t *e = &dp->save_picker[dp->selection];
+      downplay_draw_right_preview(p_disp, userdata, L,
+            e->thumb_tex, e->thumb_w, e->thumb_h,
+            DOWNPLAY_PREVIEW_SCALE_INTEGER);
    }
 }
 
@@ -1477,18 +2067,44 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
    if (menu_st)
       menu_st->flags &= ~MENU_ST_FLAG_PENDING_QUICK_MENU;
 
-   if (running && dp->view != DOWNPLAY_VIEW_INGAME)
+   /* SAVE_PICKER is a sub-view of INGAME (only reachable from there),
+    * so don't bounce it back — that snap was the bug where opening
+    * Load did nothing.  The picker tears itself down on Cancel /
+    * post-load, returning to INGAME via prior_view. */
+   if (running
+         && dp->view != DOWNPLAY_VIEW_INGAME
+         && dp->view != DOWNPLAY_VIEW_SAVE_PICKER)
    {
       dp->prior_view      = dp->view;
       dp->prior_selection = dp->selection;
       dp->view            = DOWNPLAY_VIEW_INGAME;
       dp->selection       = 0;
+      downplay_refresh_ingame_actions(dp);
       downplay_recompute_total_rows(dp);
    }
    else if (!running && dp->view == DOWNPLAY_VIEW_INGAME)
    {
       dp->view      = dp->prior_view;
       dp->selection = dp->prior_selection;
+      /* Refresh launcher state that would have changed during play —
+       * a new autosave (set by RA on unload) should make the Resume
+       * row appear next frame. */
+      downplay_refresh_resume(dp);
+      downplay_recompute_total_rows(dp);
+   }
+   else if (!running && dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+   {
+      /* Edge case: core unloaded while we were drilled into the
+       * picker (crashed core, external Quit).  Pop back to TOP
+       * cleanly.  Note this restores to TOP directly rather than via
+       * prior_view (which would be INGAME — invalid now that the core
+       * is gone).  prior_view is single-slot; if a future view ever
+       * stacks on top of SAVE_PICKER, that slot will need to become a
+       * small stack. */
+      downplay_save_picker_free(dp);
+      dp->view      = DOWNPLAY_VIEW_TOP;
+      dp->selection = 0;
+      downplay_refresh_resume(dp);
       downplay_recompute_total_rows(dp);
    }
 }
@@ -1733,10 +2349,89 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
       case MENU_ACTION_SELECT:
          if (dp->view == DOWNPLAY_VIEW_INGAME)
          {
-            if (dp->selection == 0)
+            enum downplay_ingame_action act;
+            if (dp->selection >= dp->ingame_action_count)
+               return 0;
+            act = dp->ingame_actions[dp->selection];
+            switch (act)
+            {
+               case DP_INGAME_CONTINUE:
+                  command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+                  break;
+               case DP_INGAME_SAVE:
+                  downplay_save_to_slot(downplay_pick_next_save_slot());
+                  /* Refresh row composition: zero→one save means Load
+                   * appears next time the menu opens. */
+                  downplay_refresh_ingame_actions(dp);
+                  downplay_recompute_total_rows(dp);
+                  /* Hide the menu after Save so the user can resume
+                   * play without an extra Continue press. */
+                  command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+                  break;
+               case DP_INGAME_LOAD:
+               {
+                  downplay_save_entry_t scratch[DOWNPLAY_MAX_SAVE_ENTRIES];
+                  size_t                scratch_count = 0;
+                  size_t                manual_count  = 0;
+                  size_t                i;
+                  int                   only_slot     = 0;
+
+                  /* Re-enumerate (without thumbs) to count manual
+                   * saves — could have changed since view enter
+                   * (background autosave, manual external delete). */
+                  downplay_savestate_enumerate(scratch, &scratch_count, false);
+                  for (i = 0; i < scratch_count; i++)
+                  {
+                     if (scratch[i].slot < 0)
+                        continue;
+                     if (manual_count == 0)
+                        only_slot = scratch[i].slot;
+                     manual_count++;
+                  }
+                  if (manual_count == 0)
+                     break;       /* race: row hidden next frame */
+                  if (manual_count == 1)
+                  {
+                     downplay_load_from_slot(only_slot);
+                     command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+                     break;
+                  }
+                  /* >1: open the picker.  Loads thumbnails synchronously
+                   * (~10-50 ms one-shot hitch on view enter is fine for
+                   * a deliberate user action). */
+                  downplay_save_picker_free(dp);
+                  downplay_savestate_enumerate(dp->save_picker,
+                        &dp->save_picker_count, true);
+                  dp->prior_view      = dp->view;
+                  dp->prior_selection = dp->selection;
+                  dp->view            = DOWNPLAY_VIEW_SAVE_PICKER;
+                  dp->selection       = 0;
+                  downplay_recompute_total_rows(dp);
+                  break;
+               }
+               case DP_INGAME_QUIT:
+                  command_event(CMD_EVENT_UNLOAD_CORE, NULL);
+                  break;
+            }
+            return 0;
+         }
+         if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+         {
+            if (dp->selection < dp->save_picker_count)
+            {
+               int slot = dp->save_picker[dp->selection].slot;
+               downplay_load_from_slot(slot);
+               /* Pop back to INGAME so re-opening the menu doesn't
+                * re-enter the picker against textures we already
+                * freed.  CMD_EVENT_LOAD_STATE doesn't unload the
+                * core, so the user resumes play directly. */
+               downplay_save_picker_free(dp);
+               dp->view      = dp->prior_view;
+               dp->selection = dp->prior_selection;
+               downplay_refresh_ingame_actions(dp);
+               downplay_recompute_total_rows(dp);
                command_event(CMD_EVENT_MENU_TOGGLE, NULL);
-            else
-               command_event(CMD_EVENT_UNLOAD_CORE, NULL);
+            }
             return 0;
          }
          if (dp->view == DOWNPLAY_VIEW_SYSTEM)
@@ -1752,22 +2447,45 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                downplay_launch_recent(dp->recents[dp->selection].pl_idx);
             return 0;
          }
-         /* TOP view */
-         if (downplay_has_recents_row(dp) && dp->selection == 0)
+         /* TOP view: Resume → recents-launch the head; Recents → open;
+          * else → drill into a system.  Order mirrors row layout in
+          * downplay_row_label. */
          {
-            downplay_open_recents(dp);
-            return 0;
-         }
-         {
-            size_t sys_idx = downplay_has_recents_row(dp)
-               ? dp->selection - 1 : dp->selection;
-            downplay_open_system(dp, sys_idx);
+            size_t sel = dp->selection;
+            if (downplay_has_resume_row(dp))
+            {
+               if (sel == 0)
+               {
+                  downplay_launch_recent(dp->resume_pl_idx);
+                  return 0;
+               }
+               sel--;
+            }
+            if (downplay_has_recents_row(dp) && sel == 0)
+            {
+               downplay_open_recents(dp);
+               return 0;
+            }
+            {
+               size_t sys_idx = downplay_has_recents_row(dp) ? sel - 1 : sel;
+               downplay_open_system(dp, sys_idx);
+            }
          }
          return 0;
       case MENU_ACTION_CANCEL:
          if (dp->view == DOWNPLAY_VIEW_INGAME)
          {
             command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+            return 0;
+         }
+         if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+         {
+            /* Back to INGAME: free thumbnails, restore prior cursor. */
+            downplay_save_picker_free(dp);
+            dp->view      = dp->prior_view;
+            dp->selection = dp->prior_selection;
+            downplay_refresh_ingame_actions(dp);
+            downplay_recompute_total_rows(dp);
             return 0;
          }
          if (dp->view == DOWNPLAY_VIEW_SYSTEM)
@@ -1849,6 +2567,9 @@ static void downplay_menu_context_destroy(void *data)
       video_driver_texture_unload(&dp->pill_cap_tex);
       dp->pill_cap_tex = 0;
    }
+   /* Picker thumbnails are GPU resources; drop them on context loss
+    * so they're not dangling handles after a renderer reset. */
+   downplay_save_picker_free(dp);
    gfx_display_deinit_white_texture();
 }
 

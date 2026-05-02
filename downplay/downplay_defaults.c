@@ -103,6 +103,16 @@ void downplay_defaults_apply(void)
    if (settings->uints.input_menu_toggle_gamepad_combo == INPUT_COMBO_NONE)
       settings->uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_START_SELECT;
 
+   /* Save-state UX (M7): autosave on quit, autoload on launch, and
+    * always capture a screenshot.  These power Resume in the launcher
+    * and the thumbnails in the in-game load picker.  Applied
+    * unconditionally — the boolean upstream defaults are all false, so
+    * we can't distinguish "user turned it off" from "never set", and
+    * the Downplay UX depends on these being on. */
+   settings->bools.savestate_auto_save        = true;
+   settings->bools.savestate_auto_load        = true;
+   settings->bools.savestate_thumbnail_enable = true;
+
    if (!downplay_paths_get_root(root, sizeof(root)))
    {
       RARCH_WARN("[Downplay] could not resolve Downplay/ root; "
