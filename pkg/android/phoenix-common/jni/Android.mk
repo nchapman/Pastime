@@ -12,6 +12,8 @@ HAVE_FILE_LOGGER := 1
 HAVE_GFX_WIDGETS := 1
 HAVE_SAF := 1
 HAVE_BUILTINSMBCLIENT := 1
+# DOWNPLAY: matches the Makefile.common toggle so an `HAVE_DOWNPLAY=0` ndk-build invocation drops the menu driver entirely.
+HAVE_DOWNPLAY ?= 1
 
 INCFLAGS    :=
 DEFINES     :=
@@ -56,11 +58,16 @@ endif
 
 LOCAL_MODULE := retroarch-activity
 
-# DOWNPLAY: compile downplay menu driver + cores module alongside griffin.
 LOCAL_SRC_FILES  +=	$(RARCH_DIR)/griffin/griffin.c \
-							$(RARCH_DIR)/griffin/griffin_cpp.cpp \
-							$(RARCH_DIR)/menu/drivers/downplay.c \
-							$(RARCH_DIR)/downplay/downplay_cores.c
+							$(RARCH_DIR)/griffin/griffin_cpp.cpp
+
+# DOWNPLAY: compile downplay menu driver + helper modules alongside griffin.
+ifeq ($(HAVE_DOWNPLAY),1)
+LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
+							$(RARCH_DIR)/downplay/downplay_cores.c \
+							$(RARCH_DIR)/downplay/downplay_defaults.c \
+							$(RARCH_DIR)/downplay/downplay_bootstrap.c
+endif
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)
    DEFINES += -DHAVE_BUILTINSMBCLIENT
@@ -165,7 +172,9 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_BUILTINMBEDTLS -DHAVE_SSL
 
 # DOWNPLAY: enable the Downplay menu driver in the Android build.
+ifeq ($(HAVE_DOWNPLAY),1)
 DEFINES += -DHAVE_DOWNPLAY
+endif
 
 ifeq ($(HAVE_GFX_WIDGETS),1)
 DEFINES += -DHAVE_GFX_WIDGETS

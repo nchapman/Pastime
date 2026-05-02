@@ -1,0 +1,151 @@
+/*  Downplay - a fork of RetroArch.
+ *  Copyright (C) 2026 - Downplay contributors.
+ *
+ *  Downplay is free software: you can redistribute it and/or modify it under
+ *  the terms of the GNU General Public License as published by the Free
+ *  Software Foundation, either version 3 of the License, or (at your option)
+ *  any later version.
+ *
+ *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ *  details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <retro_miscellaneous.h>
+#include <file/file_path.h>
+#include <string/stdstring.h>
+
+#include "downplay_defaults.h"
+
+#include "../configuration.h"
+#include "../defaults.h"
+#include "../paths.h"
+#include "../verbosity.h"
+#include "../input/input_defines.h"
+
+#ifdef ANDROID
+/* These globals live in platform_unix.c.  We declare extern locally
+ * rather than including platform_unix.h because that header *defines*
+ * (not declares) the arrays — including it from a separate TU would
+ * duplicate the storage.  This is a pre-existing upstream RetroArch
+ * quirk; the right fix would be marking them extern in the header and
+ * keeping the definition in the .c file, but that's an upstream PR. */
+extern char internal_storage_path[];
+extern char internal_storage_app_path[];
+#endif
+
+bool downplay_paths_get_root(char *out, size_t out_len)
+{
+#ifdef ANDROID
+   if (*internal_storage_path)
+   {
+      fill_pathname_join_special(out, internal_storage_path, "Downplay", out_len);
+      return true;
+   }
+   if (*internal_storage_app_path)
+   {
+      fill_pathname_join_special(out, internal_storage_app_path, "Downplay", out_len);
+      return true;
+   }
+   return false;
+#else
+   {
+      const char *home = getenv("HOME");
+      if (!home || !*home)
+         return false;
+      fill_pathname_join_special(out, home, "Downplay", out_len);
+      return true;
+   }
+#endif
+}
+
+/* True iff the current setting value is "either empty, or exactly the
+ * upstream default RA computed for this platform" — i.e., the user has
+ * not provided their own override.  Equality with the RA default lets
+ * us re-apply our overlay on a fresh install where config_load() has
+ * already populated the field with RA's defaults rather than leaving it
+ * empty (Android does this for SRAM/SAVESTATE/SYSTEM via platform_unix.c). */
+static bool downplay_should_overlay(const char *cur, const char *ra_default)
+{
+   if (!cur || !*cur)
+      return true;
+   if (ra_default && *ra_default && string_is_equal(cur, ra_default))
+      return true;
+   return false;
+}
+
+void downplay_defaults_apply(void)
+{
+   char        root[PATH_MAX_LENGTH];
+   char        sub[PATH_MAX_LENGTH];
+   settings_t *settings = config_get_ptr();
+
+   if (!settings)
+      return;
+
+   /* Menu driver: unconditional override.  This is the fork — the whole
+    * point is the Downplay UI.  XMB/Ozone are still compiled in for
+    * debugging via a different binary or config, but the default ships
+    * Downplay. */
+   strlcpy(settings->arrays.menu_driver, "downplay",
+         sizeof(settings->arrays.menu_driver));
+
+   /* Gamepad menu combo: pick START+SELECT only when the user hasn't
+    * chosen a combo (NONE).  Any explicit choice — L3+R3, hold START,
+    * etc. — wins. */
+   if (settings->uints.input_menu_toggle_gamepad_combo == INPUT_COMBO_NONE)
+      settings->uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_START_SELECT;
+
+   if (!downplay_paths_get_root(root, sizeof(root)))
+   {
+      RARCH_WARN("[Downplay] could not resolve Downplay/ root; "
+            "leaving paths at upstream defaults\n");
+      return;
+   }
+
+   /* Path overlays.  See downplay_should_overlay for the predicate;
+    * each setting compares against the RA platform default it would
+    * otherwise have received. */
+   if (downplay_should_overlay(settings->paths.directory_menu_content,
+            g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT]))
+   {
+      fill_pathname_join_special(sub, root, "Roms", sizeof(sub));
+      strlcpy(settings->paths.directory_menu_content, sub,
+            sizeof(settings->paths.directory_menu_content));
+   }
+   if (downplay_should_overlay(settings->paths.directory_system,
+            g_defaults.dirs[DEFAULT_DIR_SYSTEM]))
+   {
+      fill_pathname_join_special(sub, root, "Bios", sizeof(sub));
+      strlcpy(settings->paths.directory_system, sub,
+            sizeof(settings->paths.directory_system));
+   }
+   /* SAVEFILE / SAVESTATE live in the global dir_* slots, not in
+    * settings->paths.  configuration.c maps the cfg keys
+    * "savefile_directory" / "savestate_directory" through dir_get_ptr. */
+   {
+      char *cur = dir_get_ptr(RARCH_DIR_SAVEFILE);
+      if (downplay_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SRAM]))
+      {
+         fill_pathname_join_special(sub, root, "Saves", sizeof(sub));
+         dir_set(RARCH_DIR_SAVEFILE, sub);
+      }
+   }
+   {
+      char *cur = dir_get_ptr(RARCH_DIR_SAVESTATE);
+      if (downplay_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]))
+      {
+         fill_pathname_join_special(sub, root, "States", sizeof(sub));
+         dir_set(RARCH_DIR_SAVESTATE, sub);
+      }
+   }
+
+   RARCH_LOG("[Downplay] defaults applied; root=%s\n", root);
+}
