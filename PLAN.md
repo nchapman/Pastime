@@ -236,9 +236,111 @@ A MinUI-style overlay shown when the user opens the menu over a running core.  C
 
 **Exit criterion:** wiping app data and reinstalling lands the user directly in a working Browse view with the storage layout already created. ✅
 
-### M7+ — Polish
+### M7 — Save state + auto-resume
 
-Auto-resume, save state UX, background pre-download of all known cores on boot, brightness/volume bezel, theming, settings minimization — hide non-essential entries via the menu driver's own list construction, *not* by patching `menu_setting.c` upstream — per-core default config bundles, upstream-rebase tooling, decisions about how/whether to expose XMB as a fallback.
+The MinUI thing that makes a handheld feel like a Game Boy: close it mid-game, reopen, you're already back.  This milestone owns everything about saving and restoring game state, plus the launcher-side surface that makes resume the default action.
+
+**Auto-resume (the headline feature):**
+- Turn on `savestate_auto_save` and `savestate_auto_load` in `downplay_defaults_apply()` (overlay-with-default-guard, like the M6 paths).  RA writes `<savestate_dir>/<content>.state.auto` on core unload and reads it back the next time the same content launches.
+- In-game menu **Quit** (today: `CMD_EVENT_UNLOAD_CORE`): with auto_save on, RA writes the auto-state as part of unload — no new code needed.  Verify the timing actually catches the state vs. firing too late.
+- Launcher boot: if the most recent Recents entry has an `.state.auto` next to it, render a top-of-list **Resume <game>** row.  OK on that row launches the game; auto_load restores the state.  No new content-launch path; reuse the M4 recents launch.
+- Decision (defer): pure auto-jump (boot straight into the game) vs. always show the launcher with Resume highlighted.  Default to "show launcher; preselect Resume row" — less disorienting if the user actually wanted Browse.
+
+**Manual save states:**
+- In-game menu rows **Save State** / **Load State**, slot-based.  The active slot is `settings->ints.state_slot` and persists in retroarch.cfg already.
+- Slot picker is a drill-in list (slots 0–9; configurable later).  Each row shows: slot number, timestamp from the file mtime, and (when `savestate_thumbnail_enable` is on) a small thumbnail RA writes alongside the state file.
+- Save → write to current slot (`CMD_EVENT_SAVE_STATE`), no overwrite confirmation (slot picker is the confirmation).  Load → read from current slot (`CMD_EVENT_LOAD_STATE`).  Default to slot 0 for users who never touch the picker.
+- "New" / "Delete" entries: out of scope for v1; the slot-overwrite-on-save model is enough.
+
+**Slot retention:**
+- Auto-state lives forever, overwritten only on next quit.  Manual slots live forever, overwritten only by an explicit Save into the same slot.  No automatic cleanup; the user manages their own States/ folder (and we documented that folder in the M6 README).
+
+**Implementation strategy:**
+- Defaults overlay (M6): `savestate_auto_save = true`, `savestate_auto_load = true`, `savestate_thumbnail_enable = true`, all guarded by the existing should-overlay predicate.
+- New `DOWNPLAY_VIEW_SLOT_PICKER` view, similar shape to RECENTS — array of `{ slot_idx, mtime, thumb_path }` rebuilt on entry.  Thumbnails reuse RA's existing `gfx_thumbnail` machinery.
+- "Resume" row at top of TOP view when the head of `g_defaults.content_history` has a `.state.auto`.  Detection is a `path_is_valid` against `<savestate_dir>/<basename>.state.auto`.
+
+**Exit criterion:** play a game, hit menu → Quit, relaunch the app, pick **Resume**, land back exactly where you left off.  Independently: save to slot 3, load from slot 3, see thumbnails in the picker.
+
+### M8 — In-game settings (MinUI-style)
+
+In-game menu currently has Continue + Quit (M4.5) and the save-state rows added by M7.  M8 fills in the rest of what MinUI exposes: a curated, gamepad-navigable settings surface for per-core options plus the standard quick-menu actions.  Goal: never need to drop into XMB to tweak a game.
+
+What the user sees, organized as in-game menu rows (in addition to the M7 state rows above):
+
+- **Options** (per-core) — drill-in.  Iterate `runloop_state.core_options` (`runloop.h:220`); render each option's display name + current value label.  L/R cycles values; OK confirms.  Use `core_option_manager_get_val` / `core_option_manager_get_val_label` / set-by-index APIs in `core_option_manager.h`.  Only the options the core actually exposes — no RA-side categories.
+- **Controls** — drill-in.  Per-core input remap.  Reuse RA's existing remap storage (`config/remaps/<core>/<content>.rmp` via `directory_input_remapping`) so anything we save here Just Works on subsequent loads.  Surface the standard libretro buttons only; advanced stuff (analog deadzone, turbo) deferred.
+- **Disc** — drill-in, only when the core supports the disk-control interface.  Eject / Insert / pick disc index.  Driven by `CMD_EVENT_DISK_*`.
+- **Reset** — `CMD_EVENT_RESET`, with a confirmation row.
+- **Cheats** — drill-in.  Out of scope for v1; defer to M7.5 if there's demand.
+
+What we deliberately do **not** expose: video drivers, audio drivers, latency, shaders, achievements, network, anything tied to RA infrastructure rather than the running game.  Those stay reachable via XMB only (see "XMB escape hatch" in Open questions).
+
+System / launcher-level settings (a separate row from the top of Browse, not in-game): out of scope for this milestone.  Brightness / volume / sleep timer are explicitly *not* coming — Android handles those system-wide on our target devices.
+
+**Implementation strategy:**
+
+- Each row lives in the existing `DOWNPLAY_VIEW_INGAME` view; drill-ins reuse the same selection/scroll machinery as Browse.  No new view machinery.
+- Per-core options drill-in is a new view (`DOWNPLAY_VIEW_INGAME_OPTIONS`) backed by an array of `{ idx, label, current_val_label }` cached on entry.  L/R cycles via `core_option_manager_set_val`; OK confirms; B exits and rebuilds the cache on re-entry.
+- Save-state slot is a `settings->ints.state_slot`-style scalar persisted via the regular config-save path; no new storage.
+- Remap save uses `task_push_save_remap_file` (already in `tasks/tasks_internal.h`) — no new patch points.
+
+**Exit criterion:** during gameplay, the user can save and load state, change a per-core option (e.g., `mgba` color correction), remap a button, and eject/insert a disc — all from the Downplay in-game menu, without touching XMB.
+
+### M9 — Device-aware configuration
+
+Modern Android handhelds have wildly varying panel resolutions (480p to 1440p), aspect ratios (4:3, 3:2, 16:9, 16:10, 21:9), and refresh rates (60, 90, 120 Hz).  RA's compiled-in defaults aren't aware of any of this.  M9 picks sensible video / scaling / refresh defaults at install time from the actual panel — so a fresh boot looks right without the user opening a settings screen.
+
+We're not doing per-core perf tuning (the target devices are fast enough that tuning is unnecessary) or theming (one fixed look).  We *are* doing the geometry work that makes a 1080×1920 portrait device and a 480×640 square device both look correct out of the box.
+
+What gets derived from the panel:
+
+- **Integer scaling** — `video_scale_integer = true` whenever the panel is high enough resolution to render the largest target system (≥3× SNES native ≈ 768 px tall) at integer scale without losing too much pixel real estate.  Falls back to non-integer with bilinear off for very low-res panels.
+- **Aspect ratio handling** — `aspect_ratio_index = ASPECT_RATIO_CORE` (respect each core's native ratio) plus `video_aspect_ratio_auto = true`.  Single setting; per-core overrides not needed because the core ratio already encodes "GBA is 3:2, SNES is 4:3."
+- **Refresh rate** — read the panel via the video driver (`video_driver_get_refresh_rate`) and write `video_refresh_rate` to match.  RA's vsync stays on; the swap-interval default is fine.  90/120 Hz panels: leave at 60 Hz for accuracy unless we add an explicit "smooth" toggle later.
+- **Menu chrome scale** — Downplay's own font/padding/row sizing already derives from `video_height / REF_HEIGHT` (`menu/drivers/downplay.c:871`); the `user_scale_factor` knob stays at 1.0 unless we surface it later.  No code change needed; just confirm it looks right on the actual aspect ratios we ship to.
+- **Orientation** — pin landscape on Android.  Portrait handhelds (pretty rare) get an explicit override later if needed.
+
+Implementation strategy:
+
+- Run *once per device profile change*, not every launch.  Cache `{ width, height, refresh_rate, density }` to `Downplay/.profile` after first detection; on subsequent launches, redetect and only re-overlay if the profile changed (e.g., user moved their save to a different device).
+- Lives in a new `downplay_profile.{c,h}` module called from `downplay_defaults_apply()` after the path overlays.  Reads via existing video-driver getters; no new patch points.
+- The overlay respects user overrides via the same `downplay_should_overlay` predicate used in M6 — if the user has explicitly set `video_refresh_rate`, we don't clobber it.
+
+Non-goals: brightness, volume, sleep timer (Android overlays its own affordances for these and our handhelds inherit them); theming / paks; per-core performance tuning (`run-ahead` frames, latency tweaks).
+
+**Exit criterion:** install on two devices with different panels (e.g., a 480×640 Anbernic and a 1080×1920 Retroid).  Without touching a setting, both render correctly: integer-scaled where the panel allows it, aspect ratio respected, refresh rate matched.
+
+### M10 — Automatic content downloads + updates
+
+M3 covers the headline case (download cores referenced by the user's folders).  M10 generalizes that idea: anything Downplay needs from the internet gets fetched silently and kept up to date, so the user never sees "go install X" or "your Y is out of date."  The user runs the app and it works; updates happen invisibly.
+
+What needs to be auto-fetched / refreshed:
+
+- **Cores** (extends M3) — pre-download every core referenced by a visible system folder, not just the ones launched yet.  Periodically check the buildbot for newer versions of installed cores (`task_push_update_installed_cores`, `tasks_internal.h:140`) and refresh in place.
+- **Core info files** — the descriptors RA reads from `<info_dir>` to know each core's display name, supported extensions, etc.  These ship in a separate libretro-core-info repo and update independently of the cores themselves; refresh on the same cadence.
+- **Joypad autoconfigs** — RA's `autoconfig_directory` of per-controller mapping profiles.  Critical on Android handhelds where a given device's built-in pad may or may not have a profile yet.  Auto-download on first boot via the existing online-updater task; refresh periodically.
+- **Cheats database** — when the user (eventually) enables cheats from the in-game menu, the database should already be on disk.  Pre-fetch lazily on first cheats-row entry, not on boot.
+- **Failed-download retry** — if the M3 boot pass couldn't reach the buildbot, retry on the next launch (or when network becomes available).  Today the splash times out and the user has to relaunch; M10 makes the retry automatic.
+
+Policy decisions to nail down during implementation:
+
+- **Frequency** — daily? weekly? on every boot? Probably "first launch + every N days, tracked via a timestamp in the cache."
+- **Network awareness** — wifi-only by default; cellular requires a future toggle.  Android's `ConnectivityManager` exposes the metered-connection bit.
+- **Failure visibility** — silent on success, silent on transient failure (we'll retry), surface only on persistent failure (e.g., a folder's core has been delisted from the buildbot — that's a real "this won't work" signal).
+- **Progress UI** — boot-time pre-fetch reuses the M3 splash.  Post-boot updates are background-only (no UI) unless something the user is actively waiting on (e.g., a cheats lookup) is in flight.
+
+**Implementation strategy:**
+
+- Generalize the `downplay_cores` module into a small "online content sync" coordinator.  The single-flight install queue from M3 is a good shape; extend the queue to handle non-core download tasks (autoconfigs, info files) using the same async-task plumbing.
+- New `downplay/downplay_sync.{c,h}` module — owns the cadence, the cache-timestamp file (`Downplay/.sync_cache`), and the dispatch.  Uses existing `task_push_*` APIs; no new upstream patch points expected.
+- The "what cores does any folder reference" set already exists in the M3 collect-needed pass; reuse it for the broader pre-download.
+
+**Exit criterion:** wipe the app, fly somewhere with no internet, plug in a controller Downplay has never seen.  After the first online launch (back home), the controller works the next time (autoconfig was fetched), every system folder's games launch (cores pre-fetched, not just the ones I'd previously played), and core/info updates have happened in the background without a single "downloading" notification.
+
+### M11+ — Polish
+
+System-folder visibility filtering (carryover from M3), cheats, upstream-rebase tooling, decisions about how/whether to expose XMB as a fallback.
 
 ## Maintenance discipline
 
