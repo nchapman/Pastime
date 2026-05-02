@@ -154,15 +154,43 @@ The roadmap is a sequence of derisking milestones. Each milestone is a working, 
 
 **Exit criterion:** with snes9x already installed, picking a ROM in `Super Nintendo (snes9x)/` launches and returns cleanly. *(Met live with gambatte/Game Boy.)*
 
-### M3 — Lazy core download *(derisks: the MinUI "magic")*
+### M3 — Eager core download with lazy fallback *(derisks: offline-availability + the MinUI "magic")* 🚧
 
-- [ ] On boot, `downplay_cores.c` calls `task_push_get_core_updater_list()` (`tasks/tasks_internal.h:129`) with `mute=true, refresh_menu=false`, populating the cached `core_updater_list_t`.
-- [ ] System-folder filtering in `downplay_systems.c` uses this list: a folder is **shown** only if its `core_ident` resolves to an entry on the buildbot. Until the list arrives, optimistically show folders whose core is already installed locally; refresh once the list is ready.
-- [ ] Implement the additive callback hook in `tasks/task_core_updater.c` (the patch point above) so `downplay_cores.c` can register a "download finished" callback.
-- [ ] On ROM select for a not-installed core: present a "Downloading <core>…" state, call `task_push_core_updater_download()` (`tasks/tasks_internal.h:134`), and on the registered callback launch the pending ROM via the M2 path.
-- [ ] Cancel-on-back returns to the system view without launching.
+**Design shift from the original plan.** Original M3 was lazy-only: download a core the first time the user picks a ROM that needs it. That fails the "I'm on a plane and the core isn't installed" case. Revised M3: download all *referenced* cores up front behind a boot splash; keep a lazy fallback for cores referenced after that splash (folders the user adds mid-session, or a download that errored and was retried later).
 
-**Exit criterion:** wipe the cores directory, drop a ROM in `Super Nintendo (snes9x)/`, pick it — Downplay downloads snes9x and launches the ROM with no other interaction.
+The factoring: a single core-installer module (`downplay_cores.c`) with both flows on top of one primitive `downplay_cores_install_one(ident, cb)`. The splash and the lazy-on-demand path are both callers; neither owns the install primitive.
+
+**Module layout — `downplay_cores.c`:**
+- `downplay_cores_init()` — kicks off `task_push_get_core_updater_list(list, mute=true, refresh_menu=false)` (`tasks/tasks_internal.h:129`); populates the cached `core_updater_list_t`. Idempotent.
+- `downplay_cores_is_installed(ident)` — `path_is_valid` against the resolved `<ident>_libretro.<ext>` in `settings->paths.directory_libretro`.
+- `downplay_cores_is_available(ident)` — true iff `ident` is on the cached buildbot list. Returns "unknown" until the list lands so callers can wait.
+- `downplay_cores_collect_needed(systems[]) → ident set` — pure function over the parsed system list; no side effects. Reused by the splash *and* by anything that wants to show "missing core" badges. The input is already pre-filtered: `downplay_systems` drops empty folders before this sees them, so we never download a core for a system the user has no games for. (Unique idents — multiple folders can share a core.)
+- `downplay_cores_install_one(ident, retro_task_callback_t cb, void *user)` — push `task_push_core_updater_download()` (`tasks/tasks_internal.h:134`) for one ident, dispatch `cb` on success/failure. The single primitive both flows build on.
+- `downplay_cores_install_many(idents[], progress_cb, done_cb)` — sequential install (one at a time, simpler progress UI; the buildbot can take the load) by chaining `_install_one` callbacks. Cancellable.
+
+**Flow A — boot splash (primary path):**
+
+- [x] In the menu driver's `init`, after `downplay_rebuild_lists()` runs, call `downplay_cores_begin_boot_setup()` with the parsed system idents. The cores module dedupes, drops already-installed ones, and (only if anything is missing) kicks the buildbot list fetch. The frame stays BLANK while AWAITING_LIST so a "no downloads needed" outcome doesn't briefly flash the splash.
+- [x] Splash UI: progress label ("Downloading core…  <ident> (n of m)"), centered. B to cancel (sets the cancelled flag; the in-flight download runs to completion but its result is discarded, then the queue stops).
+- [x] On done (success, failure, or cancel) the splash dismisses and the normal TOP view appears.
+- [x] Cores referenced by folders but **not** on the buildbot are silently skipped during install. (Visibility filtering — hiding the folder when no core can ever be installed — still TODO; today the launch path logs "core not installed" gracefully.)
+- [x] Buildbot-list timeout: if the list fetch hasn't returned within 15 s the splash dismisses anyway, so an offline first boot doesn't strand the user.
+
+**Flow B — lazy fallback (covers gaps):**
+
+- [ ] On ROM select where `downplay_cores_is_installed(ident)` is false: show an inline "Downloading <core>…" state on the ROM list (re-using the splash's progress pill). Call `downplay_cores_install_one(ident, …)`; on success, launch the pending ROM via the M2 path. On failure, return to the ROM list with an error-pill flash. *(Not yet implemented; today the launch path just logs "core not installed".)*
+- [ ] B during a lazy install cancels and returns to the ROM list without launching.
+
+**Patch point still required:** the additive callback hook in `tasks/task_core_updater.c` (already in the patch table). ✅ landed in `a73829ee32`. The hardcoded `cb_task_core_updater_download` is unchanged; we just gained a single-shot setter for an additional callback.
+
+**System-folder visibility, refined:**
+- Until `downplay_cores_init` reports the buildbot list is loaded: show folders whose core is already installed locally, hide everything else.
+- Once the list is loaded: also show folders whose core is *available on the buildbot* (the splash will install them).
+- Folders whose core is neither installed nor on the buildbot: stay hidden. No "broken folder" UX.
+
+**Why sequential installs:** parallel downloads complicate the cancel UX, fight each other for buildbot bandwidth, and obscure progress. Sequential keeps the splash readable ("3 of 5") and trivial to cancel; the cost is marginal latency since cores are small (a few MB each).
+
+**Exit criterion:** wipe the cores directory; boot Downplay with `Roms/` populated; the splash downloads only the referenced cores (not every buildbot entry); after dismiss, every system folder's ROMs launch without further network. Plus: with the cores directory still empty, kill wifi, boot — splash skips the missing cores after timing out, system folders without an installed core stay hidden, the rest still work.
 
 ### M4 — Recents
 

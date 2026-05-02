@@ -44,6 +44,8 @@
 #include "../../tasks/task_content.h"
 #include "../../verbosity.h"
 
+#include "../../downplay/downplay_cores.h"
+
 /* Reference design height in pixels — the mockup was drawn at this size,
  * and every dimension below is a fraction of it.  Scaling to any actual
  * screen height = video_height / DOWNPLAY_REF_HEIGHT. */
@@ -947,6 +949,60 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
 
 /* ---------- frame ---------- */
 
+/* What the frame should render.  AWAITING_LIST is intentionally rendered
+ * BLANK rather than LIST: showing the system list briefly and then
+ * snapping into the splash once the first download starts looks like a
+ * glitch.  Better to stay blank until we know whether we're going to
+ * splash at all. */
+enum downplay_render_mode
+{
+   DOWNPLAY_RENDER_LIST = 0,   /* normal menu */
+   DOWNPLAY_RENDER_BLANK,      /* awaiting buildbot list — chrome only */
+   DOWNPLAY_RENDER_SPLASH      /* download in flight */
+};
+
+static enum downplay_render_mode downplay_get_render_mode(void)
+{
+   switch (downplay_cores_get_state())
+   {
+      case DOWNPLAY_CORES_INSTALLING:
+         return DOWNPLAY_RENDER_SPLASH;
+      case DOWNPLAY_CORES_AWAITING_LIST:
+         return DOWNPLAY_RENDER_BLANK;
+      default:
+         return DOWNPLAY_RENDER_LIST;
+   }
+}
+
+/* Only called in DOWNPLAY_RENDER_SPLASH (i.e. cores state == INSTALLING),
+ * so we always have a current ident and progress to draw. */
+static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
+      const downplay_handle_t *dp)
+{
+   const downplay_layout_t *L     = &dp->layout;
+   const char              *ident;
+   size_t                   done  = 0;
+   size_t                   total = 0;
+   char                     subline[160];
+   float                    cy    = (float)L->vid_h * 0.5f;
+
+   ident      = downplay_cores_get_progress(&done, &total);
+   subline[0] = '\0';
+   if (ident)
+      snprintf(subline, sizeof(subline), "%s   (%u of %u)",
+            ident, (unsigned)(done + 1), (unsigned)total);
+
+   downplay_draw_text(dp->font, "Downloading core…",
+         (float)L->vid_w * 0.5f,
+         cy + (L->font_size * 0.35f),
+         L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+   if (*subline)
+      downplay_draw_text(dp->chrome_font, subline,
+            (float)L->vid_w * 0.5f,
+            cy + L->font_size + (L->chrome_font_size * 0.35f) + (8.0f * L->scale),
+            L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
+}
+
 static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
 {
    downplay_handle_t *dp = (downplay_handle_t*)data;
@@ -954,7 +1010,8 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    void              *userdata;
    settings_t        *settings;
    float              user_scale;
-   int                bottom_y;
+   int                          bottom_y;
+   enum downplay_render_mode    mode;
 
    if (!dp)
       return;
@@ -967,6 +1024,11 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
 
    if (!p_disp)
       return;
+
+   /* Pump the cores state machine on every frame.  Cheap; only does work
+    * when the buildbot list has just landed. */
+   downplay_cores_pump();
+   mode = downplay_get_render_mode();
 
    /* Recompute layout (and reload fonts at new size) only when the
     * window or user scale changed.  The font reload is the expensive
@@ -989,9 +1051,19 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    downplay_draw_status_pill(p_disp, userdata, dp->chrome_font,
          &dp->layout, dp->pill_cap_tex);
 
-   /* Main list */
-   downplay_draw_list(p_disp, userdata, dp->font,
-         &dp->layout, dp->pill_cap_tex, dp);
+   switch (mode)
+   {
+      case DOWNPLAY_RENDER_SPLASH:
+         downplay_draw_setup_splash(p_disp, userdata, dp);
+         break;
+      case DOWNPLAY_RENDER_LIST:
+         downplay_draw_list(p_disp, userdata, dp->font,
+               &dp->layout, dp->pill_cap_tex, dp);
+         break;
+      case DOWNPLAY_RENDER_BLANK:
+         /* Nothing — chrome below still draws, but no list / no splash. */
+         break;
+   }
 
    /* Bottom hints */
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.chrome_h;
@@ -1000,10 +1072,13 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          dp->layout.margin_x, bottom_y,
          "POWER", "SLEEP",
          DP_COLOR_PILL_LIGHT, DP_TEXT_DARK, DP_TEXT_MUTED);
+
+   /* Right-aligned hint depends on mode.  Hidden in BLANK since there's
+    * no action to advertise yet. */
+   if (mode != DOWNPLAY_RENDER_BLANK)
    {
-      /* Right-aligned hint: measure label width to position the badge. */
-      const char *glyph = "A";
-      const char *label = "OPEN";
+      const char *glyph = (mode == DOWNPLAY_RENDER_SPLASH) ? "B" : "A";
+      const char *label = (mode == DOWNPLAY_RENDER_SPLASH) ? "CANCEL" : "OPEN";
       int label_w = font_driver_get_message_width(dp->chrome_font,
             label, strlen(label), 1.0f);
       int badge_w = downplay_badge_width(dp->chrome_font, &dp->layout,
@@ -1031,6 +1106,18 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
    downplay_handle_t *dp = (downplay_handle_t*)userdata;
    if (!dp)
       return -1;
+
+   /* Boot pass in progress (awaiting list or downloading): swallow nav.
+    * CANCEL aborts the pass — during AWAITING_LIST that drops straight
+    * to DONE; during INSTALLING the in-flight task runs to completion
+    * but its result is discarded.  The screen leaves splash/blank state
+    * naturally as the cores state advances. */
+   if (downplay_get_render_mode() != DOWNPLAY_RENDER_LIST)
+   {
+      if (action == MENU_ACTION_CANCEL)
+         downplay_cores_cancel();
+      return 0;
+   }
 
    /* Empty list (no recents and no system folders): swallow nav silently
     * but still allow CANCEL to log, so input plumbing is observably alive. */
@@ -1105,6 +1192,25 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
 
    dp->selection = 0;
    downplay_rebuild_lists(dp);
+
+   /* Eager-on-boot core install (PLAN.md M3).  Collect every core_ident
+    * referenced by a non-empty system folder, hand them to the cores
+    * module — it dedupes, drops already-installed ones, and kicks the
+    * buildbot list fetch.  Splash UI takes over while this is running. */
+   if (dp->system_count > 0)
+   {
+      const char **idents = (const char**)malloc(
+            dp->system_count * sizeof(*idents));
+      if (idents)
+      {
+         size_t i;
+         for (i = 0; i < dp->system_count; i++)
+            idents[i] = dp->systems[i].core_ident;
+         downplay_cores_begin_boot_setup(idents, dp->system_count);
+         free(idents);
+      }
+   }
+
    *userdata     = dp;
    return menu;
 }
