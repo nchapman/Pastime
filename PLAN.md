@@ -178,8 +178,8 @@ The factoring: a single core-installer module (`downplay_cores.c`) with both flo
 
 **Flow B — lazy fallback (covers gaps):**
 
-- [ ] On ROM select where `downplay_cores_is_installed(ident)` is false: show an inline "Downloading <core>…" state on the ROM list (re-using the splash's progress pill). Call `downplay_cores_install_one(ident, …)`; on success, launch the pending ROM via the M2 path. On failure, return to the ROM list with an error-pill flash. *(Not yet implemented; today the launch path just logs "core not installed".)*
-- [ ] B during a lazy install cancels and returns to the ROM list without launching.
+- [x] On ROM select where `downplay_cores_is_installed(ident)` is false: stash the pick on the menu handle (`pending_launch_core` / `pending_launch_rom`) and call `downplay_cores_begin_boot_setup(&ident, 1)`.  The same boot splash takes over rendering; `downplay_drive_pending_launch` finishes the launch when the cores state machine returns to LIST mode.  Reusing the splash (rather than building an inline ROM-row pill) keeps the install UX identical to the boot pass.
+- [x] B during a lazy install cancels (the in-flight download still runs to completion, but the result is discarded) and clears the pending pick so we don't auto-launch when the task settles.
 
 **Patch point still required:** the additive callback hook in `tasks/task_core_updater.c` (already in the patch table). ✅ landed in `a73829ee32`. The hardcoded `cb_task_core_updater_download` is unchanged; we just gained a single-shot setter for an additional callback.
 

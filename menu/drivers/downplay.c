@@ -154,6 +154,15 @@ typedef struct
    /* Cached: rows in the current view (TOP: recents header + systems;
     * SYSTEM: rom_count). */
    size_t              total_rows;
+   /* Lazy-install handoff (PLAN.md M3 Flow B): set when the user picks a
+    * ROM whose core isn't installed.  The cores module takes over the
+    * frame (splash), and downplay_drive_pending_launch finishes the
+    * launch once it returns to DONE.  Empty core[0] means none pending.
+    * Sized to PATH_MAX_LENGTH for symmetry with the rom buffer; idents
+    * are short, but a single bound keeps the asymmetry from being a
+    * future footgun. */
+   char                pending_launch_core[PATH_MAX_LENGTH];
+   char                pending_launch_rom[PATH_MAX_LENGTH];
 } downplay_handle_t;
 
 /* Solid colors expressed as 4×RGBA (one vertex each, flat shaded).  Kept
@@ -701,15 +710,15 @@ static bool downplay_resolve_core_path(const char *core_ident,
    return true;
 }
 
-static void downplay_launch_rom(const char *core_ident, const char *rom_path)
+/* Push the actual content-load task.  Caller must have already resolved
+ * core_ident to an installed core; we re-resolve here defensively. */
+static void downplay_do_launch_rom(const char *core_ident, const char *rom_path)
 {
    char               core_path[PATH_MAX_LENGTH];
    content_ctx_info_t content_info;
 
    if (!downplay_resolve_core_path(core_ident, core_path, sizeof(core_path)))
    {
-      /* Lazy-download lands in plan M3.  For now, surface the miss to
-       * the log so it's diagnosable. */
       RARCH_WARN("[Downplay] core not installed: %s\n", core_ident);
       return;
    }
@@ -728,6 +737,48 @@ static void downplay_launch_rom(const char *core_ident, const char *rom_path)
       RARCH_ERR("[Downplay] task_push_load_content failed for '%s'\n",
             rom_path);
 }
+
+static void downplay_clear_pending_launch(downplay_handle_t *dp)
+{
+   dp->pending_launch_core[0] = '\0';
+   dp->pending_launch_rom[0]  = '\0';
+}
+
+/* ROM-pick entry point.  If the core is already installed, launch now.
+ * Otherwise stash the pick and kick a single-ident install through the
+ * cores module — the existing splash takes over rendering and
+ * downplay_drive_pending_launch finishes the launch when it dismisses. */
+static void downplay_launch_rom(downplay_handle_t *dp,
+      const char *core_ident, const char *rom_path)
+{
+   const char *idents[1];
+
+   if (downplay_cores_is_installed(core_ident))
+   {
+      downplay_do_launch_rom(core_ident, rom_path);
+      return;
+   }
+
+   /* Defensive: input is swallowed while render mode != LIST, so the
+    * user can't actually queue a second pick mid-install — but if that
+    * invariant ever slips, drop the new pick rather than clobbering
+    * the in-flight one. */
+   if (*dp->pending_launch_core)
+   {
+      RARCH_WARN("[Downplay] launch already pending; ignoring second pick\n");
+      return;
+   }
+
+   RARCH_LOG("[Downplay] core %s not installed; lazy install before launch\n",
+         core_ident);
+   strlcpy(dp->pending_launch_core, core_ident,
+         sizeof(dp->pending_launch_core));
+   strlcpy(dp->pending_launch_rom,  rom_path,
+         sizeof(dp->pending_launch_rom));
+   idents[0] = core_ident;
+   downplay_cores_begin_boot_setup(idents, 1);
+}
+
 
 /* Launch from the recents playlist.  The entry already carries the core
  * path it last ran with, so we don't go through core_info_find — if the
@@ -1314,6 +1365,27 @@ static enum downplay_render_mode downplay_get_render_mode(void)
    }
 }
 
+/* Called every frame after downplay_cores_pump.  When the cores module
+ * settles back to DONE/INACTIVE (rendering as LIST again) and we have a
+ * pending pick, finish the launch.  If install failed (core still not
+ * installed), do_launch logs and bails — we still clear the slot so the
+ * user gets the menu back. */
+static void downplay_drive_pending_launch(downplay_handle_t *dp)
+{
+   char core[sizeof(dp->pending_launch_core)];
+   char rom[sizeof(dp->pending_launch_rom)];
+
+   if (!*dp->pending_launch_core)
+      return;
+   if (downplay_get_render_mode() != DOWNPLAY_RENDER_LIST)
+      return;
+
+   strlcpy(core, dp->pending_launch_core, sizeof(core));
+   strlcpy(rom,  dp->pending_launch_rom,  sizeof(rom));
+   downplay_clear_pending_launch(dp);
+   downplay_do_launch_rom(core, rom);
+}
+
 /* Only called in DOWNPLAY_RENDER_SPLASH (i.e. cores state == INSTALLING),
  * so we always have a current ident and progress to draw. */
 static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
@@ -1368,6 +1440,11 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    /* Pump the cores state machine on every frame.  Cheap; only does work
     * when the buildbot list has just landed. */
    downplay_cores_pump();
+   /* If the pump just transitioned the cores state to DONE, this fires
+    * on the same frame and the splash's "complete" state is never drawn.
+    * That's intentional: content-load is async, so the splash dismissing
+    * straight into the loading screen is the desired UX. */
+   downplay_drive_pending_launch(dp);
    downplay_sync_ingame(dp);
    mode = downplay_get_render_mode();
 
@@ -1462,7 +1539,13 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
    if (downplay_get_render_mode() != DOWNPLAY_RENDER_LIST)
    {
       if (action == MENU_ACTION_CANCEL)
+      {
+         /* Drop any pending lazy launch so a cancelled lazy install
+          * returns to the menu instead of auto-launching when the
+          * in-flight task completes. */
+         downplay_clear_pending_launch(dp);
          downplay_cores_cancel();
+      }
       return 0;
    }
 
@@ -1498,7 +1581,7 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          {
             const downplay_system_t *sys = &dp->systems[dp->active_system];
             const downplay_rom_t    *rom = &dp->roms[dp->selection];
-            downplay_launch_rom(sys->core_ident, rom->full_path);
+            downplay_launch_rom(dp, sys->core_ident, rom->full_path);
             return 0;
          }
          if (dp->view == DOWNPLAY_VIEW_RECENTS)
