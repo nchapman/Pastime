@@ -192,13 +192,15 @@ The factoring: a single core-installer module (`downplay_cores.c`) with both flo
 
 **Exit criterion:** wipe the cores directory; boot Downplay with `Roms/` populated; the splash downloads only the referenced cores (not every buildbot entry); after dismiss, every system folder's ROMs launch without further network. Plus: with the cores directory still empty, kill wifi, boot — splash skips the missing cores after timing out, system folders without an installed core stay hidden, the rest still work.
 
-### M4 — Recents
+### M4 — Recents ✅
 
-- [ ] Iterate `g_defaults.content_history` via `playlist_get_size()` + `playlist_get_index()` (`playlist.h:230,323`).
-- [ ] Render as a top-level Recents view.
-- [ ] Selecting a recent: call `task_push_load_content_from_playlist_from_menu(entry->core_path, entry->path, entry->label, &content_info, NULL, NULL)` (`tasks/task_content.c:2056`; pattern at `menu/cbs/menu_cbs_ok.c:2524`).
+- [x] Iterate `g_defaults.content_history` via `playlist_size()` + `playlist_get_index()` and cache display rows on drill-in (label, falling back to basename minus extension; rows skipped when both are empty record their original `pl_idx` so the array can't drift from the playlist on launch).
+- [x] Render as a drill-in view from the "Recently Played" row (top of the system list when history is non-empty).
+- [x] Selecting a recent calls `task_push_load_content_from_playlist_from_menu(entry->core_path, entry->path, entry->label, &content_info, NULL, NULL)`.
+- [x] Force `CMD_EVENT_HISTORY_INIT` from `downplay_menu_init` (guarded on `g_defaults.content_history == NULL`). Upstream only fires it lazily on the first content load (`tasks/task_content.c:1643`), so without this the playlist file is never read on a fresh boot and the row never appears.
+- [x] Fixed an unrelated double-free at exit (`menu_driver_ctl(RARCH_MENU_CTL_DEINIT)` already frees `menu_st->userdata`; our `free` callback was freeing `dp` again). The crash had been ignored since M0.
 
-**Exit criterion:** Recents reflects play history and re-launches correctly.
+**Exit criterion:** Recents reflects play history and re-launches correctly. ✅
 
 ### M5 — Android build + on-device test
 

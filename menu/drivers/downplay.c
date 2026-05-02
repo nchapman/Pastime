@@ -33,6 +33,7 @@
 #include <retro_dirent.h>
 
 #include "../menu_driver.h"
+#include "../../command.h"
 #include "../../configuration.h"
 #include "../../content.h"
 #include "../../core_info.h"
@@ -78,10 +79,21 @@ typedef struct
    char *full_path;
 } downplay_rom_t;
 
+/* One row in the recents view.  pl_idx is the entry's index in
+ * g_defaults.content_history at build time — kept around because we
+ * skip rows whose entries have neither a label nor a usable path, so
+ * the array index would otherwise drift from the playlist index. */
+typedef struct
+{
+   char  *display_name;
+   size_t pl_idx;
+} downplay_recent_t;
+
 enum downplay_view
 {
    DOWNPLAY_VIEW_TOP = 0,    /* recents header + system list */
-   DOWNPLAY_VIEW_SYSTEM      /* drilled into one system; showing its ROMs */
+   DOWNPLAY_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
+   DOWNPLAY_VIEW_RECENTS     /* drilled into recents history */
 };
 
 typedef struct
@@ -125,6 +137,11 @@ typedef struct
    /* Number of entries in g_defaults.content_history at last rebuild.
     * 0 hides the "Recently Played" row entirely. */
    size_t              recent_count;
+   /* Cached display rows for the RECENTS view.  Populated on drill-in
+    * and freed on close so we don't re-format every frame.  Each entry
+    * carries its source playlist index (see downplay_recent_t). */
+   downplay_recent_t  *recents;
+   size_t              recent_row_count;
    /* Cached: rows in the current view (TOP: recents header + systems;
     * SYSTEM: rom_count). */
    size_t              total_rows;
@@ -173,6 +190,13 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
    {
       if (dp->roms && row < dp->rom_count)
          return dp->roms[row].display_name;
+      return "";
+   }
+
+   if (dp->view == DOWNPLAY_VIEW_RECENTS)
+   {
+      if (dp->recents && row < dp->recent_row_count)
+         return dp->recents[row].display_name;
       return "";
    }
 
@@ -490,6 +514,8 @@ static void downplay_recompute_total_rows(downplay_handle_t *dp)
 {
    if (dp->view == DOWNPLAY_VIEW_SYSTEM)
       dp->total_rows = dp->rom_count;
+   else if (dp->view == DOWNPLAY_VIEW_RECENTS)
+      dp->total_rows = dp->recent_row_count;
    else
       dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0)
                      + dp->system_count;
@@ -498,6 +524,100 @@ static void downplay_recompute_total_rows(downplay_handle_t *dp)
       dp->selection = 0;
    else if (dp->selection >= dp->total_rows)
       dp->selection = dp->total_rows - 1;
+}
+
+static void downplay_recents_free(downplay_recent_t *rows, size_t count)
+{
+   size_t i;
+   if (!rows)
+      return;
+   for (i = 0; i < count; i++)
+      free(rows[i].display_name);
+   free(rows);
+}
+
+/* Build display rows for the recents view.  Prefer the entry's own
+ * label; fall back to the ROM filename minus extension.  Skips entries
+ * with neither (corrupt history line, contentless-core stub) so they
+ * can't push a blank row — pl_idx preserves the original index for
+ * launch lookup. */
+static downplay_recent_t *downplay_build_recents(size_t *out_count)
+{
+   playlist_t        *pl    = g_defaults.content_history;
+   downplay_recent_t *out   = NULL;
+   char               buf[NAME_MAX_LENGTH];
+   size_t             total;
+   size_t             count = 0;
+   size_t             i;
+
+   *out_count = 0;
+   if (!pl)
+      return NULL;
+   total = playlist_size(pl);
+   if (total == 0)
+      return NULL;
+   if (!(out = (downplay_recent_t*)calloc(total, sizeof(*out))))
+      return NULL;
+
+   for (i = 0; i < total; i++)
+   {
+      const struct playlist_entry *entry = NULL;
+      const char                  *src;
+      char                        *dup;
+
+      playlist_get_index(pl, i, &entry);
+      if (!entry)
+         continue;
+      if (entry->label && *entry->label)
+         src = entry->label;
+      else if (entry->path && *entry->path)
+      {
+         fill_pathname_base(buf, entry->path, sizeof(buf));
+         path_remove_extension(buf);
+         if (!*buf)
+            continue;
+         src = buf;
+      }
+      else
+         continue;
+
+      if (!(dup = strdup(src)))
+         continue;
+      out[count].display_name = dup;
+      out[count].pl_idx       = i;
+      count++;
+   }
+
+   if (count == 0)
+   {
+      free(out);
+      return NULL;
+   }
+   *out_count = count;
+   return out;
+}
+
+static void downplay_open_recents(downplay_handle_t *dp)
+{
+   downplay_recents_free(dp->recents, dp->recent_row_count);
+   dp->recents          = NULL;
+   dp->recent_row_count = 0;
+   dp->recents          = downplay_build_recents(&dp->recent_row_count);
+
+   dp->top_selection = dp->selection;
+   dp->view          = DOWNPLAY_VIEW_RECENTS;
+   dp->selection     = 0;
+   downplay_recompute_total_rows(dp);
+}
+
+static void downplay_close_recents(downplay_handle_t *dp)
+{
+   downplay_recents_free(dp->recents, dp->recent_row_count);
+   dp->recents          = NULL;
+   dp->recent_row_count = 0;
+   dp->view             = DOWNPLAY_VIEW_TOP;
+   dp->selection        = dp->top_selection;
+   downplay_recompute_total_rows(dp);
 }
 
 /* Drill into a system's ROM list.  Saves the top-level cursor so we can
@@ -583,6 +703,38 @@ static void downplay_launch_rom(const char *core_ident, const char *rom_path)
             rom_path);
 }
 
+/* Launch from the recents playlist.  The entry already carries the core
+ * path it last ran with, so we don't go through core_info_find — if the
+ * core has since been uninstalled, the playlist task will surface that
+ * itself. */
+static void downplay_launch_recent(size_t index)
+{
+   playlist_t                  *pl    = g_defaults.content_history;
+   const struct playlist_entry *entry = NULL;
+   content_ctx_info_t           content_info;
+
+   if (!pl)
+      return;
+   playlist_get_index(pl, index, &entry);
+   if (!entry || !entry->path || !*entry->path
+         || !entry->core_path || !*entry->core_path)
+   {
+      RARCH_WARN("[Downplay] recents entry %u missing path/core\n",
+            (unsigned)index);
+      return;
+   }
+
+   content_info.argc        = 0;
+   content_info.argv        = NULL;
+   content_info.args        = NULL;
+   content_info.environ_get = NULL;
+
+   if (!task_push_load_content_from_playlist_from_menu(
+            entry->core_path, entry->path, entry->label,
+            &content_info, NULL, NULL))
+      RARCH_ERR("[Downplay] recents launch failed: %s\n", entry->path);
+}
+
 static void downplay_rebuild_lists(downplay_handle_t *dp)
 {
    char        expanded[PATH_MAX_LENGTH];
@@ -599,6 +751,14 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
       dp->rom_count = 0;
       dp->view      = DOWNPLAY_VIEW_TOP;
       dp->selection = 0;
+   }
+   else if (dp->view == DOWNPLAY_VIEW_RECENTS)
+   {
+      downplay_recents_free(dp->recents, dp->recent_row_count);
+      dp->recents          = NULL;
+      dp->recent_row_count = 0;
+      dp->view             = DOWNPLAY_VIEW_TOP;
+      dp->selection        = 0;
    }
 
    /* directory_menu_content is stored verbatim — RA doesn't expand "~" or
@@ -1146,11 +1306,16 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
             downplay_launch_rom(sys->core_ident, rom->full_path);
             return 0;
          }
+         if (dp->view == DOWNPLAY_VIEW_RECENTS)
+         {
+            if (dp->recents && dp->selection < dp->recent_row_count)
+               downplay_launch_recent(dp->recents[dp->selection].pl_idx);
+            return 0;
+         }
          /* TOP view */
          if (downplay_has_recents_row(dp) && dp->selection == 0)
          {
-            /* Recents drill-in is plan M4. */
-            RARCH_LOG("[Downplay] recents (TODO)\n");
+            downplay_open_recents(dp);
             return 0;
          }
          {
@@ -1163,6 +1328,11 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          if (dp->view == DOWNPLAY_VIEW_SYSTEM)
          {
             downplay_close_system(dp);
+            return 0;
+         }
+         if (dp->view == DOWNPLAY_VIEW_RECENTS)
+         {
+            downplay_close_recents(dp);
             return 0;
          }
          /* TOP view: nothing to back out to.  Stay put. */
@@ -1191,6 +1361,12 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
    }
 
    dp->selection = 0;
+   /* Upstream only fires HISTORY_INIT lazily on first content load
+    * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
+    * is NULL and our "Recently Played" row never appears.  Guard so menu
+    * re-init (driver swap, GPU reset) doesn't re-read the file. */
+   if (!g_defaults.content_history)
+      command_event(CMD_EVENT_HISTORY_INIT, NULL);
    downplay_rebuild_lists(dp);
 
    /* Eager-on-boot core install (PLAN.md M3).  Collect every core_ident
@@ -1239,7 +1415,9 @@ static void downplay_menu_free(void *data)
     * context_destroy so they survive GPU context loss/reset cycles. */
    downplay_systems_free(dp->systems, dp->system_count);
    downplay_roms_free(dp->roms, dp->rom_count);
-   free(dp);
+   downplay_recents_free(dp->recents, dp->recent_row_count);
+   /* Don't free(dp) — menu_driver_ctl(RARCH_MENU_CTL_DEINIT) frees
+    * menu_st->userdata (which is dp) itself right after this returns. */
 }
 
 static void downplay_menu_context_reset(void *data, bool video_is_threaded)
