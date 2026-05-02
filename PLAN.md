@@ -236,31 +236,33 @@ A MinUI-style overlay shown when the user opens the menu over a running core.  C
 
 **Exit criterion:** wiping app data and reinstalling lands the user directly in a working Browse view with the storage layout already created. ✅
 
-### M7 — Save state + auto-resume
+### M7 — Save state UX
 
-The MinUI thing that makes a handheld feel like a Game Boy: close it mid-game, reopen, you're already back.  This milestone owns everything about saving and restoring game state, plus the launcher-side surface that makes resume the default action.
+Manual save states are still the headline here: slot picker, thumbnails, Save / Load rows in the in-game menu.  Auto-resume gets a smaller treatment than the equivalent feature in MinUI does.  Why: on Android, the OS keeps the app process resident across screen-off / lock with very little battery cost, so closing-and-reopening already lands the user back in the running game with no save-state involved.  MinUI needed auto-resume because its target devices fully power down to save battery; we don't have that constraint.
 
-**Auto-resume (the headline feature):**
-- Turn on `savestate_auto_save` and `savestate_auto_load` in `downplay_defaults_apply()` (overlay-with-default-guard, like the M6 paths).  RA writes `<savestate_dir>/<content>.state.auto` on core unload and reads it back the next time the same content launches.
-- In-game menu **Quit** (today: `CMD_EVENT_UNLOAD_CORE`): with auto_save on, RA writes the auto-state as part of unload — no new code needed.  Verify the timing actually catches the state vs. firing too late.
-- Launcher boot: if the most recent Recents entry has an `.state.auto` next to it, render a top-of-list **Resume <game>** row.  OK on that row launches the game; auto_load restores the state.  No new content-launch path; reuse the M4 recents launch.
-- Decision (defer): pure auto-jump (boot straight into the game) vs. always show the launcher with Resume highlighted.  Default to "show launcher; preselect Resume row" — less disorienting if the user actually wanted Browse.
+What we still want for the cold-restart case (force-stop, reboot, OOM kill): a `.state.auto` written on Quit and consumed on next launch of the same content.  RA already supports this; we just turn the flags on and surface the entry point.
 
-**Manual save states:**
+**Manual save states (the bulk of this milestone):**
 - In-game menu rows **Save State** / **Load State**, slot-based.  The active slot is `settings->ints.state_slot` and persists in retroarch.cfg already.
 - Slot picker is a drill-in list (slots 0–9; configurable later).  Each row shows: slot number, timestamp from the file mtime, and (when `savestate_thumbnail_enable` is on) a small thumbnail RA writes alongside the state file.
 - Save → write to current slot (`CMD_EVENT_SAVE_STATE`), no overwrite confirmation (slot picker is the confirmation).  Load → read from current slot (`CMD_EVENT_LOAD_STATE`).  Default to slot 0 for users who never touch the picker.
 - "New" / "Delete" entries: out of scope for v1; the slot-overwrite-on-save model is enough.
 
+**Cold-restart resume (the smaller piece):**
+- Turn on `savestate_auto_save` and `savestate_auto_load` in `downplay_defaults_apply()` (overlay-with-default-guard, like the M6 paths).  RA writes `<savestate_dir>/<content>.state.auto` on core unload and reads it back the next time the same content launches.
+- In-game menu **Quit** (today: `CMD_EVENT_UNLOAD_CORE`): with `auto_save` on, RA writes the auto-state as part of unload — no new code needed.  Verify the timing actually catches the state vs. firing too late.
+- Launcher boot: if the most recent Recents entry has an `.state.auto` next to it, render a top-of-list **Resume <game>** row.  OK on that row launches the game; `auto_load` restores the state.  Reuse the M4 recents launch path.
+- We do *not* auto-jump straight into the game on launch.  The Recents row is a one-tap path back; that's enough given how rarely the cold-restart case actually fires on Android.
+
 **Slot retention:**
-- Auto-state lives forever, overwritten only on next quit.  Manual slots live forever, overwritten only by an explicit Save into the same slot.  No automatic cleanup; the user manages their own States/ folder (and we documented that folder in the M6 README).
+- Auto-state lives forever, overwritten only on next Quit.  Manual slots live forever, overwritten only by an explicit Save into the same slot.  No automatic cleanup; the user manages their own States/ folder (documented in the M6 README).
 
 **Implementation strategy:**
 - Defaults overlay (M6): `savestate_auto_save = true`, `savestate_auto_load = true`, `savestate_thumbnail_enable = true`, all guarded by the existing should-overlay predicate.
 - New `DOWNPLAY_VIEW_SLOT_PICKER` view, similar shape to RECENTS — array of `{ slot_idx, mtime, thumb_path }` rebuilt on entry.  Thumbnails reuse RA's existing `gfx_thumbnail` machinery.
 - "Resume" row at top of TOP view when the head of `g_defaults.content_history` has a `.state.auto`.  Detection is a `path_is_valid` against `<savestate_dir>/<basename>.state.auto`.
 
-**Exit criterion:** play a game, hit menu → Quit, relaunch the app, pick **Resume**, land back exactly where you left off.  Independently: save to slot 3, load from slot 3, see thumbnails in the picker.
+**Exit criterion:** save to slot 3, load from slot 3, see thumbnails in the picker.  Separately, force-stop the app mid-game, relaunch, pick the **Resume** row at the top of the launcher, land back exactly where you left off.
 
 ### M8 — In-game settings (MinUI-style)
 
