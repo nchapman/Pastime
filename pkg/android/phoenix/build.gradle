@@ -27,7 +27,7 @@ apply plugin: 'com.android.application'
 android {
   compileSdkVersion 31
   buildToolsVersion "30.0.3"
-  ndkVersion "22.0.7026061"
+  ndkVersion "26.1.10909125" /* DOWNPLAY: r22 has no arm64 macOS host; bumped to a host-arm64-capable NDK */
 
   flavorDimensions "variant"
 

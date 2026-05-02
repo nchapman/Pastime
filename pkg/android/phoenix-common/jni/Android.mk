@@ -56,8 +56,11 @@ endif
 
 LOCAL_MODULE := retroarch-activity
 
+# DOWNPLAY: compile downplay menu driver + cores module alongside griffin.
 LOCAL_SRC_FILES  +=	$(RARCH_DIR)/griffin/griffin.c \
-							$(RARCH_DIR)/griffin/griffin_cpp.cpp
+							$(RARCH_DIR)/griffin/griffin_cpp.cpp \
+							$(RARCH_DIR)/menu/drivers/downplay.c \
+							$(RARCH_DIR)/downplay/downplay_cores.c
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)
    DEFINES += -DHAVE_BUILTINSMBCLIENT
@@ -160,6 +163,9 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_XDELTA \
 	   -DHAVE_CORE_INFO_CACHE \
 	   -DHAVE_BUILTINMBEDTLS -DHAVE_SSL
+
+# DOWNPLAY: enable the Downplay menu driver in the Android build.
+DEFINES += -DHAVE_DOWNPLAY
 
 ifeq ($(HAVE_GFX_WIDGETS),1)
 DEFINES += -DHAVE_GFX_WIDGETS
