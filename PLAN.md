@@ -216,24 +216,25 @@ A MinUI-style overlay shown when the user opens the menu over a running core.  C
 
 **Exit criterion:** menu opens over a running core, Continue resumes, Quit returns to the launcher.  ✅ (Continue/Quit only.)
 
-### M5 — Android build + on-device test
+### M5 — Android build + on-device test ✅
 
-- [ ] Add `HAVE_DOWNPLAY=1` to `pkg/android/phoenix-common/jni/Android.mk`. The Android build is a unity build through `griffin/griffin.c` and reads `Makefile.common`, so no separate file list is needed.
-- [ ] Verify `HAVE_NETWORKING` is on for the Android build (required by `tasks/tasks_internal.h:33` to compile the core-updater APIs Downplay depends on; should already be the default).
-- [ ] Locate `Downplay/` via the storage-tier walk from M1 against the actual Android tiers (`INTERNAL_STORAGE_WRITABLE` / `_APPDIR_WRITABLE` / `_NOT_WRITABLE`, `frontend/drivers/platform_unix.c:105–109,1810–1867`). For now, set `g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT]` to `Downplay/Roms` directly as a stand-in; M6's `downplay_defaults_apply()` supersedes this with the full path overlay.
-- [ ] Disable Play Feature Delivery for the sideload build (`task_core_updater.c:440–444` switches to `task_push_play_feature_delivery_core_install` when PFD is on, which is a different code path Downplay won't drive). Play Store distribution is out of scope for now.
-- [ ] Sideload onto a target handheld (Retroid Pocket / similar).
-- [ ] Verify input, rendering, content launching, and lazy core download on-device.
+- [x] Add Downplay sources + `HAVE_DOWNPLAY` to `pkg/android/phoenix-common/jni/Android.mk`. *(The Android build is ndk-build via `Android.mk`, **not** `Makefile.common` — original plan was wrong about this. Sources are listed explicitly and are guarded by `HAVE_DOWNPLAY ?= 1` for parity.)*
+- [x] `HAVE_NETWORKING` already on for the Android build.
+- [x] Bump `ndkVersion` from r22 to r26.1: r22 has no Apple-Silicon host, so building on an arm64 Mac requires a newer NDK. Patched in `pkg/android/phoenix/build.gradle` with a `/* DOWNPLAY: */` marker.
+- [x] Play Feature Delivery: no code change needed — non-`playStore*` Gradle flavors include `play-core-stub`, which makes `play_feature_delivery_enabled()` return false at runtime, so `task_push_core_updater_download` follows the regular code path.
+- [x] Sideload onto a real handheld; storage at `/sdcard/Downplay/`.
+- [x] Verified input (built-in controller), rendering, content launching, lazy core download. Initial pass needed two manual config edits (`menu_driver`, gamepad combo) and an `adb push` of the font; all three are superseded by M6.
 
-**Exit criterion:** the desktop M0–M4 experience works on a real handheld.
+**Exit criterion:** the desktop M0–M4 experience works on a real handheld. ✅
 
-### M6 — First-run bootstrap
+### M6 — First-run bootstrap ✅
 
-- [ ] `downplay_bootstrap()` runs after `Downplay/` is located (or after picking the writable tier where it should live). Creates `Downplay/`, `Downplay/Roms/`, `Downplay/Bios/`, `Downplay/Saves/`, `Downplay/States/` if missing. Drops a `README.txt` in `Roms/` explaining the `Display Name (corename)` convention.
-- [ ] `downplay_defaults_apply()` overlays opinionated defaults: `menu_driver = "downplay"`, `system_directory = Downplay/Bios`, `savefile_directory = Downplay/Saves`, `savestate_directory = Downplay/States`, `content_history_size`, hidden-files = false, plus a curated set of UI/input defaults (~15–30 keys). Called from `retroarch.c:~7497`.
-- [ ] First launch on a fresh device requires zero user configuration: bootstrap creates the layout, defaults route everything inside `Downplay/`, the menu driver loads, the core updater fetches its list, and the user lands in an empty Browse view ready for ROMs.
+- [x] `downplay_bootstrap()` ensures `Downplay/{Roms,Bios,Saves,States}` exist (idempotent: each `path_mkdir` is gated on `path_is_directory`). Drops a `README.txt` in `Roms/` explaining the `Display Name (corename)` convention; only written when missing so user edits survive.
+- [x] `downplay_defaults_apply()` overlays: `menu_driver = "downplay"` unconditionally; `input_menu_toggle_gamepad_combo = INPUT_COMBO_START_SELECT` only when current is `NONE`; path settings (`directory_menu_content`, `directory_system`, save/state dirs) routed under `Downplay/` only when current value is empty or matches the upstream RA platform default (so an explicit user override in `retroarch.cfg` is preserved). Called from `retroarch.c` after `config_load()` and before the CLI second pass. The other curated defaults (`content_history_size`, hidden-files, ~15–30 UI/input keys) are deferred to M7 polish — the prototype runs fine without them.
+- [x] Asset shipping: `downplay/assets/downplay/InterTight-Bold.ttf` is bundled into the APK via `assets.srcDirs += ['../../../downplay/assets']` in `build.gradle`. RA's existing `bundle_assets` extract pipeline (already enabled on Android via `griffin.c`'s `#define HAVE_COMPRESSION 1`) copies it to `<dataDir>/assets/downplay/InterTight-Bold.ttf` on first launch and on every version bump. No new C code; we just feed the existing pipeline.
+- [x] Verified end-to-end: clean uninstall + reinstall lands the user in the Downplay launcher with the bundled font and existing ROM tree, no `adb` interventions.
 
-**Exit criterion:** wiping app data and reinstalling lands the user directly in a working Browse view with the storage layout already created.
+**Exit criterion:** wiping app data and reinstalling lands the user directly in a working Browse view with the storage layout already created. ✅
 
 ### M7+ — Polish
 
