@@ -41,7 +41,9 @@
 #include "../../gfx/gfx_display.h"
 #include "../../gfx/font_driver.h"
 #include "../../gfx/video_driver.h"
+#include "../../paths.h"
 #include "../../playlist.h"
+#include "../../runloop.h"
 #include "../../tasks/task_content.h"
 #include "../../verbosity.h"
 
@@ -93,7 +95,8 @@ enum downplay_view
 {
    DOWNPLAY_VIEW_TOP = 0,    /* recents header + system list */
    DOWNPLAY_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
-   DOWNPLAY_VIEW_RECENTS     /* drilled into recents history */
+   DOWNPLAY_VIEW_RECENTS,    /* drilled into recents history */
+   DOWNPLAY_VIEW_INGAME      /* core running; show Continue/Quit overlay */
 };
 
 typedef struct
@@ -142,6 +145,12 @@ typedef struct
     * carries its source playlist index (see downplay_recent_t). */
    downplay_recent_t  *recents;
    size_t              recent_row_count;
+   /* Saved state for INGAME entry: the view we were on when the core
+    * started running.  We restore exactly this on core unload — no
+    * heap state copied, since SYSTEM/RECENTS resources stay live in
+    * place while the game runs. */
+   enum downplay_view  prior_view;
+   size_t              prior_selection;
    /* Cached: rows in the current view (TOP: recents header + systems;
     * SYSTEM: rom_count). */
    size_t              total_rows;
@@ -154,13 +163,18 @@ static float DP_COLOR_BG[16] = {
    0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f,
    0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f
 };
+/* INGAME view dims the running game instead of fully hiding it. */
+static float DP_COLOR_BG_INGAME[16] = {
+   0.0f, 0.0f, 0.0f, 0.7f,   0.0f, 0.0f, 0.0f, 0.7f,
+   0.0f, 0.0f, 0.0f, 0.7f,   0.0f, 0.0f, 0.0f, 0.7f
+};
 static float DP_COLOR_PILL_LIGHT[16] = {
    1.0f, 1.0f, 1.0f, 1.0f,   1.0f, 1.0f, 1.0f, 1.0f,
    1.0f, 1.0f, 1.0f, 1.0f,   1.0f, 1.0f, 1.0f, 1.0f
 };
 static float DP_COLOR_PILL_DARK[16] = {
-   0.18f, 0.18f, 0.18f, 1.0f,   0.18f, 0.18f, 0.18f, 1.0f,
-   0.18f, 0.18f, 0.18f, 1.0f,   0.18f, 0.18f, 0.18f, 1.0f
+   0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f,
+   0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f
 };
 
 /* Cap texture is generated 1:1 (no scaling) at this size, then sampled
@@ -185,6 +199,16 @@ static bool downplay_has_recents_row(const downplay_handle_t *dp)
 static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
 {
    size_t sys_idx;
+
+   if (dp->view == DOWNPLAY_VIEW_INGAME)
+   {
+      switch (row)
+      {
+         case 0: return "Continue";
+         case 1: return "Quit";
+         default: return "";
+      }
+   }
 
    if (dp->view == DOWNPLAY_VIEW_SYSTEM)
    {
@@ -512,7 +536,9 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
 
 static void downplay_recompute_total_rows(downplay_handle_t *dp)
 {
-   if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+   if (dp->view == DOWNPLAY_VIEW_INGAME)
+      dp->total_rows = 2;
+   else if (dp->view == DOWNPLAY_VIEW_SYSTEM)
       dp->total_rows = dp->rom_count;
    else if (dp->view == DOWNPLAY_VIEW_RECENTS)
       dp->total_rows = dp->recent_row_count;
@@ -1052,6 +1078,125 @@ static void downplay_draw_button_hint(gfx_display_t *p_disp, void *userdata,
          L, label_color, TEXT_ALIGN_LEFT);
 }
 
+/* Trim `buf` in-place so its rendered width through `font` fits in
+ * max_w pixels, appending "..." when truncation occurs.  No-op when
+ * the original already fits.  buf_size is the full capacity of the
+ * caller's buffer (must hold the trimmed prefix + 3 ellipsis bytes +
+ * NUL); we bail without mutation if it can't. */
+static void downplay_truncate_to_width(font_data_t *font, char *buf,
+      size_t buf_size, int max_w)
+{
+   const char *ell    = "...";
+   size_t      ell_n  = strlen(ell);
+   size_t      len;
+   int         text_w;
+   int         ell_w;
+
+   if (!buf || buf_size <= ell_n + 1 || max_w <= 0)
+      return;
+   len = strlen(buf);
+   if (len == 0)
+      return;
+   text_w = font_driver_get_message_width(font, buf, (unsigned)len, 1.0f);
+   if (text_w >= 0 && text_w <= max_w)
+      return;
+
+   ell_w = font_driver_get_message_width(font, ell, (unsigned)ell_n, 1.0f);
+   if (ell_w < 0)
+      ell_w = 0;
+
+   /* Shrink from the back until prefix + ellipsis fits.  Linear is
+    * fine — title strings are short and this runs once per frame at
+    * most.  After each decrement, walk past UTF-8 continuation bytes
+    * (0x80-0xBF) so we never slice mid-codepoint. */
+   while (len > 0)
+   {
+      buf[len] = '\0';
+      text_w   = font_driver_get_message_width(font, buf,
+            (unsigned)len, 1.0f);
+      if (text_w >= 0 && text_w + ell_w <= max_w)
+         break;
+      len--;
+      while (len > 0 && (((unsigned char)buf[len]) & 0xC0) == 0x80)
+         len--;
+   }
+   while (len > 0 && buf[len - 1] == ' ')
+   {
+      len--;
+      buf[len] = '\0';
+   }
+   /* buf_size > ell_n + 1 (checked above) and len <= buf_size - 1 by
+    * construction, so len + ell_n + 1 always fits. */
+   memcpy(buf + len, ell, ell_n + 1);
+}
+
+/* Draw a left-anchored dark pill with the contents of `text_buf`
+ * centered inside.  Pill grows with the text up to max_w; the buffer
+ * is mutated (ellipsis-truncated) when the text doesn't fit, so it
+ * must be writable and ≥ NAME_MAX_LENGTH-ish.  Returns the pixel
+ * width drawn so callers can layout further chrome to the right. */
+static int downplay_draw_text_pill(gfx_display_t *p_disp, void *userdata,
+      font_data_t *font, float font_size, int height,
+      const downplay_layout_t *L, uintptr_t cap_tex,
+      int x, int y, int max_w,
+      char *text_buf, size_t text_buf_size)
+{
+   int text_max_w = max_w - 2 * L->chrome_pad_x;
+   int text_w;
+   int pill_w;
+   int text_y = y + (height / 2) + (int)(font_size * 0.35f);
+
+   if (text_max_w < 0)
+      text_max_w = 0;
+   downplay_truncate_to_width(font, text_buf, text_buf_size, text_max_w);
+
+   text_w = font_driver_get_message_width(font, text_buf,
+         (unsigned)strlen(text_buf), 1.0f);
+   if (text_w < 0)
+      text_w = 0;
+   pill_w = text_w + 2 * L->chrome_pad_x;
+   if (pill_w < height)
+      pill_w = height;
+   if (pill_w > max_w)
+      pill_w = max_w;
+
+   downplay_draw_pill(p_disp, userdata, L, cap_tex,
+         x, y, pill_w, height, DP_COLOR_PILL_DARK);
+   downplay_draw_text(font, text_buf,
+         (float)(x + pill_w / 2), (float)text_y,
+         L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+   return pill_w;
+}
+
+/* INGAME-only: dark pill at the top-left holding the loaded content's
+ * display name (basename minus extension).  Sized to the row font so
+ * the title visually anchors the menu the way "Continue/Quit" do. */
+static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
+      font_data_t *font, float font_size, int height,
+      const downplay_layout_t *L, uintptr_t cap_tex)
+{
+   const char *content = path_get(RARCH_PATH_CONTENT);
+   char        title[NAME_MAX_LENGTH];
+   int         max_w;
+
+   if (!content || !*content)
+      return;
+   fill_pathname_base(title, content, sizeof(title));
+   path_remove_extension(title);
+   if (!*title)
+      return;
+
+   /* Half-width minus margin keeps the title from running into the
+    * top-right status pill regardless of how long the basename is. */
+   max_w = (int)L->vid_w / 2 - L->margin_x;
+   if (max_w < height)
+      max_w = height;
+
+   downplay_draw_text_pill(p_disp, userdata, font, font_size, height,
+         L, cap_tex, L->margin_x, L->margin_y, max_w,
+         title, sizeof(title));
+}
+
 static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, const downplay_layout_t *L, uintptr_t cap_tex)
 {
@@ -1108,6 +1253,41 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
 }
 
 /* ---------- frame ---------- */
+
+/* Drive the INGAME view from the actual core-running state.  Upstream
+ * menu drivers don't detect this themselves — task_content sets
+ * MENU_ST_FLAG_PENDING_QUICK_MENU on content load and runloop pushes
+ * ACTION_OK_DL_CONTENT_SETTINGS for them.  We render our own view
+ * stack instead, so we read the underlying condition (CORE_RUNNING)
+ * and consume the upstream flag so it can't queue a displaylist push
+ * that we'd ignore. */
+static void downplay_sync_ingame(downplay_handle_t *dp)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   bool               running = (runloop_get_flags()
+         & RUNLOOP_FLAG_CORE_RUNNING) != 0;
+
+   /* Unconditional: upstream may set this flag at content load even
+    * before our frame fires, so we eat it every tick rather than only
+    * on the running→ingame transition. */
+   if (menu_st)
+      menu_st->flags &= ~MENU_ST_FLAG_PENDING_QUICK_MENU;
+
+   if (running && dp->view != DOWNPLAY_VIEW_INGAME)
+   {
+      dp->prior_view      = dp->view;
+      dp->prior_selection = dp->selection;
+      dp->view            = DOWNPLAY_VIEW_INGAME;
+      dp->selection       = 0;
+      downplay_recompute_total_rows(dp);
+   }
+   else if (!running && dp->view == DOWNPLAY_VIEW_INGAME)
+   {
+      dp->view      = dp->prior_view;
+      dp->selection = dp->prior_selection;
+      downplay_recompute_total_rows(dp);
+   }
+}
 
 /* What the frame should render.  AWAITING_LIST is intentionally rendered
  * BLANK rather than LIST: showing the system list briefly and then
@@ -1188,6 +1368,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    /* Pump the cores state machine on every frame.  Cheap; only does work
     * when the buildbot list has just landed. */
    downplay_cores_pump();
+   downplay_sync_ingame(dp);
    mode = downplay_get_render_mode();
 
    /* Recompute layout (and reload fonts at new size) only when the
@@ -1202,14 +1383,20 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       downplay_reload_fonts(dp, video_driver_is_threaded());
    }
 
-   /* Background */
+   /* Background — opaque normally, dim-overlay over the running game so
+    * INGAME reads as a HUD instead of hiding the frame underneath. */
    downplay_draw_rect(p_disp, userdata, &dp->layout,
          0, 0, (int)dp->layout.vid_w, (int)dp->layout.vid_h,
-         DP_COLOR_BG);
+         dp->view == DOWNPLAY_VIEW_INGAME ? DP_COLOR_BG_INGAME : DP_COLOR_BG);
 
    /* Top-right status pill */
    downplay_draw_status_pill(p_disp, userdata, dp->chrome_font,
          &dp->layout, dp->pill_cap_tex);
+
+   if (dp->view == DOWNPLAY_VIEW_INGAME)
+      downplay_draw_title_pill(p_disp, userdata, dp->font,
+            dp->layout.font_size, dp->layout.row_height,
+            &dp->layout, dp->pill_cap_tex);
 
    switch (mode)
    {
@@ -1299,6 +1486,14 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          return 0;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:
+         if (dp->view == DOWNPLAY_VIEW_INGAME)
+         {
+            if (dp->selection == 0)
+               command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+            else
+               command_event(CMD_EVENT_UNLOAD_CORE, NULL);
+            return 0;
+         }
          if (dp->view == DOWNPLAY_VIEW_SYSTEM)
          {
             const downplay_system_t *sys = &dp->systems[dp->active_system];
@@ -1325,6 +1520,11 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          }
          return 0;
       case MENU_ACTION_CANCEL:
+         if (dp->view == DOWNPLAY_VIEW_INGAME)
+         {
+            command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+            return 0;
+         }
          if (dp->view == DOWNPLAY_VIEW_SYSTEM)
          {
             downplay_close_system(dp);
@@ -1360,7 +1560,9 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
       return NULL;
    }
 
-   dp->selection = 0;
+   dp->selection  = 0;
+   dp->view       = DOWNPLAY_VIEW_TOP;
+   dp->prior_view = DOWNPLAY_VIEW_TOP;
    /* Upstream only fires HISTORY_INIT lazily on first content load
     * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
     * is NULL and our "Recently Played" row never appears.  Guard so menu

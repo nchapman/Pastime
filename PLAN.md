@@ -202,6 +202,20 @@ The factoring: a single core-installer module (`downplay_cores.c`) with both flo
 
 **Exit criterion:** Recents reflects play history and re-launches correctly. ✅
 
+### M4.5 — In-game menu 🚧
+
+A MinUI-style overlay shown when the user opens the menu over a running core.  Continue resumes; Quit unloads back to the launcher.  Save/Load/Options come later.
+
+- [x] New `DOWNPLAY_VIEW_INGAME` view, driven from `runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING` every frame.  The same condition upstream menu drivers approximate via `MENU_ST_FLAG_PENDING_QUICK_MENU` + `ACTION_OK_DL_CONTENT_SETTINGS`; we read it directly because we don't render the file_list_t stack.
+- [x] Consume `MENU_ST_FLAG_PENDING_QUICK_MENU` unconditionally in our pump so `runloop.c:6150` can't queue a displaylist push we'd ignore.
+- [x] `prior_view` / `prior_selection` saved on entry, restored on exit (SYSTEM/RECENTS resources stay live during gameplay so no heap copy needed).
+- [x] **Continue** → `command_event(CMD_EVENT_MENU_TOGGLE, NULL)`.  **Quit** → `command_event(CMD_EVENT_UNLOAD_CORE, NULL)`.  CANCEL also acts as Continue.
+- [x] Background renders with alpha 0.7 in INGAME so the running game shows through.  Title pill (top-left) sources from `path_get(RARCH_PATH_CONTENT)` basename minus extension; sized to the row font, capped at half-screen-minus-margin, ellipsis-truncated when it doesn't fit (UTF-8-safe).
+- [x] Generic helpers `downplay_truncate_to_width` and `downplay_draw_text_pill` so future chrome can reuse the size-and-truncate flow.
+- [ ] Save / Load / Options.  Out of scope for now.
+
+**Exit criterion:** menu opens over a running core, Continue resumes, Quit returns to the launcher.  ✅ (Continue/Quit only.)
+
 ### M5 — Android build + on-device test
 
 - [ ] Add `HAVE_DOWNPLAY=1` to `pkg/android/phoenix-common/jni/Android.mk`. The Android build is a unity build through `griffin/griffin.c` and reads `Makefile.common`, so no separate file list is needed.
