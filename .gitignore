@@ -82,7 +82,9 @@ libretro-super
 run.sh
 convert_rumble.awk
 *~
+# DOWNPLAY: keep Downplay-owned bundled assets (font, etc.) tracked
 assets
+!downplay/assets/
 info
 content_favorites.lpl
 content_history.lpl

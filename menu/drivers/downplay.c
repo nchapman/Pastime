@@ -22,9 +22,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <file/file_path.h>
+
 #include "../menu_driver.h"
+#include "../../configuration.h"
 #include "../../gfx/gfx_display.h"
 #include "../../gfx/font_driver.h"
+
+#define DOWNPLAY_FONT_FILE "InterTight-Bold.ttf"
+#define DOWNPLAY_FONT_SIZE 32.0f
 
 typedef struct
 {
@@ -70,8 +76,12 @@ static void downplay_menu_free(void *data)
 
 static void downplay_menu_context_reset(void *data, bool video_is_threaded)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)data;
-   gfx_display_t *p_disp;
+   char fontpath[PATH_MAX_LENGTH];
+   char fontdir[PATH_MAX_LENGTH];
+   downplay_handle_t *dp    = (downplay_handle_t*)data;
+   settings_t        *settings;
+   gfx_display_t     *p_disp;
+
    if (!dp)
       return;
 
@@ -81,10 +91,27 @@ static void downplay_menu_context_reset(void *data, bool video_is_threaded)
       dp->font = NULL;
    }
 
-   /* NULL fontpath -> font driver picks a built-in fallback. Good enough
-    * for M0; real font selection follows asset/theme work later. */
+   settings = config_get_ptr();
    p_disp   = disp_get_ptr();
-   dp->font = gfx_display_font_file(p_disp, NULL, 32.0f, video_is_threaded);
+
+   /* Look for our bundled font under <assets_dir>/downplay/. Fall back to
+    * the renderer's built-in font if the asset is missing - lets the menu
+    * still come up on installs where assets weren't deployed yet. */
+   fontpath[0] = '\0';
+   if (settings && *settings->paths.directory_assets)
+   {
+      fill_pathname_join_special(fontdir,
+            settings->paths.directory_assets, "downplay", sizeof(fontdir));
+      fill_pathname_join_special(fontpath,
+            fontdir, DOWNPLAY_FONT_FILE, sizeof(fontpath));
+   }
+
+   if (*fontpath)
+      dp->font = gfx_display_font_file(p_disp, fontpath,
+            DOWNPLAY_FONT_SIZE, video_is_threaded);
+   if (!dp->font)
+      dp->font = gfx_display_font_file(p_disp, NULL,
+            DOWNPLAY_FONT_SIZE, video_is_threaded);
 }
 
 static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
