@@ -140,6 +140,14 @@ if [ -n "$include_shaders" ] ; then
     mkdir shaders ; mv glsl-shaders shaders/shaders_glsl ; mv slang-shaders shaders/shaders_slang
 fi
 
+# DOWNPLAY: overlay our bundled assets (e.g. assets/downplay/InterTight-Bold.ttf)
+# on top of the upstream tree before zipping, so the .app ships our font.
+downplay_assets="$WD/../../downplay/assets"
+if [ -d "$downplay_assets" ] ; then
+    echo "Packaging Downplay assets"
+    cp -R "$downplay_assets"/. .
+fi
+
 rm -f $assets_zip
 echo "Zipping final assets bundle..."
 zip -qr $assets_zip *

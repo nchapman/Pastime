@@ -92,6 +92,7 @@ This means: standard MinUI navigation (up / down / select / back / page) fits cl
 | `retroarch.c` (~L7497, after `config_load()`) | Call `downplay_defaults_apply()` to overlay defaults *after* upstream defaults + on-disk config but *before* CLI override (second pass starts ~L7509). | 1–2 lines |
 | `retroarch.c` `retroarch_main_init()` (immediately after the `downplay_defaults_apply()` call) | Call `downplay_bootstrap()` once. Defaults are now in place, paths resolve correctly, drivers haven't been initialized yet. | 1–2 lines |
 | `tasks/task_core_updater.c` (~L511, `cb_task_core_updater_download`) and `tasks/tasks_internal.h` | Add a setter `task_core_updater_set_download_callback(retro_task_callback_t)` so Downplay can hook "core finished installing → launch the pending ROM". The existing callback is hardcoded; this is the smallest additive change that avoids polling. | ~10 lines |
+| `pkg/apple/rebuild-assets.sh` | Overlay `downplay/assets/*` (e.g. `assets/downplay/InterTight-Bold.ttf`) into the macOS `.app`'s `assets.zip` before zipping, so the bundled-assets pipeline ships our font. | ~6 lines |
 
 **Contingent (only if proven necessary):**
 
