@@ -141,6 +141,13 @@ void task_push_update_installed_cores(
       bool auto_backup, size_t auto_backup_history_size,
       const char *path_dir_libretro,
       const char *path_dir_core_assets);
+
+/* DOWNPLAY: register a single-shot completion callback that fires after
+ * the next core-updater download finishes (success or failure).  The hook
+ * is automatically cleared after firing, so chained sequential installs
+ * must re-register inside the callback.  err is non-NULL on failure. */
+void task_core_updater_set_download_callback(
+      retro_task_callback_t cb, void *user_data);
 #if defined(ANDROID)
 void *task_push_play_feature_delivery_core_install(
       core_updater_list_t* core_list,
