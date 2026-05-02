@@ -124,25 +124,25 @@ menu/drivers/
 
 The roadmap is a sequence of derisking milestones. Each milestone is a working, runnable build. Desktop comes before Android because the iteration loop is much faster and the derisking questions are platform-independent.
 
-### M0 — Hello menu driver *(derisks: build + registration plumbing)*
+### M0 — Hello menu driver *(derisks: build + registration plumbing)* ✅
 
-- [ ] Create skeleton `menu/drivers/downplay.c` implementing the bare minimum of the `menu_ctx_driver_t` interface: `init`, `free`, `frame`, `ident`. The placeholder draw goes inside `frame` (no separate `render` slot is required).
-- [ ] Register it in `menu_driver.c` and add it to `Makefile.common`.
-- [ ] Renders a placeholder screen — solid background, "Downplay" label.
-- [ ] Build on macOS desktop, select Downplay as the menu driver via config, confirm it loads.
+- [x] Create skeleton `menu/drivers/downplay.c` implementing the bare minimum of the `menu_ctx_driver_t` interface: `init`, `free`, `frame`, `ident`. The placeholder draw goes inside `frame` (no separate `render` slot is required).
+- [x] Register it in `menu_driver.c` and add it to `Makefile.common`.
+- [x] Renders a placeholder screen — solid background, "Downplay" label.
+- [x] Build on macOS desktop, select Downplay as the menu driver via config, confirm it loads.
 
-**Exit criterion:** `./retroarch -v` boots into the Downplay menu driver and renders the placeholder.
+**Exit criterion:** `./retroarch -v` boots into the Downplay menu driver and renders the placeholder. *(met by `efe25422a8`)*
 
-### M1 — Storage discovery + folder browse *(derisks: storage convention + rendering)*
+### M1 — Storage discovery + folder browse *(derisks: storage convention + rendering)* 🚧
 
-- [ ] Implement `downplay_paths.c`: locate `Downplay/` at storage root. On desktop, look at `~/Downplay/`. On Android, walk the three storage tiers from `frontend/drivers/platform_unix.c:105–109,1810–1867` and pick the first writable one with a `Downplay/` directory (or the first writable one at all, for bootstrap).
-- [ ] Implement `downplay_systems.c`: enumerate `Roms/` via `dir_list_new()`. Parse each subfolder name with the `^(.+) \(([a-z0-9_]+)\)$` rule. Folders without a parens suffix are dropped. Returns a list of `{ display_name, core_ident, path }`.
-- [ ] Render the system list as the top of the Browse view; selecting a system reveals its ROMs.
-- [ ] Use `gfx_display_*` APIs and `gfx_display_font_file()`. Reuse RGUI's font path for the prototype (no custom asset bundle yet).
-- [ ] Standard navigation only (`MENU_ACTION_UP/DOWN/OK/CANCEL`) via driver navigation callbacks.
-- [ ] Selecting a ROM still just logs — no launch yet.
+- [ ] Implement `downplay_paths.c`: locate `Downplay/` at storage root. On desktop, look at `~/Downplay/`. On Android, walk the three storage tiers from `frontend/drivers/platform_unix.c:105–109,1810–1867` and pick the first writable one with a `Downplay/` directory (or the first writable one at all, for bootstrap). *(Deferred. Currently we read `settings->paths.directory_menu_content` (RA's `rgui_browser_directory`) and let the user point it at `~/Downplay/Roms`. Factoring into `downplay_paths.c` lands with M5/M6 when Android needs it.)*
+- [x] Implement `downplay_systems.c`: enumerate `Roms/` via `dir_list_new()`. Parse each subfolder name with the `^(.+) \(([a-z0-9_]+)\)$` rule. Folders without a parens suffix are dropped. Returns a list of `{ display_name, core_ident, path }`. *(Lives inline in `menu/drivers/downplay.c` for now; extract to its own module when a second consumer appears. Also drops empty folders so the launcher only shows rows the user can drill into.)*
+- [ ] Render the system list as the top of the Browse view; selecting a system reveals its ROMs. *(System list ✅. ROM drill-in pending.)*
+- [x] Use `gfx_display_*` APIs and `gfx_display_font_file()`. Reuse RGUI's font path for the prototype (no custom asset bundle yet). *(Using bundled InterTight-Bold.ttf instead — per the MinUI-style visual direction; falls back to the renderer's built-in font.)*
+- [x] Standard navigation only (`MENU_ACTION_UP/DOWN/OK/CANCEL`) via driver navigation callbacks. *(Implemented as an `entry_action` override since we own a single hardcoded list, not a `file_list_t`.)*
+- [ ] Selecting a ROM still just logs — no launch yet. *(Selecting a system logs today; ROM list comes with the drill-in.)*
 
-**Exit criterion:** drop ROMs into `Downplay/Roms/Super Nintendo (snes9x)/`, see the system and ROMs in the UI.
+**Exit criterion:** drop ROMs into `Downplay/Roms/Super Nintendo (snes9x)/`, see the system and ROMs in the UI. *(Systems visible; ROM drill-in still TODO.)*
 
 ### M2 — Launch using the parsed core ident *(derisks: content-load path from our driver)*
 

@@ -30,6 +30,7 @@
 #include <formats/image.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
+#include <retro_dirent.h>
 
 #include "../menu_driver.h"
 #include "../../configuration.h"
@@ -52,6 +53,15 @@
 #define DOWNPLAY_FONT_FILE "InterTight-Bold.ttf"
 
 #define DOWNPLAY_RECENTS_LABEL "Recently Played"
+
+/* One Roms/<folder> that conformed to the "Display Name (core_ident)"
+ * convention.  Folders without that suffix are dropped during scan, so
+ * by the time a downplay_system_t exists, both fields are non-empty. */
+typedef struct
+{
+   char *display_name;
+   char *core_ident;
+} downplay_system_t;
 
 typedef struct
 {
@@ -77,17 +87,17 @@ typedef struct
 {
    font_data_t        *font;
    font_data_t        *chrome_font;
-   /* Subdirectories of settings->paths.directory_menu_content; each is a
-    * "system" row.  NULL until the first rebuild.  Element basenames are
-    * stored in .data; .attr is unused. */
-   struct string_list *systems;
+   /* Sorted (by display_name) array of conforming Roms/ subfolders.
+    * NULL when system_count == 0. */
+   downplay_system_t  *systems;
+   size_t              system_count;
    uintptr_t           pill_cap_tex;  /* RGBA circle, used for rounded ends */
    downplay_layout_t   layout;
    size_t              selection;
    /* Number of entries in g_defaults.content_history at last rebuild.
     * 0 hides the "Recently Played" row entirely. */
    size_t              recent_count;
-   /* Cached: (recent_count > 0 ? 1 : 0) + systems->size. */
+   /* Cached: (recent_count > 0 ? 1 : 0) + system_count. */
    size_t              total_rows;
 } downplay_handle_t;
 
@@ -139,20 +149,154 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
    else
       sys_idx = row;
 
-   if (dp->systems && sys_idx < dp->systems->size)
-      return dp->systems->elems[sys_idx].data;
+   if (dp->systems && sys_idx < dp->system_count)
+      return dp->systems[sys_idx].display_name;
    return "";
 }
 
-/* Build dp->systems from one level of subdirectories under content_root.
- * Files at the top level are ignored — only folders count as systems. */
-static struct string_list *downplay_scan_systems(const char *content_root)
+/* Parse a Roms/ subfolder name per the convention from PLAN.md:
+ *   "Display Name (core_ident)"
+ *
+ * core_ident must be non-empty and contain only [a-z0-9_].  On match,
+ * heap-allocates display_name and core_ident (caller frees) and returns
+ * true.  Folders that don't match the pattern are silently rejected —
+ * strict convention is the feature; there is no fallback. */
+static bool downplay_parse_system_folder(const char *folder,
+      char **display_out, char **ident_out)
 {
-   struct string_list       *raw;
-   struct string_list       *out;
-   union string_list_elem_attr attr;
-   size_t                    i;
+   const char *open;
+   const char *ident_start;
+   size_t      folder_len;
+   size_t      display_len;
+   size_t      ident_len;
+   size_t      i;
+   char       *display;
+   char       *ident;
 
+   if (!folder)
+      return false;
+   folder_len = strlen(folder);
+   if (folder_len < 4 || folder[folder_len - 1] != ')')
+      return false;
+
+   /* Match the LAST " (" so display names with their own parens still
+    * work, e.g. "Game Boy Advance (hacks) (mgba)".  folder_len >= 4 above
+    * guarantees no size_t wraparound on (folder_len - 1). */
+   open = NULL;
+   for (i = folder_len - 1; i > 0; i--)
+   {
+      if (folder[i] == '(' && folder[i - 1] == ' ')
+      {
+         open = folder + i;
+         break;
+      }
+   }
+   if (!open)
+      return false;
+
+   ident_start = open + 1;
+   ident_len   = (folder + folder_len - 1) - ident_start;
+   if (ident_len == 0)
+      return false;
+   for (i = 0; i < ident_len; i++)
+   {
+      char c = ident_start[i];
+      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+         return false;
+   }
+
+   /* Display name is everything before the " (".  open points at '(', so
+    * the trailing space sits at open - 1; strip it. */
+   display_len = (size_t)(open - 1 - folder);
+   if (display_len == 0)
+      return false;
+
+   if (!(display = (char*)malloc(display_len + 1)))
+      return false;
+   if (!(ident = (char*)malloc(ident_len + 1)))
+   {
+      free(display);
+      return false;
+   }
+   memcpy(display, folder, display_len);
+   display[display_len] = '\0';
+   memcpy(ident, ident_start, ident_len);
+   ident[ident_len] = '\0';
+
+   *display_out = display;
+   *ident_out   = ident;
+   return true;
+}
+
+static int downplay_system_cmp(const void *a, const void *b)
+{
+   const downplay_system_t *sa = (const downplay_system_t*)a;
+   const downplay_system_t *sb = (const downplay_system_t*)b;
+   return strcasecmp(sa->display_name, sb->display_name);
+}
+
+static void downplay_systems_free(downplay_system_t *systems, size_t count)
+{
+   size_t i;
+   if (!systems)
+      return;
+   for (i = 0; i < count; i++)
+   {
+      free(systems[i].display_name);
+      free(systems[i].core_ident);
+   }
+   free(systems);
+}
+
+/* True if the folder contains at least one regular file anywhere in its
+ * tree.  Hides empty system folders from the launcher.  Walks via
+ * retro_opendir so we can bail at the first hit without allocating a
+ * full file listing — a 5000-ROM library would otherwise allocate
+ * megabytes per system on every rebuild. */
+static bool downplay_folder_has_content(const char *full_path)
+{
+   RDIR *dir;
+   bool  found = false;
+
+   if (!(dir = retro_opendir(full_path)))
+      return false;
+
+   while (retro_readdir(dir))
+   {
+      const char *name = retro_dirent_get_name(dir);
+      if (!name || name[0] == '.')
+         continue;
+      if (retro_dirent_is_dir(dir, NULL))
+      {
+         char child[PATH_MAX_LENGTH];
+         fill_pathname_join_special(child, full_path, name, sizeof(child));
+         if (downplay_folder_has_content(child))
+         {
+            found = true;
+            break;
+         }
+         continue;
+      }
+      found = true;
+      break;
+   }
+   retro_closedir(dir);
+   return found;
+}
+
+/* Scan Roms/ for conforming subfolders.  Drops files, drops folders that
+ * don't match "Display Name (core_ident)", and drops folders with no
+ * content inside.  Returns NULL + count==0 when nothing qualifies. */
+static downplay_system_t *downplay_scan_systems(const char *content_root,
+      size_t *out_count)
+{
+   struct string_list *raw;
+   downplay_system_t  *systems = NULL;
+   size_t              cap     = 0;
+   size_t              count   = 0;
+   size_t              i;
+
+   *out_count = 0;
    if (!content_root || !*content_root)
       return NULL;
 
@@ -161,29 +305,49 @@ static struct string_list *downplay_scan_systems(const char *content_root)
    if (!raw)
       return NULL;
 
-   out = string_list_new();
-   if (!out)
-   {
-      string_list_free(raw);
-      return NULL;
-   }
-
-   attr.i = 0;
    for (i = 0; i < raw->size; i++)
    {
-      char base[NAME_MAX_LENGTH];
+      char  base[NAME_MAX_LENGTH];
+      char *display = NULL;
+      char *ident   = NULL;
+
       if (raw->elems[i].attr.i != RARCH_DIRECTORY)
          continue;
       fill_pathname_base(base, raw->elems[i].data, sizeof(base));
-      if (*base)
-         string_list_append(out, base, attr);
+      if (!downplay_parse_system_folder(base, &display, &ident))
+         continue;
+      if (!downplay_folder_has_content(raw->elems[i].data))
+      {
+         free(display);
+         free(ident);
+         continue;
+      }
+
+      if (count == cap)
+      {
+         size_t             new_cap = cap ? cap * 2 : 8;
+         downplay_system_t *grown   = (downplay_system_t*)realloc(systems,
+               new_cap * sizeof(*systems));
+         if (!grown)
+         {
+            free(display);
+            free(ident);
+            break;
+         }
+         systems = grown;
+         cap     = new_cap;
+      }
+      systems[count].display_name = display;
+      systems[count].core_ident   = ident;
+      count++;
    }
    string_list_free(raw);
 
-   /* Sort case-insensitively by name; dir_first is irrelevant since we
-    * filtered to dirs only. */
-   dir_list_sort(out, false);
-   return out;
+   if (count > 1)
+      qsort(systems, count, sizeof(*systems), downplay_system_cmp);
+
+   *out_count = count;
+   return systems;
 }
 
 static void downplay_rebuild_lists(downplay_handle_t *dp)
@@ -201,12 +365,10 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
       root = expanded;
    }
 
-   if (dp->systems)
-   {
-      string_list_free(dp->systems);
-      dp->systems = NULL;
-   }
-   dp->systems = downplay_scan_systems(root);
+   downplay_systems_free(dp->systems, dp->system_count);
+   dp->systems      = NULL;
+   dp->system_count = 0;
+   dp->systems      = downplay_scan_systems(root, &dp->system_count);
 
    /* g_defaults.content_history is initialized once at boot in retroarch.c
     * and lives for the process lifetime, so reading it without locking is
@@ -215,8 +377,7 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
    dp->recent_count = g_defaults.content_history
                       ? playlist_size(g_defaults.content_history) : 0;
 
-   dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0)
-                  + (dp->systems ? dp->systems->size : 0);
+   dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0) + dp->system_count;
 
    if (dp->total_rows == 0)
       dp->selection = 0;
@@ -710,8 +871,7 @@ static void downplay_menu_free(void *data)
    downplay_menu_context_destroy(dp);
    /* systems is CPU-only state, freed here rather than in context_destroy
     * so it survives GPU context loss/reset cycles. */
-   if (dp->systems)
-      string_list_free(dp->systems);
+   downplay_systems_free(dp->systems, dp->system_count);
    free(dp);
 }
 
