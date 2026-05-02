@@ -1,0 +1,4 @@
+[tools]
+# AGP 4.2 / Gradle 6.7.1 require JDK 8 or 11.  JDK 17+ fails with
+# "module java.base does not opens java.io" on processManifest.
+java = "temurin-11.0.29+7"

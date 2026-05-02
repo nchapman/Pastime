@@ -113,6 +113,15 @@ void downplay_defaults_apply(void)
    settings->bools.savestate_auto_load        = true;
    settings->bools.savestate_thumbnail_enable = true;
 
+   /* Hide the noisy upstream OSD bits that don't fit the launcher's quiet
+    * aesthetic.  Disables the load-content splash, the modern widget
+    * notifications, and *all* legacy OSD text — including FPS, shader
+    * parameter overlays, error messages, and core-emitted RETRO_MESSAGE
+    * strings.  Coarse on purpose; M8 will expose a user toggle. */
+   settings->bools.menu_show_load_content_animation = false;
+   settings->bools.menu_enable_widgets              = false;
+   settings->bools.video_font_enable                = false;
+
    if (!downplay_paths_get_root(root, sizeof(root)))
    {
       RARCH_WARN("[Downplay] could not resolve Downplay/ root; "
