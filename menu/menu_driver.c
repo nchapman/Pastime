@@ -341,6 +341,9 @@ const menu_ctx_driver_t *menu_ctx_drivers[] = {
 #if defined(HAVE_XMB)
    &menu_ctx_xmb,
 #endif
+#if defined(HAVE_DOWNPLAY) /* DOWNPLAY: register custom menu driver */
+   &menu_ctx_downplay,
+#endif
    &menu_ctx_null,
    NULL
 };
