@@ -28,12 +28,16 @@
 #include <boolean.h>
 #include <file/file_path.h>
 #include <formats/image.h>
+#include <lists/dir_list.h>
+#include <lists/string_list.h>
 
 #include "../menu_driver.h"
 #include "../../configuration.h"
+#include "../../defaults.h"
 #include "../../gfx/gfx_display.h"
 #include "../../gfx/font_driver.h"
 #include "../../gfx/video_driver.h"
+#include "../../playlist.h"
 #include "../../verbosity.h"
 
 /* Reference design height in pixels — the mockup was drawn at this size,
@@ -47,15 +51,7 @@
 
 #define DOWNPLAY_FONT_FILE "InterTight-Bold.ttf"
 
-/* Hardcoded list for M1.  Replaced by real systems/recents in M3+. */
-static const char *downplay_stub_items[] = {
-   "Recently Played",
-   "Game Boy",
-   "Game Boy Advance",
-   "Game Boy Color",
-   "Genesis"
-};
-#define DOWNPLAY_STUB_COUNT (sizeof(downplay_stub_items) / sizeof(downplay_stub_items[0]))
+#define DOWNPLAY_RECENTS_LABEL "Recently Played"
 
 typedef struct
 {
@@ -79,11 +75,20 @@ typedef struct
 
 typedef struct
 {
-   font_data_t       *font;
-   font_data_t       *chrome_font;
-   uintptr_t          pill_cap_tex;   /* RGBA circle, used for rounded ends */
-   downplay_layout_t  layout;
-   size_t             selection;
+   font_data_t        *font;
+   font_data_t        *chrome_font;
+   /* Subdirectories of settings->paths.directory_menu_content; each is a
+    * "system" row.  NULL until the first rebuild.  Element basenames are
+    * stored in .data; .attr is unused. */
+   struct string_list *systems;
+   uintptr_t           pill_cap_tex;  /* RGBA circle, used for rounded ends */
+   downplay_layout_t   layout;
+   size_t              selection;
+   /* Number of entries in g_defaults.content_history at last rebuild.
+    * 0 hides the "Recently Played" row entirely. */
+   size_t              recent_count;
+   /* Cached: (recent_count > 0 ? 1 : 0) + systems->size. */
+   size_t              total_rows;
 } downplay_handle_t;
 
 /* Solid colors expressed as 4×RGBA (one vertex each, flat shaded).  Kept
@@ -112,6 +117,112 @@ static float DP_COLOR_PILL_DARK[16] = {
 #define DP_TEXT_LIGHT   0xFFFFFFFF
 #define DP_TEXT_DARK    0x000000FF
 #define DP_TEXT_MUTED   0x808080FF
+
+/* ---------- list (systems + recents) ---------- */
+
+/* True when row 0 is the "Recently Played" header and rows 1.. are systems;
+ * false when there are no recents and rows 0.. are systems directly. */
+static bool downplay_has_recents_row(const downplay_handle_t *dp)
+{
+   return dp->recent_count > 0;
+}
+
+static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
+{
+   size_t sys_idx;
+   if (downplay_has_recents_row(dp))
+   {
+      if (row == 0)
+         return DOWNPLAY_RECENTS_LABEL;
+      sys_idx = row - 1;
+   }
+   else
+      sys_idx = row;
+
+   if (dp->systems && sys_idx < dp->systems->size)
+      return dp->systems->elems[sys_idx].data;
+   return "";
+}
+
+/* Build dp->systems from one level of subdirectories under content_root.
+ * Files at the top level are ignored — only folders count as systems. */
+static struct string_list *downplay_scan_systems(const char *content_root)
+{
+   struct string_list       *raw;
+   struct string_list       *out;
+   union string_list_elem_attr attr;
+   size_t                    i;
+
+   if (!content_root || !*content_root)
+      return NULL;
+
+   raw = dir_list_new(content_root, NULL,
+         true /* include_dirs */, false, false, false /* not recursive */);
+   if (!raw)
+      return NULL;
+
+   out = string_list_new();
+   if (!out)
+   {
+      string_list_free(raw);
+      return NULL;
+   }
+
+   attr.i = 0;
+   for (i = 0; i < raw->size; i++)
+   {
+      char base[NAME_MAX_LENGTH];
+      if (raw->elems[i].attr.i != RARCH_DIRECTORY)
+         continue;
+      fill_pathname_base(base, raw->elems[i].data, sizeof(base));
+      if (*base)
+         string_list_append(out, base, attr);
+   }
+   string_list_free(raw);
+
+   /* Sort case-insensitively by name; dir_first is irrelevant since we
+    * filtered to dirs only. */
+   dir_list_sort(out, false);
+   return out;
+}
+
+static void downplay_rebuild_lists(downplay_handle_t *dp)
+{
+   char        expanded[PATH_MAX_LENGTH];
+   settings_t *settings   = config_get_ptr();
+   const char *root       = settings ? settings->paths.directory_menu_content : NULL;
+
+   /* directory_menu_content is stored verbatim — RA doesn't expand "~" or
+    * ":/" prefixes for this setting (see configuration.c).  Expand here so
+    * dir_list_new (POSIX opendir under the hood) can actually open it. */
+   if (root && *root)
+   {
+      fill_pathname_expand_special(expanded, root, sizeof(expanded));
+      root = expanded;
+   }
+
+   if (dp->systems)
+   {
+      string_list_free(dp->systems);
+      dp->systems = NULL;
+   }
+   dp->systems = downplay_scan_systems(root);
+
+   /* g_defaults.content_history is initialized once at boot in retroarch.c
+    * and lives for the process lifetime, so reading it without locking is
+    * fine — but only from the main thread.  playlist_size reads
+    * playlist->size unlocked, so don't call rebuild from a task callback. */
+   dp->recent_count = g_defaults.content_history
+                      ? playlist_size(g_defaults.content_history) : 0;
+
+   dp->total_rows = (downplay_has_recents_row(dp) ? 1 : 0)
+                  + (dp->systems ? dp->systems->size : 0);
+
+   if (dp->total_rows == 0)
+      dp->selection = 0;
+   else if (dp->selection >= dp->total_rows)
+      dp->selection = dp->total_rows - 1;
+}
 
 /* ---------- layout ---------- */
 
@@ -401,7 +512,7 @@ static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
 
 static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, const downplay_layout_t *L, uintptr_t cap_tex,
-      size_t selection)
+      const downplay_handle_t *dp)
 {
    size_t   i;
    /* Push the list below the status pill row so they don't collide. */
@@ -414,10 +525,14 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    bool     selected;
    uint32_t txt_color;
 
-   for (i = 0; i < DOWNPLAY_STUB_COUNT; i++)
+   for (i = 0; i < dp->total_rows; i++)
    {
-      selected  = (i == selection);
-      row_y     = list_top + (int)(i * (size_t)L->row_height);
+      row_y = list_top + (int)(i * (size_t)L->row_height);
+      /* Skip rows that fall below the bottom hint strip — saves draws on
+       * long lists and avoids text colliding with the chrome. */
+      if (row_y + L->row_height > (int)L->vid_h - L->margin_y - L->chrome_h)
+         break;
+      selected  = (i == dp->selection);
       txt_color = selected ? DP_TEXT_DARK : DP_TEXT_LIGHT;
 
       if (selected)
@@ -425,7 +540,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
                list_x, row_y, pill_w, L->row_height,
                DP_COLOR_PILL_LIGHT);
 
-      downplay_draw_text(font, downplay_stub_items[i],
+      downplay_draw_text(font, downplay_row_label(dp, i),
             (float)text_x, (float)(row_y + text_y_off), L,
             txt_color, TEXT_ALIGN_LEFT);
    }
@@ -477,7 +592,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
 
    /* Main list */
    downplay_draw_list(p_disp, userdata, dp->font,
-         &dp->layout, dp->pill_cap_tex, dp->selection);
+         &dp->layout, dp->pill_cap_tex, dp);
 
    /* Bottom hints */
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.chrome_h;
@@ -518,19 +633,28 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
    if (!dp)
       return -1;
 
+   /* Empty list (no recents and no system folders): swallow nav silently
+    * but still allow CANCEL to log, so input plumbing is observably alive. */
+   if (dp->total_rows == 0)
+   {
+      if (action == MENU_ACTION_CANCEL)
+         RARCH_LOG("[Downplay] cancel (empty list)\n");
+      return 0;
+   }
+
    switch (action)
    {
       case MENU_ACTION_UP:
-         dp->selection = (dp->selection + DOWNPLAY_STUB_COUNT - 1)
-                       % DOWNPLAY_STUB_COUNT;
+         dp->selection = (dp->selection + dp->total_rows - 1)
+                       % dp->total_rows;
          return 0;
       case MENU_ACTION_DOWN:
-         dp->selection = (dp->selection + 1) % DOWNPLAY_STUB_COUNT;
+         dp->selection = (dp->selection + 1) % dp->total_rows;
          return 0;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:
          RARCH_LOG("[Downplay] open: %s\n",
-               downplay_stub_items[dp->selection]);
+               downplay_row_label(dp, dp->selection));
          return 0;
       case MENU_ACTION_CANCEL:
          RARCH_LOG("[Downplay] cancel\n");
@@ -559,6 +683,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
    }
 
    dp->selection = 0;
+   downplay_rebuild_lists(dp);
    *userdata     = dp;
    return menu;
 }
@@ -579,10 +704,15 @@ static void downplay_menu_context_destroy(void *data)
 
 static void downplay_menu_free(void *data)
 {
-   if (!data)
+   downplay_handle_t *dp = (downplay_handle_t*)data;
+   if (!dp)
       return;
-   downplay_menu_context_destroy(data);
-   free(data);
+   downplay_menu_context_destroy(dp);
+   /* systems is CPU-only state, freed here rather than in context_destroy
+    * so it survives GPU context loss/reset cycles. */
+   if (dp->systems)
+      string_list_free(dp->systems);
+   free(dp);
 }
 
 static void downplay_menu_context_reset(void *data, bool video_is_threaded)
