@@ -43,6 +43,7 @@ typedef struct
    size_t                    count;
    size_t                    cursor;        /* index of currently-installing item */
    retro_time_t              await_started; /* usec; 0 outside AWAITING_LIST */
+   retro_task_t             *list_task;     /* the buildbot list-fetch task; NULL after finish */
    bool                      cancelled;     /* set true by cancel; pump short-circuits */
 } downplay_cores_t;
 
@@ -60,6 +61,7 @@ static void downplay_cores_clear_queue(void)
    g_state.count         = 0;
    g_state.cursor        = 0;
    g_state.await_started = 0;
+   g_state.list_task     = NULL;
    g_state.cancelled     = false;
 }
 
@@ -273,8 +275,8 @@ void downplay_cores_begin_boot_setup(const char *const *idents, size_t count)
       core_updater_list_init_cached();
    {
       core_updater_list_t *list = core_updater_list_get_cached();
-      task_push_get_core_updater_list(list,
-            true /* mute */, false /* refresh_menu */);
+      g_state.list_task = (retro_task_t*)task_push_get_core_updater_list(
+            list, true /* mute */, false /* refresh_menu */);
    }
    g_state.await_started = cpu_features_get_time_usec();
    g_state.state         = DOWNPLAY_CORES_AWAITING_LIST;
@@ -283,12 +285,32 @@ void downplay_cores_begin_boot_setup(const char *const *idents, size_t count)
 void downplay_cores_pump(void)
 {
    core_updater_list_t *list;
+   bool                 list_ready = false;
 
    if (g_state.state != DOWNPLAY_CORES_AWAITING_LIST)
       return;
 
+   /* The buildbot list parser populates the cached list incrementally
+    * from a worker thread (parse_network_data runs synchronously, but
+    * task processing can happen off-main on Android).  Polling
+    * `core_updater_list_size > 0` would race — find_entry then misses
+    * later entries and reports "not on buildbot" for cores that
+    * actually exist.  Wait until the list task is FINISHED, which is
+    * after the parser has appended every line. */
+   if (g_state.list_task)
+   {
+      uint8_t flg = task_get_flags(g_state.list_task);
+      if ((flg & RETRO_TASK_FLG_FINISHED) != 0)
+      {
+         g_state.list_task = NULL;
+         list_ready        = true;
+      }
+   }
+   else
+      list_ready = true;
+
    list = core_updater_list_get_cached();
-   if (list && core_updater_list_size(list) > 0)
+   if (list_ready && list && core_updater_list_size(list) > 0)
    {
       /* List arrived — start downloading.  queue_next handles the empty
        * case (lands in DONE). */
