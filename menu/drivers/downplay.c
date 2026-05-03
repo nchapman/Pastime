@@ -2006,13 +2006,15 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
 }
 
 /* Build the status-pill text from RA's built-in helpers: "HH:MM"
- * (24h) + battery, where battery is "NN%" / "NN% AC" (charging) /
- * "AC" (no battery, e.g. desktop builds).  Two-space gap so the
- * two halves read as separate elements.  Locale-aware time isn't
- * wired up yet — we pick the 24h style for now and revisit later
- * (PLAN: JNI hook for android.text.format.DateFormat.is24HourFormat). */
+ * (or "HH:MM AM/PM") + battery, where battery is "NN%" / "NN% AC"
+ * (charging) / "AC" (no battery, e.g. desktop builds).  Two-space
+ * gap so the two halves read as separate elements.  Time format
+ * tracks settings->uints.menu_timedate_style — set by the global
+ * Settings menu's Clock Format row.  Date+time styles fall back to
+ * 24-hour time-only since the pill has no room for a date. */
 static void downplay_build_status_text(char *out, size_t len)
 {
+   settings_t *settings = config_get_ptr();
    gfx_display_ctx_powerstate_t ps;
    gfx_display_ctx_datetime_t dt;
    char time_buf[16];
@@ -2023,7 +2025,10 @@ static void downplay_build_status_text(char *out, size_t len)
 
    time_buf[0] = '\0';
 
-   dt.time_mode      = MENU_TIMEDATE_STYLE_HM;
+   dt.time_mode      = (settings && settings->uints.menu_timedate_style
+                          == MENU_TIMEDATE_STYLE_HM_AMPM)
+                       ? MENU_TIMEDATE_STYLE_HM_AMPM
+                       : MENU_TIMEDATE_STYLE_HM;
    dt.date_separator = MENU_TIMEDATE_DATE_SEPARATOR_HYPHEN;
    menu_display_timedate(&dt, time_buf, sizeof(time_buf));
 
@@ -3601,6 +3606,182 @@ static downplay_settings_list_t *downplay_build_root_options_list(
    return L;
 }
 
+/* ---- Global Settings — launcher-level toggles, opened from the
+ * top view via Start.  Three rows: Swap A/B, Clock Format, Menu
+ * Scale.  Each persists immediately to the base retroarch.cfg via
+ * CMD_EVENT_MENU_SAVE_CURRENT_CONFIG since downplay_defaults_apply
+ * forces config_save_on_exit = false (so without an explicit save,
+ * changes here would vanish at process quit).  Reachable only from
+ * DOWNPLAY_VIEW_TOP, where there is no content loaded — so
+ * OVERRIDE_NONE always lands in the global cfg, never a per-core
+ * override. */
+
+/* Percentage scale presets multiplied on top of the base
+ * video_height/DOWNPLAY_REF_HEIGHT scaling.  5% steps from 75% to
+ * 125% — fine-grained enough that any device should land within
+ * one step of comfortable.  Single source of truth: the float
+ * multiplier is pct/100.0f and the row label is "NN%". */
+static const unsigned dp_global_scale_pct[] = {
+   75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125
+};
+#define DP_GLOBAL_SCALE_COUNT \
+   (sizeof(dp_global_scale_pct) / sizeof(dp_global_scale_pct[0]))
+
+/* Lazily-built parallel arrays of label strings + pointers.  Built
+ * once on first list construction so the values array passed to the
+ * settings row points into stable storage. */
+static char        dp_global_scale_label_buf[DP_GLOBAL_SCALE_COUNT][8];
+static const char *dp_global_scale_labels[DP_GLOBAL_SCALE_COUNT];
+
+static void dp_global_scale_labels_build(void)
+{
+   static bool built = false;
+   size_t      i;
+   if (built)
+      return;
+   for (i = 0; i < DP_GLOBAL_SCALE_COUNT; i++)
+   {
+      snprintf(dp_global_scale_label_buf[i],
+            sizeof(dp_global_scale_label_buf[i]),
+            "%u%%", dp_global_scale_pct[i]);
+      dp_global_scale_labels[i] = dp_global_scale_label_buf[i];
+   }
+   built = true;
+}
+
+static void dp_global_persist(void)
+{
+   command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL);
+}
+
+/* Read the active row's idx_value from the top settings frame.
+ * Used by every on_change below — the framework writes idx_value
+ * before invoking us, so the new state is already there. */
+static size_t dp_global_active_idx(downplay_handle_t *dp)
+{
+   downplay_settings_list_t *S = downplay_settings_top(dp);
+   if (!S || S->sel >= S->row_count)
+      return 0;
+   return S->rows[S->sel].idx_value;
+}
+
+static void dp_global_swap_ab_on_change(int delta, void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   settings_t        *s  = config_get_ptr();
+   (void)delta;
+   if (!dp || !s)
+      return;
+   s->bools.input_menu_swap_ok_cancel_buttons =
+         (dp_global_active_idx(dp) == 1);
+   dp_global_persist();
+}
+
+/* Two-state mapping: 0 → 24-hour (HM), 1 → 12-hour (HM_AMPM).
+ * Overwrites any pre-existing date+time style — Downplay's status
+ * pill is time-only, and we don't expose the full upstream
+ * timedate menu, so this is the only sanctioned way to set it. */
+static void dp_global_clock_on_change(int delta, void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   settings_t        *s  = config_get_ptr();
+   (void)delta;
+   if (!dp || !s)
+      return;
+   s->uints.menu_timedate_style = (dp_global_active_idx(dp) == 1)
+         ? MENU_TIMEDATE_STYLE_HM_AMPM
+         : MENU_TIMEDATE_STYLE_HM;
+   dp_global_persist();
+}
+
+static void dp_global_scale_on_change(int delta, void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   settings_t        *s  = config_get_ptr();
+   size_t             idx;
+   (void)delta;
+   if (!dp || !s)
+      return;
+   idx = dp_global_active_idx(dp);
+   if (idx >= DP_GLOBAL_SCALE_COUNT)
+      return;
+   s->floats.menu_scale_factor = (float)dp_global_scale_pct[idx] / 100.0f;
+   dp_global_persist();
+   /* Layout picks up the new scale on the next frame via
+    * downplay_layout_needs_recompute watching menu_scale_factor —
+    * no explicit recompute call needed. */
+}
+
+/* Map an arbitrary on-disk menu_scale_factor onto the closest
+ * bucket so the cursor lands on something sensible even when the
+ * user (or a prior install) wrote a value outside our discrete
+ * set. */
+static size_t dp_global_scale_current_idx(float current)
+{
+   size_t i, best   = 0;
+   float  best_diff = 1e9f;
+   for (i = 0; i < DP_GLOBAL_SCALE_COUNT; i++)
+   {
+      float d = current - (float)dp_global_scale_pct[i] / 100.0f;
+      if (d < 0.0f)
+         d = -d;
+      if (d < best_diff)
+      {
+         best_diff = d;
+         best      = i;
+      }
+   }
+   return best;
+}
+
+static downplay_settings_list_t *downplay_build_global_settings_list(
+      downplay_handle_t *dp)
+{
+   static const char * const off_on[]    = { "Off", "On" };
+   static const char * const clock_lab[] = { "24-hour", "12-hour" };
+
+   downplay_settings_list_t *L;
+   downplay_settings_row_t  *r;
+   settings_t               *s = config_get_ptr();
+   if (!s)
+      return NULL;
+   dp_global_scale_labels_build();
+   L = downplay_settings_list_new("Settings", 3, 0, 60);
+   if (!L)
+      return NULL;
+
+   r               = &L->rows[0];
+   r->title        = "Swap A/B";
+   r->desc         = "Use B to confirm and A to cancel.";
+   r->values       = off_on;
+   r->values_count = 2;
+   r->idx_value    = s->bools.input_menu_swap_ok_cancel_buttons ? 1 : 0;
+   r->on_change    = dp_global_swap_ab_on_change;
+   r->userdata     = dp;
+
+   r               = &L->rows[1];
+   r->title        = "Clock Format";
+   r->desc         = "How the status clock is displayed.";
+   r->values       = clock_lab;
+   r->values_count = 2;
+   r->idx_value    = (s->uints.menu_timedate_style
+                        == MENU_TIMEDATE_STYLE_HM_AMPM) ? 1 : 0;
+   r->on_change    = dp_global_clock_on_change;
+   r->userdata     = dp;
+
+   r               = &L->rows[2];
+   r->title        = "Menu Scale";
+   r->desc         = "Size of menu text and controls.";
+   r->values       = dp_global_scale_labels;
+   r->values_count = DP_GLOBAL_SCALE_COUNT;
+   r->idx_value    = dp_global_scale_current_idx(
+         s->floats.menu_scale_factor);
+   r->on_change    = dp_global_scale_on_change;
+   r->userdata     = dp;
+
+   return L;
+}
+
 /* Build a settings list mirroring the running core's option set.
  * Categories (v2) ignored on the first cut — flat list.  Hidden
  * options are skipped on enumeration; the Emulator nav row will
@@ -4042,12 +4223,23 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
       downplay_refresh_resume(dp);
       downplay_recompute_total_rows(dp);
    }
-   else if (!running && (dp->view == DOWNPLAY_VIEW_SETTINGS
-                      || dp->view == DOWNPLAY_VIEW_CONFIRM))
+   else if (!running
+         && ((dp->view == DOWNPLAY_VIEW_SETTINGS
+                  && dp->prior_view == DOWNPLAY_VIEW_INGAME)
+             || (dp->view == DOWNPLAY_VIEW_CONFIRM
+                  && (dp->confirm.prior_view == DOWNPLAY_VIEW_INGAME
+                     || (dp->confirm.prior_view == DOWNPLAY_VIEW_SETTINGS
+                        && dp->prior_view == DOWNPLAY_VIEW_INGAME)))))
    {
-      /* Same edge case as SAVE_PICKER: core died while in Options
-       * (or a confirm modal opened from there).  Tear down the
-       * settings stack and snap to TOP. */
+      /* Edge case: core died while in in-game Options (or a confirm
+       * modal opened from there).  Tear down the settings stack and
+       * snap to TOP.  Two slots track "where we came from": SETTINGS
+       * uses dp->prior_view (set on settings_push), CONFIRM uses
+       * dp->confirm.prior_view (set on open_confirm).  The compound
+       * predicate gates teardown to in-game-rooted views only — a
+       * launcher-rooted SETTINGS or CONFIRM (no game involved)
+       * legitimately persists across "no core loaded" frames and
+       * must not be ripped down. */
       downplay_settings_pop_all(dp);
       dp->confirm.on_confirm = NULL;
       dp->view      = DOWNPLAY_VIEW_TOP;
@@ -4551,6 +4743,8 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
       {
          if (action == MENU_ACTION_CANCEL)
             downplay_settings_pop(dp);
+         else if (action == MENU_ACTION_START)
+            downplay_settings_pop_all(dp);
          return 0;
       }
       switch (action)
@@ -4587,6 +4781,13 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          }
          case MENU_ACTION_CANCEL:
             downplay_settings_pop(dp);
+            return 0;
+         case MENU_ACTION_START:
+            /* Toggle close: mirrors Start-to-open from the launcher,
+             * and from deeper stacks (in-game Options) collapses the
+             * whole stack so the user exits Settings entirely instead
+             * of having to back out one level at a time. */
+            downplay_settings_pop_all(dp);
             return 0;
          default:
             return 0;
@@ -4769,6 +4970,15 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
             return 0;
          }
          /* TOP view: nothing to back out to.  Stay put. */
+         return 0;
+      case MENU_ACTION_START:
+         /* Launcher-only shortcut into the global Settings list.
+          * Other views ignore Start (RA's default for it is "reset
+          * to default" on whichever entry has focus, which we don't
+          * want bleeding into our list-driven views). */
+         if (dp->view == DOWNPLAY_VIEW_TOP)
+            downplay_settings_push(dp,
+                  downplay_build_global_settings_list(dp));
          return 0;
       default:
          break;
