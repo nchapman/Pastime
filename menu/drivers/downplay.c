@@ -2774,33 +2774,18 @@ static void dp_frontend_scaling_apply(size_t idx)
    command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
 }
 
-/* Sharp = nearest-neighbor texture filtering; Soft = bilinear.  A
- * third "Crisp" mode (supersample integer-prescale + bilinear
- * downsample) is the next addition to this list, but stock RA has no
- * builtin path for it — it'll land as an interpolation slang shader
- * the user picks from Screen Effect, or as a sibling row here that
- * loads such a shader internally.  Until then, Sharp + Soft cover
- * the two real builtin behaviors. */
-static const char *const dp_frontend_sharpness_labels[] = {
+/* Sharp = nearest, Soft = bilinear, Crisp = pixel_aa interpolation
+ * shader prepended to the pipeline (supersample-style AA at any
+ * scale, MinUI's signature look).  Crisp is only offered when the
+ * running video driver speaks slang — on gl1/gl/glsl the shader load
+ * silently fails, so we drop to the 2-element label set and the row
+ * just shows Sharp/Soft. */
+static const char *const dp_frontend_sharpness_labels_2[] = {
    "Sharp", "Soft"
 };
-
-static size_t dp_frontend_sharpness_current_idx(void)
-{
-   settings_t *s = config_get_ptr();
-   if (!s)
-      return 0;
-   return s->bools.video_smooth ? 1 : 0;
-}
-
-static void dp_frontend_sharpness_apply(size_t idx)
-{
-   settings_t *s = config_get_ptr();
-   if (!s)
-      return;
-   s->bools.video_smooth = (idx == 1);
-   command_event(CMD_EVENT_VIDEO_APPLY_STATE_CHANGES, NULL);
-}
+static const char *const dp_frontend_sharpness_labels_3[] = {
+   "Sharp", "Crisp", "Soft"
+};
 
 /* Slang shader presets shown by Screen Effect.  Paths are relative to
  * <directory_video_shader>/shaders_slang and must match the layout that
@@ -2846,48 +2831,107 @@ static bool dp_shader_resolve_path(const char *rel, char *out, size_t out_len)
    return true;
 }
 
-/* preset_idx >= DP_SHADER_PRESET_COUNT (e.g. SIZE_MAX from the
- * "Off" sentinel row) means "clear the shader" — use_path stays NULL
- * and menu_shader_manager_set_preset takes the goto-clear branch. */
-static void dp_shader_apply(size_t preset_idx)
+/* True iff pass 0 of the running shader is one of the pixel_aa
+ * variants (pixel_aa.slang, pixel_aa_fast.slang, pixel_aa_xform.slang
+ * etc.).  Used as the source-of-truth for "is Crisp on?" — survives
+ * override reloads with no extra wiring, since when a saved per-core
+ * preset has pixel_aa as pass 0 the cycler will read Crisp on next
+ * render. */
+static bool dp_shader_first_pass_is_crisp(void)
 {
-   char        path[PATH_MAX_LENGTH];
-   const char *use_path = NULL;
-   if (    preset_idx < DP_SHADER_PRESET_COUNT
-        && dp_shader_resolve_path(dp_shader_presets[preset_idx].path,
-              path, sizeof(path)))
-      use_path = path;
-   /* NULL/empty preset_path clears the running shader pipeline.
-    * Pass menu_shader_get() so the menu's mirror state stays in
-    * sync — passing NULL works but leaves the menu shader stale. */
-   menu_shader_manager_set_preset(menu_shader_get(),
-         RARCH_SHADER_SLANG, use_path, true);
+   struct video_shader *s = menu_shader_get();
+   const char          *bn;
+   if (!s || s->passes == 0)
+      return false;
+   bn = path_basename(s->pass[0].source.path);
+   return bn && !strncmp(bn, "pixel_aa", 8);
 }
 
-/* Match the currently-loaded preset against our table by basename.
- * Each preset in the table has a unique basename, so basename match
- * is sufficient and avoids absolute-path comparison fragility (case,
- * trailing slashes, symlinks, the #reference resolution that
- * loaded_preset_path applies).  Returns 0 (Off) when no shader is
- * loaded. */
+/* Apply the combined Sharpness=Crisp + Effect pipeline.  Both rows'
+ * on_change callbacks funnel through here so the shader stack always
+ * reflects the union of their states.  When Crisp is on we set the
+ * effect first (or NULL) and prepend pixel_aa, so pixel_aa always
+ * runs as pass 0 — matters for read-back, and is the order the
+ * MinUI-style supersample wants (interpolate then apply CRT etc.). */
+static void dp_frontend_apply_pipeline(bool crisp,
+      size_t effect_preset_idx)
+{
+   const char *crisp_rel = "pixel-art-scaling/pixel_aa.slangp";
+   char        crisp_abs[PATH_MAX_LENGTH];
+   char        effect_abs[PATH_MAX_LENGTH];
+   bool        have_crisp  = crisp
+        && dp_shader_resolve_path(crisp_rel, crisp_abs, sizeof(crisp_abs))
+        && path_is_valid(crisp_abs);
+   bool        have_effect = (effect_preset_idx < DP_SHADER_PRESET_COUNT)
+        && dp_shader_resolve_path(dp_shader_presets[effect_preset_idx].path,
+              effect_abs, sizeof(effect_abs))
+        && path_is_valid(effect_abs);
+
+   if (!have_crisp && !have_effect)
+   {
+      menu_shader_manager_set_preset(menu_shader_get(),
+            RARCH_SHADER_SLANG, NULL, true);
+      return;
+   }
+   if (have_crisp && !have_effect)
+   {
+      menu_shader_manager_set_preset(menu_shader_get(),
+            RARCH_SHADER_SLANG, crisp_abs, true);
+      return;
+   }
+   if (!have_crisp && have_effect)
+   {
+      menu_shader_manager_set_preset(menu_shader_get(),
+            RARCH_SHADER_SLANG, effect_abs, true);
+      return;
+   }
+   menu_shader_manager_set_preset(menu_shader_get(),
+         RARCH_SHADER_SLANG, effect_abs, true);
+   /* append_preset clears the menu's pass count on failure (see
+    * menu_driver.c:7069), which would leave the shader struct empty
+    * even though the Effect was already applied to the GPU.  On
+    * failure, re-set the Effect alone so the menu mirror matches
+    * what's actually rendering — read-back stays consistent and the
+    * user sees Crisp drop back off rather than the Effect vanishing. */
+   if (!menu_shader_manager_append_preset(menu_shader_get(),
+            crisp_abs, true))
+      menu_shader_manager_set_preset(menu_shader_get(),
+            RARCH_SHADER_SLANG, effect_abs, true);
+}
+
+/* Match the running shader's first non-pixel_aa pass against our
+ * preset table by basename.  Walking pass[].source.path (rather than
+ * shader->path) is necessary because Crisp prepends pixel_aa as a
+ * separate preset — shader->path would only name the most recent
+ * set_preset target, not the composed effect.  Each table entry has
+ * a unique source-file basename, so basename match is sufficient and
+ * avoids absolute-path fragility (case, symlinks, #reference). */
 static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
 {
    struct video_shader *shader = menu_shader_get();
-   const char          *cur;
+   unsigned             p;
    size_t               i;
-   if (!shader || shader->passes == 0 || !*shader->path)
+   if (!shader || shader->passes == 0)
       return 0;
-   cur = path_basename(shader->path);
-   if (!cur || !*cur)
-      return 0;
-   for (i = 1; i < ud->count; i++)
+   for (p = 0; p < shader->passes; p++)
    {
-      const char *cand;
-      if (ud->preset_idx[i] >= DP_SHADER_PRESET_COUNT)
+      const char *cur = path_basename(shader->pass[p].source.path);
+      if (!cur || !*cur)
          continue;
-      cand = path_basename(dp_shader_presets[ud->preset_idx[i]].path);
-      if (cand && string_is_equal(cand, cur))
-         return i;
+      if (!strncmp(cur, "pixel_aa", 8))
+         continue;
+      for (i = 1; i < ud->count; i++)
+      {
+         const char *cand;
+         if (ud->preset_idx[i] >= DP_SHADER_PRESET_COUNT)
+            continue;
+         cand = path_basename(dp_shader_presets[ud->preset_idx[i]].path);
+         if (cand && string_is_equal(cand, cur))
+            return i;
+      }
+      /* First non-pixel_aa pass didn't match — Effect is set to
+       * something we don't track.  Don't keep walking; report Off. */
+      break;
    }
    return 0;
 }
@@ -2905,24 +2949,84 @@ static void dp_frontend_scaling_on_change(int delta, void *userdata)
    dp_frontend_scaling_apply(S->rows[S->sel].idx_value);
 }
 
+/* Forward decl — sharpness on_change reaches the effect row by
+ * function-pointer identity, and effect on_change does the
+ * symmetrical lookup; one of the two needs to be visible early. */
+static void dp_frontend_effect_on_change(int delta, void *userdata);
+
+/* Walk the active settings list for the row whose on_change matches
+ * the passed function pointer; returns NULL if no such row exists
+ * (e.g. Effect row hidden on a non-slang driver). */
+static const downplay_settings_row_t *dp_frontend_find_row(
+      downplay_settings_list_t *S,
+      void (*on_change)(int, void*))
+{
+   size_t i;
+   if (!S)
+      return NULL;
+   for (i = 0; i < S->row_count; i++)
+      if (S->rows[i].on_change == on_change)
+         return &S->rows[i];
+   return NULL;
+}
+
+/* Pull the currently-selected effect preset index off the Effect
+ * row's userdata (a dp_shader_row_ud_t).  Returns SIZE_MAX when the
+ * row is absent or selected on Off. */
+static size_t dp_frontend_current_effect_idx(downplay_settings_list_t *S)
+{
+   const downplay_settings_row_t *r = dp_frontend_find_row(S,
+         dp_frontend_effect_on_change);
+   const dp_shader_row_ud_t      *ud;
+   if (!r || !r->userdata)
+      return SIZE_MAX;
+   ud = (const dp_shader_row_ud_t*)r->userdata;
+   if (r->idx_value >= ud->count)
+      return SIZE_MAX;
+   return ud->preset_idx[r->idx_value];
+}
+
 static void dp_frontend_sharpness_on_change(int delta, void *userdata)
 {
    downplay_handle_t        *dp = (downplay_handle_t*)userdata;
    downplay_settings_list_t *S;
+   settings_t               *s  = config_get_ptr();
+   size_t                    sharp_idx;
+   bool                      crisp;
+   bool                      three_label;
    (void)delta;
-   if (!dp)
+   if (!dp || !s)
       return;
    S = downplay_settings_top(dp);
    if (!S || S->sel >= S->row_count)
       return;
-   dp_frontend_sharpness_apply(S->rows[S->sel].idx_value);
+   sharp_idx   = S->rows[S->sel].idx_value;
+   /* The label set is 2 (Sharp/Soft) on non-slang drivers and 3
+    * (Sharp/Crisp/Soft) elsewhere — read off the row to know which
+    * index means which. */
+   three_label = (S->rows[S->sel].values_count == 3);
+   crisp       = three_label && (sharp_idx == 1);
+   /* Sharp/Soft drive video_smooth; Crisp forces it false (the
+    * shader does its own filtering via filter_linear directives, so
+    * the sampler state doesn't matter once pixel_aa runs). */
+   s->bools.video_smooth = three_label
+        ? (sharp_idx == 2)
+        : (sharp_idx == 1);
+   command_event(CMD_EVENT_VIDEO_APPLY_STATE_CHANGES, NULL);
+   dp_frontend_apply_pipeline(crisp, dp_frontend_current_effect_idx(S));
+   /* Pipeline composition changed → Save Changes must persist the
+    * combined .slangp.  Effect row's dirty flag is the same flag and
+    * gets set from there too; one source of truth. */
+   dp->frontend_effect_dirty = true;
 }
 
 static void dp_frontend_effect_on_change(int delta, void *userdata)
 {
    dp_shader_row_ud_t       *ud = (dp_shader_row_ud_t*)userdata;
    downplay_settings_list_t *S;
-   size_t                    idx;
+   const downplay_settings_row_t *sharp_row;
+   size_t                    idx, effect_preset_idx;
+   bool                      crisp = false;
    (void)delta;
    if (!ud || !ud->dp)
       return;
@@ -2932,7 +3036,12 @@ static void dp_frontend_effect_on_change(int delta, void *userdata)
    idx = S->rows[S->sel].idx_value;
    if (idx >= ud->count)
       return;
-   dp_shader_apply(ud->preset_idx[idx]);
+   effect_preset_idx = ud->preset_idx[idx];
+   sharp_row         = dp_frontend_find_row(S,
+         dp_frontend_sharpness_on_change);
+   if (sharp_row && sharp_row->values_count == 3)
+      crisp = (sharp_row->idx_value == 1);
+   dp_frontend_apply_pipeline(crisp, effect_preset_idx);
    ud->dp->frontend_effect_dirty = true;
 }
 
@@ -3007,17 +3116,35 @@ static downplay_settings_list_t *downplay_build_frontend_list(
       r->userdata    = shader_ud;
    }
 
-   /* Screen Sharpness */
-   r              = &L->rows[out_row++];
-   r->title       = "Screen Sharpness";
-   r->desc        = "Sharp keeps hard pixel edges; Soft applies "
-                    "bilinear smoothing.";
-   r->values      = dp_frontend_sharpness_labels;
-   r->values_count = sizeof(dp_frontend_sharpness_labels)
-                  / sizeof(dp_frontend_sharpness_labels[0]);
-   r->idx_value   = dp_frontend_sharpness_current_idx();
-   r->on_change   = dp_frontend_sharpness_on_change;
-   r->userdata    = dp;
+   /* Screen Sharpness — Sharp/Crisp/Soft when slang is available,
+    * Sharp/Soft otherwise (Crisp needs the pixel_aa interpolation
+    * shader). */
+   {
+      settings_t *s        = config_get_ptr();
+      bool        smooth   = s && s->bools.video_smooth;
+      bool        crisp_on = slang_ok && dp_shader_first_pass_is_crisp();
+      r              = &L->rows[out_row++];
+      r->title       = "Screen Sharpness";
+      r->desc        = slang_ok
+           ? "Sharp keeps hard pixel edges; Crisp smooths them with "
+             "subpixel anti-aliasing; Soft applies bilinear blur."
+           : "Sharp keeps hard pixel edges; Soft applies bilinear "
+             "smoothing.";
+      if (slang_ok)
+      {
+         r->values       = dp_frontend_sharpness_labels_3;
+         r->values_count = 3;
+         r->idx_value    = crisp_on ? 1 : (smooth ? 2 : 0);
+      }
+      else
+      {
+         r->values       = dp_frontend_sharpness_labels_2;
+         r->values_count = 2;
+         r->idx_value    = smooth ? 1 : 0;
+      }
+      r->on_change   = dp_frontend_sharpness_on_change;
+      r->userdata    = dp;
+   }
 
    return L;
 }
