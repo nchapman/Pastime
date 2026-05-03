@@ -29,6 +29,7 @@
 #include "../paths.h"
 #include "../verbosity.h"
 #include "../input/input_defines.h"
+#include "../gfx/video_defines.h"
 
 #ifdef ANDROID
 /* These globals live in platform_unix.c.  We declare extern locally
@@ -113,6 +114,46 @@ void downplay_defaults_apply(void)
    settings->bools.savestate_auto_load        = true;
    settings->bools.savestate_thumbnail_enable = true;
 
+   /* Frontend video defaults (M8): Sharp + Aspect.  These map to the
+    * Frontend submenu's Screen Scaling = Aspect (core PAR + integer
+    * scaling) and Screen Sharpness = Sharp (nearest-neighbor — RA's
+    * desktop default, intentionally retained).  Applied unconditionally
+    * since RA's aspect default elsewhere can be ASPECT_RATIO_CONFIG /
+    * 16:9 / 4:3 depending on platform. */
+   settings->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
+   settings->bools.video_scale_integer        = true;
+
+   /* In-game settings persistence model (M8).  Two pieces:
+    *
+    * 1. config_save_on_exit = false: prevents settings_t from being
+    *    flushed to retroarch.cfg at process quit.  All in-game
+    *    settings changes are session-only by default; persistence
+    *    requires the user to explicitly hit Save for console / Save
+    *    for game in the in-game menu, which writes a per-core or
+    *    per-game override file (configuration.c stacks overrides on
+    *    top of the base cfg automatically on next launch).
+    *    Belt-and-suspenders against the launcher path — when content
+    *    isn't loaded there's no override active, so the override
+    *    block in config_save_file (configuration.c:5844) doesn't
+    *    apply, and any settings changed from a launcher menu would
+    *    leak globally without this.
+    *
+    *    Note: this overlay is unconditional, not gated by a
+    *    "should_overlay" check.  A user who manually sets
+    *    config_save_on_exit = true in their retroarch.cfg will see
+    *    it silently reverted on every boot — that's deliberate, not
+    *    a bug.  The session-only persistence model depends on this
+    *    flag being off, and toggling it would silently break the
+    *    Frontend submenu's commit semantics.
+    *
+    * 2. auto_shaders_enable = true: gates RA's per-core / per-game
+    *    .slangp auto-load on core+content launch.  The Save for
+    *    console / game actions write these files via
+    *    menu_shader_manager_save_auto_preset; without auto-load the
+    *    saved preset wouldn't take effect on the next session. */
+   settings->bools.config_save_on_exit        = false;
+   settings->bools.auto_shaders_enable        = true;
+
    /* Hide the noisy upstream OSD bits that don't fit the launcher's quiet
     * aesthetic.  Disables the load-content splash, the modern widget
     * notifications, and *all* legacy OSD text — including FPS, shader
@@ -166,5 +207,15 @@ void downplay_defaults_apply(void)
       }
    }
 
-   RARCH_LOG("[Downplay] defaults applied; root=%s\n", root);
+   /* Boot log only.  defaults_apply now runs on every cfg reload
+    * (game exit, CMD_EVENT_RELOAD_CONFIG, override stack reload),
+    * which would spam this line on every short session. */
+   {
+      static bool logged = false;
+      if (!logged)
+      {
+         RARCH_LOG("[Downplay] defaults applied; root=%s\n", root);
+         logged = true;
+      }
+   }
 }

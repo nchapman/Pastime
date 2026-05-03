@@ -34,8 +34,10 @@
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
 #include <retro_dirent.h>
+#include <string/stdstring.h>
 
 #include "../menu_driver.h"
+#include "../menu_shader.h"
 #include "../../command.h"
 #include "../../configuration.h"
 #include "../../content.h"
@@ -318,6 +320,13 @@ typedef struct
     * happen inside on_change because the rebuild frees the row
     * userdata that on_change was just called on. */
    bool                      settings_rebuild_pending;
+   /* Tracks whether the user touched Screen Effect during this
+    * session.  Save Changes only writes/removes the shader auto-
+    * preset file when this is true — otherwise hitting Save just
+    * to persist a core-option tweak would silently delete a
+    * previously-saved per-core/per-game .slangp the user never
+    * intended to touch. */
+   bool                      frontend_effect_dirty;
 
    /* Confirm view (DOWNPLAY_VIEW_CONFIRM).  A small modal screen
     * driven entirely by these fields — no per-call allocation.
@@ -2678,9 +2687,8 @@ static void downplay_action_open_core_options(void *userdata)
       downplay_settings_push(dp, L);
 }
 
-/* Stub list — placeholder used by Frontend / Controls / Shortcuts
- * until they have real implementations.  One nav row that just
- * cancels back. */
+/* Stub list — placeholder used by Controls / Shortcuts until they
+ * have real implementations.  One nav row that just cancels back. */
 static downplay_settings_list_t *downplay_build_stub_list(const char *title)
 {
    downplay_settings_list_t *L = downplay_settings_list_new(title, 1, 0, 50);
@@ -2691,10 +2699,333 @@ static downplay_settings_list_t *downplay_build_stub_list(const char *title)
    return L;
 }
 
+/* ---- Frontend submenu (M8): Screen Scaling / Effect / Sharpness ----
+ *
+ * Three rows.  Each row is a value cycler whose on_change writes
+ * into settings_t and dispatches the appropriate command_event so the
+ * change takes effect on the next frame without leaving the menu.
+ *
+ * Scaling and Sharpness combine two RA knobs each — see the apply
+ * helpers for the mapping.  Effect drives the slang shader pipeline
+ * via menu_shader_manager_set_preset; rows are filtered to presets
+ * present on disk so cores without the slang shaders content bucket
+ * installed get a usable (smaller) list rather than a wall of
+ * "shader not found" errors. */
+
+/* Native and Cropped both use square pixels (ASPECT_RATIO_SQUARE) +
+ * integer scaling.  They differ only in scale_integer_scaling:
+ * UNDERSCALE for Native (largest integer factor that fits inside the
+ * display) vs OVERSCALE for Cropped (next factor up — clips a few
+ * rows/columns at the display edges to fill more of the screen).
+ * OVERSCALE is most useful on small handheld displays where the
+ * underscale factor wastes a noticeable border. */
+static const char *const dp_frontend_scaling_labels[] = {
+   "Native", "Cropped", "Aspect", "Fullscreen"
+};
+
+static size_t dp_frontend_scaling_current_idx(void)
+{
+   settings_t *s = config_get_ptr();
+   if (!s)
+      return 2;
+   if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_FULL)
+      return 3;
+   if (    s->bools.video_scale_integer
+        && s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE)
+      return (s->uints.video_scale_integer_scaling
+            == VIDEO_SCALE_INTEGER_SCALING_OVERSCALE) ? 1 : 0;
+   return 2;
+}
+
+static void dp_frontend_scaling_apply(size_t idx)
+{
+   settings_t *s = config_get_ptr();
+   if (!s)
+      return;
+   switch (idx)
+   {
+      case 0: /* Native — square pixels, fit inside */
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_SQUARE;
+         s->bools.video_scale_integer        = true;
+         s->uints.video_scale_integer_scaling
+                                             = VIDEO_SCALE_INTEGER_SCALING_UNDERSCALE;
+         break;
+      case 1: /* Cropped — square pixels, overscale & clip */
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_SQUARE;
+         s->bools.video_scale_integer        = true;
+         s->uints.video_scale_integer_scaling
+                                             = VIDEO_SCALE_INTEGER_SCALING_OVERSCALE;
+         break;
+      case 3: /* Fullscreen — stretch */
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_FULL;
+         s->bools.video_scale_integer        = false;
+         break;
+      case 2:
+      default: /* Aspect — core PAR, fit inside */
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
+         s->bools.video_scale_integer        = true;
+         s->uints.video_scale_integer_scaling
+                                             = VIDEO_SCALE_INTEGER_SCALING_UNDERSCALE;
+         break;
+   }
+   /* SET_ASPECT_RATIO already raises the SHOULD_RESIZE flag on every
+    * modern video driver via video_driver_set_aspect_ratio(); a
+    * follow-up APPLY_STATE_CHANGES would be redundant. */
+   command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
+}
+
+/* Sharp = nearest-neighbor texture filtering; Soft = bilinear.  A
+ * third "Crisp" mode (supersample integer-prescale + bilinear
+ * downsample) is the next addition to this list, but stock RA has no
+ * builtin path for it — it'll land as an interpolation slang shader
+ * the user picks from Screen Effect, or as a sibling row here that
+ * loads such a shader internally.  Until then, Sharp + Soft cover
+ * the two real builtin behaviors. */
+static const char *const dp_frontend_sharpness_labels[] = {
+   "Sharp", "Soft"
+};
+
+static size_t dp_frontend_sharpness_current_idx(void)
+{
+   settings_t *s = config_get_ptr();
+   if (!s)
+      return 0;
+   return s->bools.video_smooth ? 1 : 0;
+}
+
+static void dp_frontend_sharpness_apply(size_t idx)
+{
+   settings_t *s = config_get_ptr();
+   if (!s)
+      return;
+   s->bools.video_smooth = (idx == 1);
+   command_event(CMD_EVENT_VIDEO_APPLY_STATE_CHANGES, NULL);
+}
+
+/* Slang shader presets shown by Screen Effect.  Paths are relative to
+ * <directory_video_shader>/shaders_slang and must match the layout that
+ * downplay_setup.c lays down for the slang shaders bucket. */
+typedef struct
+{
+   const char *label;
+   const char *path;
+} dp_shader_preset_t;
+
+static const dp_shader_preset_t dp_shader_presets[] = {
+   { "LCD Grid",  "handheld/lcd-grid-v2.slangp" },
+   { "Sharp CRT", "crt/crt-aperture.slangp" },
+   { "Soft CRT",  "crt/crt-consumer.slangp" },
+   { "CRT Glow",  "crt/crt-easymode-halation.slangp" },
+   { "CRT Lite",  "crt/zfast-crt.slangp" },
+};
+#define DP_SHADER_PRESET_COUNT \
+   (sizeof(dp_shader_presets)/sizeof(dp_shader_presets[0]))
+
+/* Per-row userdata for the Screen Effect cycler.  preset_idx[i] is
+ * the index into dp_shader_presets[] for visible row i, or SIZE_MAX
+ * for the "Off" sentinel at row 0.  labels mirrors dp_shader_presets[].label
+ * (or "Off"); rows[].values points at this array. */
+typedef struct
+{
+   downplay_handle_t *dp;
+   size_t             preset_idx[DP_SHADER_PRESET_COUNT + 1];
+   const char        *labels[DP_SHADER_PRESET_COUNT + 1];
+   size_t             count;
+} dp_shader_row_ud_t;
+
+/* Build absolute path: <video_shader_dir>/shaders_slang/<rel>. */
+static bool dp_shader_resolve_path(const char *rel, char *out, size_t out_len)
+{
+   settings_t *s = config_get_ptr();
+   char        mid[PATH_MAX_LENGTH];
+   if (!s || !*s->paths.directory_video_shader)
+      return false;
+   fill_pathname_join_special(mid, s->paths.directory_video_shader,
+         "shaders_slang", sizeof(mid));
+   fill_pathname_join_special(out, mid, rel, out_len);
+   return true;
+}
+
+/* preset_idx >= DP_SHADER_PRESET_COUNT (e.g. SIZE_MAX from the
+ * "Off" sentinel row) means "clear the shader" — use_path stays NULL
+ * and menu_shader_manager_set_preset takes the goto-clear branch. */
+static void dp_shader_apply(size_t preset_idx)
+{
+   char        path[PATH_MAX_LENGTH];
+   const char *use_path = NULL;
+   if (    preset_idx < DP_SHADER_PRESET_COUNT
+        && dp_shader_resolve_path(dp_shader_presets[preset_idx].path,
+              path, sizeof(path)))
+      use_path = path;
+   /* NULL/empty preset_path clears the running shader pipeline.
+    * Pass menu_shader_get() so the menu's mirror state stays in
+    * sync — passing NULL works but leaves the menu shader stale. */
+   menu_shader_manager_set_preset(menu_shader_get(),
+         RARCH_SHADER_SLANG, use_path, true);
+}
+
+/* Match the currently-loaded preset against our table by basename.
+ * Each preset in the table has a unique basename, so basename match
+ * is sufficient and avoids absolute-path comparison fragility (case,
+ * trailing slashes, symlinks, the #reference resolution that
+ * loaded_preset_path applies).  Returns 0 (Off) when no shader is
+ * loaded. */
+static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
+{
+   struct video_shader *shader = menu_shader_get();
+   const char          *cur;
+   size_t               i;
+   if (!shader || shader->passes == 0 || !*shader->path)
+      return 0;
+   cur = path_basename(shader->path);
+   if (!cur || !*cur)
+      return 0;
+   for (i = 1; i < ud->count; i++)
+   {
+      const char *cand;
+      if (ud->preset_idx[i] >= DP_SHADER_PRESET_COUNT)
+         continue;
+      cand = path_basename(dp_shader_presets[ud->preset_idx[i]].path);
+      if (cand && string_is_equal(cand, cur))
+         return i;
+   }
+   return 0;
+}
+
+static void dp_frontend_scaling_on_change(int delta, void *userdata)
+{
+   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
+   downplay_settings_list_t *S;
+   (void)delta;
+   if (!dp)
+      return;
+   S = downplay_settings_top(dp);
+   if (!S || S->sel >= S->row_count)
+      return;
+   dp_frontend_scaling_apply(S->rows[S->sel].idx_value);
+}
+
+static void dp_frontend_sharpness_on_change(int delta, void *userdata)
+{
+   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
+   downplay_settings_list_t *S;
+   (void)delta;
+   if (!dp)
+      return;
+   S = downplay_settings_top(dp);
+   if (!S || S->sel >= S->row_count)
+      return;
+   dp_frontend_sharpness_apply(S->rows[S->sel].idx_value);
+}
+
+static void dp_frontend_effect_on_change(int delta, void *userdata)
+{
+   dp_shader_row_ud_t       *ud = (dp_shader_row_ud_t*)userdata;
+   downplay_settings_list_t *S;
+   size_t                    idx;
+   (void)delta;
+   if (!ud || !ud->dp)
+      return;
+   S = downplay_settings_top(ud->dp);
+   if (!S || S->sel >= S->row_count)
+      return;
+   idx = S->rows[S->sel].idx_value;
+   if (idx >= ud->count)
+      return;
+   dp_shader_apply(ud->preset_idx[idx]);
+   ud->dp->frontend_effect_dirty = true;
+}
+
+static downplay_settings_list_t *downplay_build_frontend_list(
+      downplay_handle_t *dp)
+{
+   downplay_settings_list_t *L;
+   dp_shader_row_ud_t       *shader_ud;
+   downplay_settings_row_t  *r;
+   size_t                    i;
+   size_t                    out_row   = 0;
+   /* Slang shader pipeline only works on slang-capable contexts
+    * (vulkan / glcore / d3d10+ / metal).  On gl1/gl/glsl drivers,
+    * menu_shader_manager_set_preset silently fails — the user would
+    * cycle the row but see no change.  Hide the row entirely on
+    * those drivers rather than presenting a broken control.  Also
+    * defends against builds compiled without a menu shader manager
+    * (menu_shader_get returning NULL, which the helpers already
+    * tolerate but the row itself would still be a no-op). */
+   bool                      slang_ok  = video_driver_test_all_flags(
+         GFX_CTX_FLAGS_SHADERS_SLANG) && menu_shader_get() != NULL;
+   size_t                    row_count = slang_ok ? 3 : 2;
+   char                      path[PATH_MAX_LENGTH];
+
+   L = downplay_settings_list_new("Frontend", row_count,
+         slang_ok ? sizeof(dp_shader_row_ud_t) : 0, 60);
+   if (!L)
+      return NULL;
+
+   /* Screen Scaling */
+   r              = &L->rows[out_row++];
+   r->title       = "Screen Scaling";
+   r->desc        = "Native is square pixels; Cropped fills the "
+                    "screen and clips edges; Aspect uses the game's "
+                    "intended ratio; Fullscreen stretches.";
+   r->values      = dp_frontend_scaling_labels;
+   r->values_count = sizeof(dp_frontend_scaling_labels)
+                  / sizeof(dp_frontend_scaling_labels[0]);
+   r->idx_value   = dp_frontend_scaling_current_idx();
+   r->on_change   = dp_frontend_scaling_on_change;
+   r->userdata    = dp;
+
+   /* Screen Effect — only when the running video driver speaks slang. */
+   if (slang_ok)
+   {
+      shader_ud      = (dp_shader_row_ud_t*)L->userdata_pool;
+      shader_ud->dp  = dp;
+      /* Row 0 is always Off; further rows added per existing preset. */
+      shader_ud->labels[0]     = "Off";
+      shader_ud->preset_idx[0] = SIZE_MAX;
+      shader_ud->count         = 1;
+      for (i = 0; i < DP_SHADER_PRESET_COUNT; i++)
+      {
+         if (!dp_shader_resolve_path(dp_shader_presets[i].path,
+                  path, sizeof(path)))
+            continue;
+         if (!path_is_valid(path))
+            continue;
+         shader_ud->labels[shader_ud->count]     = dp_shader_presets[i].label;
+         shader_ud->preset_idx[shader_ud->count] = i;
+         shader_ud->count++;
+      }
+
+      r              = &L->rows[out_row++];
+      r->title       = "Screen Effect";
+      r->desc        = "Apply a shader over the picture.  Install the "
+                       "Slang Shaders content bucket for more options.";
+      r->values      = shader_ud->labels;
+      r->values_count = shader_ud->count;
+      r->idx_value   = dp_shader_current_idx(shader_ud);
+      r->on_change   = dp_frontend_effect_on_change;
+      r->userdata    = shader_ud;
+   }
+
+   /* Screen Sharpness */
+   r              = &L->rows[out_row++];
+   r->title       = "Screen Sharpness";
+   r->desc        = "Sharp keeps hard pixel edges; Soft applies "
+                    "bilinear smoothing.";
+   r->values      = dp_frontend_sharpness_labels;
+   r->values_count = sizeof(dp_frontend_sharpness_labels)
+                  / sizeof(dp_frontend_sharpness_labels[0]);
+   r->idx_value   = dp_frontend_sharpness_current_idx();
+   r->on_change   = dp_frontend_sharpness_on_change;
+   r->userdata    = dp;
+
+   return L;
+}
+
 static void downplay_action_open_frontend(void *userdata)
 {
    downplay_handle_t *dp = (downplay_handle_t*)userdata;
-   downplay_settings_push(dp, downplay_build_stub_list("Frontend"));
+   downplay_settings_push(dp, downplay_build_frontend_list(dp));
 }
 
 static void downplay_action_open_controls(void *userdata)
@@ -2711,26 +3042,81 @@ static void downplay_action_open_shortcuts(void *userdata)
 
 /* Save Changes submenu — three scoped persist operations.  Each
  * action calls into the existing retroarch.h helpers (no new patch
- * point needed) and shows a confirm/ack via DOWNPLAY_VIEW_CONFIRM. */
+ * point needed) and shows a confirm/ack via DOWNPLAY_VIEW_CONFIRM.
+ *
+ * Persistence model recap (M8): config_save_on_exit is forced off in
+ * downplay_defaults_apply, so settings_t mutations made via the
+ * Frontend submenu are session-only by default.  These actions are
+ * the explicit commit:
+ *   - core options:  flush / create_override (RA's per-core .opt mech)
+ *   - RA settings:   CMD_EVENT_MENU_SAVE_CURRENT_CONFIG_OVERRIDE_*
+ *                    (writes <config>/<core>/<core|game>.cfg as a
+ *                    diff against base — RA stacks it on next launch)
+ *   - shader preset: menu_shader_manager_save_auto_preset for the
+ *                    matching SHADER_PRESET_CORE/GAME slot, or the
+ *                    matching remove_auto_preset when the user picked
+ *                    Off (so the prior preset doesn't keep auto-loading) */
 
-/* Save the current core-option values as the per-core defaults
- * file (~/Downplay/config/<core>/<core>.opt or platform equivalent).
- * Applies to every game launched with this core unless a per-game
- * override exists. */
+static void downplay_save_shader_for_scope(downplay_handle_t *dp,
+      enum auto_shader_type type)
+{
+   settings_t          *s      = config_get_ptr();
+   struct video_shader *shader = menu_shader_get();
+   if (!s || !dp)
+      return;
+   /* Skip the shader pipe entirely when the user didn't touch Screen
+    * Effect this session.  Without this guard, a user who saves an
+    * Effect preset, returns later to change a core option only, and
+    * hits Save Changes would lose their saved preset (passes==0 on
+    * the freshly-initialised menu_shader would route to the remove
+    * branch and delete the on-disk .slangp). */
+   if (!dp->frontend_effect_dirty)
+      return;
+   /* No shader pipeline in this build, or no slang context — nothing
+    * to persist on this axis.  The Frontend submenu hides Effect in
+    * those configurations, but Save Changes is reachable independently
+    * (the user could have built a per-core .slangp by other means);
+    * silently skip rather than removing what we didn't touch. */
+   if (!shader)
+      return;
+   if (shader->passes > 0 && *shader->path)
+      menu_shader_manager_save_auto_preset(shader, type,
+            s->paths.directory_video_shader,
+            s->paths.directory_menu_config, true);
+   else
+      menu_shader_manager_remove_auto_preset(type,
+            s->paths.directory_video_shader,
+            s->paths.directory_menu_config);
+   /* "dirty since last save" — reset so a subsequent unrelated Save
+    * (e.g. user toggled a core option later) doesn't re-touch the
+    * shader file.  See the matching dirty-flag set in
+    * dp_frontend_effect_on_change. */
+   dp->frontend_effect_dirty = false;
+}
+
+/* Save the current state as the per-core defaults: core options to
+ * <core>.opt, RA settings to <core>.cfg override, shader to
+ * <core>.slangp.  Applies to every game launched with this core
+ * unless a per-game override exists. */
 static void downplay_action_save_for_console(void *userdata)
 {
    downplay_handle_t *dp = (downplay_handle_t*)userdata;
    core_options_flush();
+   command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG_OVERRIDE_CORE, NULL);
+   downplay_save_shader_for_scope(dp, SHADER_PRESET_CORE);
    downplay_open_confirm(dp, "Saved for console.", "OKAY", NULL, NULL);
 }
 
-/* Save the current core-option values as a per-game override
- * (<core>/<game>.opt).  Takes precedence over the per-core file
- * when this specific ROM is loaded next time. */
+/* Save the current state as a per-game override: <core>/<game>.opt
+ * for core options, <core>/<game>.cfg for RA settings,
+ * <core>/<game>.slangp for the shader.  Takes precedence over the
+ * per-core files when this specific ROM is loaded next time. */
 static void downplay_action_save_for_game(void *userdata)
 {
    downplay_handle_t *dp = (downplay_handle_t*)userdata;
    core_options_create_override(true);
+   command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG_OVERRIDE_GAME, NULL);
+   downplay_save_shader_for_scope(dp, SHADER_PRESET_GAME);
    downplay_open_confirm(dp, "Saved for game.", "OKAY", NULL, NULL);
 }
 
