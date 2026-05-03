@@ -29,6 +29,7 @@ The build system is a hand-rolled `./configure` + GNU make (scripts in `qb/`), n
 - Platform builds use a per-platform Makefile, e.g. `make -f Makefile.win`, `Makefile.emscripten`, `Makefile.ctr`, `Makefile.libnx`, `Makefile.vita`, `Makefile.wiiu`, `Makefile.ps2`, `Makefile.griffin`, `Makefile.apple`, `Makefile.msvc`, etc. `Makefile.common` is shared object/source rules included by the platform makefiles.
 - "Griffin" build (`griffin/griffin.c` and friends) is a single-translation-unit unity build used for some console targets — when adding new `.c` files used on those platforms, ensure they get picked up by `griffin.c` or the appropriate platform Makefile.
 - macOS / iOS / tvOS: use the Xcode projects under `pkg/apple/` (or `Makefile.apple` for command-line builds).
+- Android (primary Downplay target): `pkg/android/build-and-install.sh [debug|release]` is the daily iteration loop. It runs `mise exec -- ./gradlew assembleAarch64Debug` (mise activates JDK 11 from `pkg/android/phoenix/.mise.toml`), `adb install -r`s the APK, and `adb shell am force-stop com.retroarch.aarch64`s the running process so the new code actually loads. Set `ANDROID_SERIAL` if multiple devices are attached. The Android build uses `ndk-build` via `pkg/android/phoenix-common/jni/Android.mk`, *not* `Makefile.common`. Note: sideloading on a device that ships with stock RetroArch (most Anbernic handhelds) fails first time with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — `adb uninstall com.retroarch.aarch64` first.
 
 ## Tests
 
@@ -51,6 +52,19 @@ RetroArch is mostly C89-compatible C with a thin C++/Obj-C/Obj-C++ veneer for so
 - **Tasks.** `tasks/` contains the async task system used for background work (downloads, scans, screenshot, autosave, content loading). New long-running operations should be tasks, not blocking calls in the runloop.
 - **libretro-common.** `libretro-common/` is a vendored copy of shared libretro utility code (file I/O, formats, compat shims, networking, encodings, streams). **Prefer its APIs over Qt/POSIX equivalents when touching cross-platform code** — the recent Qt cleanup commits have been moving in that direction.
 - **Database / playlists.** `libretro-db/` is a small key/value DB used for content metadata; `playlist.c` and `core_info.c` build on top of it. `database_info.c` glues them to the menu.
+
+### Downplay-owned code
+
+Downplay's delta lives in two places — both safe to edit freely:
+
+- `menu/drivers/downplay.c` — the launcher itself, registered as the `"downplay"` menu driver. Single-file driver; navigation is mode-driven via `enum downplay_view` (`DOWNPLAY_VIEW_TOP` / `SYSTEM` / `RECENTS` / `INGAME` / `SAVE_PICKER` / `SETTINGS` / `CONFIRM`). The `frame` callback dispatches to a per-view renderer; `entry_action` (overrides `generic_menu_entry_action`) handles input. Settings views use a small stack-based push/pop model so submenus (Frontend, Emulator, Save Changes…) don't need their own view enums.
+- `downplay/` — self-contained C modules called from a small number of upstream patch points:
+  - `downplay_bootstrap.{c,h}` — first-run: ensure `Downplay/{Roms,Bios,Saves,States}` exist and seed `Roms/README.txt`.
+  - `downplay_defaults.{c,h}` — defaults overlay applied after `config_load()` (sets `menu_driver = "downplay"`, paths, save/state UX flags, session-only persistence, Vulkan-on-Android, gamepad menu combo, etc.). Also owns `downplay_paths_get_root` (Android storage-tier walker → `Downplay/` root).
+  - `downplay_cores.{c,h}` — buildbot list cache + sequential install queue. Powers both the boot splash and the lazy "core not installed at launch time" fallback.
+  - `downplay_setup.{c,h}` — first-run sequential bucket downloader (core info, assets, joypad autoconfigs, databases, overlays, slang shaders). Reuses RA's online-updater download + decompress task plumbing.
+
+The single source of truth for what is and isn't a sanctioned modification is **`PLAN.md`'s "Allowed patch points" table**.
 
 ## Conventions specific to this codebase
 

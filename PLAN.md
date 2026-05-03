@@ -203,7 +203,7 @@ The factoring: a single core-installer module (`downplay_cores.c`) with both flo
 
 **Exit criterion:** Recents reflects play history and re-launches correctly. ✅
 
-### M4.5 — In-game menu 🚧
+### M4.5 — In-game menu ✅
 
 A MinUI-style overlay shown when the user opens the menu over a running core.  Continue resumes; Quit unloads back to the launcher.  Save/Load/Options come later.
 
@@ -213,9 +213,9 @@ A MinUI-style overlay shown when the user opens the menu over a running core.  C
 - [x] **Continue** → `command_event(CMD_EVENT_MENU_TOGGLE, NULL)`.  **Quit** → `command_event(CMD_EVENT_UNLOAD_CORE, NULL)`.  CANCEL also acts as Continue.
 - [x] Background renders with alpha 0.7 in INGAME so the running game shows through.  Title pill (top-left) sources from `path_get(RARCH_PATH_CONTENT)` basename minus extension; sized to the row font, capped at half-screen-minus-margin, ellipsis-truncated when it doesn't fit (UTF-8-safe).
 - [x] Generic helpers `downplay_truncate_to_width` and `downplay_draw_text_pill` so future chrome can reuse the size-and-truncate flow.
-- [ ] Save / Load / Options.  Out of scope for now.
+- [x] Save / Load shipped as M7.  Per-core Options (and the rest of the in-game settings surface) shipped as M8.
 
-**Exit criterion:** menu opens over a running core, Continue resumes, Quit returns to the launcher.  ✅ (Continue/Quit only.)
+**Exit criterion:** menu opens over a running core, Continue resumes, Quit returns to the launcher.  ✅
 
 ### M5 — Android build + on-device test ✅
 
@@ -224,7 +224,7 @@ A MinUI-style overlay shown when the user opens the menu over a running core.  C
 - [x] Bump `ndkVersion` from r22 to r26.1: r22 has no Apple-Silicon host, so building on an arm64 Mac requires a newer NDK. Patched in `pkg/android/phoenix/build.gradle` with a `/* DOWNPLAY: */` marker.
 - [x] Play Feature Delivery: no code change needed — non-`playStore*` Gradle flavors include `play-core-stub`, which makes `play_feature_delivery_enabled()` return false at runtime, so `task_push_core_updater_download` follows the regular code path.
 - [x] Sideload onto a real handheld; storage at `/sdcard/Downplay/`.
-- [x] Verified input (built-in controller), rendering, content launching, lazy core download. Initial pass needed two manual config edits (`menu_driver`, gamepad combo) and an `adb push` of the font; all three are superseded by M6.
+- [x] Verified input (built-in controller), rendering, content launching, lazy core download. Initial pass needed two manual config edits (`menu_driver`, gamepad combo) and an `adb push` of the font; all three are superseded by M6.  Multi-device (Retroid, Anbernic RG477V) confirmed working from a clean install.
 
 **Exit criterion:** the desktop M0–M4 experience works on a real handheld. ✅
 
@@ -250,7 +250,7 @@ Shipped a MinUI-style UX layered on top of RetroArch's existing save-state primi
 
 All work in `menu/drivers/downplay.c` and `downplay/downplay_defaults.c`.  No upstream patch points added.
 
-### M8 — In-game settings (MinUI-style)
+### M8 — In-game settings (MinUI-style) 🚧
 
 In-game menu currently has Continue + Quit (M4.5) and the save-state rows added by M7.  M8 fills in the rest of what MinUI exposes: a curated, gamepad-navigable settings surface for per-core options plus the standard quick-menu actions.  Goal: never need to drop into XMB to tweak a game.
 
@@ -274,6 +274,35 @@ System / launcher-level settings (a separate row from the top of Browse, not in-
 - Remap save uses `task_push_save_remap_file` (already in `tasks/tasks_internal.h`) — no new patch points.
 
 **Exit criterion:** during gameplay, the user can save and load state, change a per-core option (e.g., `mgba` color correction), remap a button, and eject/insert a disc — all from the Downplay in-game menu, without touching XMB.
+
+**Status (what shipped vs. plan):**
+
+The Options view that landed has a different shape than the bullet list above — five nav rows backing a settings tree:
+
+- [x] **Frontend** (new — wasn't in the original spec).  Video knobs the user always wants:
+  Screen Scaling (Native / Aspect / Fullscreen), Screen Effect (curated slang preset
+  cycler — LCD / Dot Matrix / CRT / CRT TV / CRT Monitor with Downplay-tuned param
+  overrides), driven through `menu_shader_manager_set_preset` against
+  `menu_shader_get()` plus the live driver shader.
+- [x] **Emulator** — per-core options drill-in (the original M8 "Options" bullet).  Built
+  from `runloop_state.core_options`; L/R cycles values; visibility-callback aware.
+- [ ] **Controls** — nav row exists but opens a stub list.  Per-core remap not yet wired.
+- [ ] **Shortcuts** — nav row exists but opens a stub list.
+- [x] **Save Changes** — submenu with Save for console / Save for game / Restore defaults,
+  each gated by a `DOWNPLAY_VIEW_CONFIRM` modal.  Routes through the existing
+  `menu_shader_manager_save_auto_preset` + override-save helpers.
+
+Two structural pieces that didn't have a bullet in the original M8 but were necessary:
+
+- [x] **Session-only persistence model** — `config_save_on_exit = false` in the defaults
+  overlay; in-game tweaks live for the session unless the user explicitly hits Save
+  Changes.  Paired with `auto_shaders_enable = true` so saved presets reload on next
+  launch via the per-core/per-game override pipeline.
+- [x] **Confirm/ack modal view** (`DOWNPLAY_VIEW_CONFIRM`) — generic enough to be reused
+  by Restore-defaults, Save-for-console, and the M7 lock UI when that lands.
+
+Still outstanding from the original M8 spec: **Disc** (disk-control interface), **Reset**
+(`CMD_EVENT_RESET` confirmation row), and the Controls/Shortcuts implementations.
 
 ### M9 — Device-aware configuration
 
@@ -299,9 +328,24 @@ Non-goals: brightness, volume, sleep timer (Android overlays its own affordances
 
 **Exit criterion:** install on two devices with different panels (e.g., a 480×640 Anbernic and a 1080×1920 Retroid).  Without touching a setting, both render correctly: integer-scaled where the panel allows it, aspect ratio respected, refresh rate matched.
 
-### M10 — Automatic content downloads + updates
+### M10 — Automatic content downloads + updates 🚧
 
 M3 covers the headline case (download cores referenced by the user's folders).  M10 generalizes that idea: anything Downplay needs from the internet gets fetched silently and kept up to date, so the user never sees "go install X" or "your Y is out of date."  The user runs the app and it works; updates happen invisibly.
+
+**First-run pass shipped** as `downplay/downplay_setup.c`: a sequential bucket
+downloader that runs once on a fresh install (gated by per-bucket "is this directory
+populated?" probes).  Buckets currently fetched: core info, assets, joypad
+autoconfigs, databases, overlays, slang shaders.  Reuses the existing online-updater
+download + decompress task plumbing; no new patch points.  Welcome screen is shown
+during the pass.
+
+What's still TODO from the M10 spec:
+
+- Periodic refresh of installed cores / core info beyond the first-run pass.
+- Failed-download retry on next launch (today, a bucket that fails its setup pass
+  is silently skipped if the dir later looks "populated enough").
+- Network awareness (wifi-only) — currently downloads on whatever connection.
+- Cheats DB lazy fetch on first cheats-row entry.
 
 What needs to be auto-fetched / refreshed:
 
