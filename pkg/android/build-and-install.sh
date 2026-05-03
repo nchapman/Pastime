@@ -39,4 +39,4 @@ else
 fi
 
 echo "Installing $APK"
-adb "${ADB_TARGET[@]}" install -r "$APK"
+adb ${ADB_TARGET[@]+"${ADB_TARGET[@]}"} install -r "$APK"

@@ -66,7 +66,8 @@ ifeq ($(HAVE_DOWNPLAY),1)
 LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
 							$(RARCH_DIR)/downplay/downplay_cores.c \
 							$(RARCH_DIR)/downplay/downplay_defaults.c \
-							$(RARCH_DIR)/downplay/downplay_bootstrap.c
+							$(RARCH_DIR)/downplay/downplay_bootstrap.c \
+							$(RARCH_DIR)/downplay/downplay_setup.c
 endif
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)
