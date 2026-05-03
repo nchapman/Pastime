@@ -372,6 +372,14 @@ typedef struct
    /* Pre-formatted "Resume Foo" label, mutated only on rebuild. */
    char                resume_label[NAME_MAX_LENGTH];
 
+   /* Top-right status pill text — rebuilt once per frame in
+    * downplay_menu_frame from RA's powerstate + timedate helpers (both
+    * internally throttled).  Cached because the value is consumed in
+    * three places (the pill draw, the title-pill right limit, and the
+    * top-row max-width budget) and we want them all in sync within a
+    * single frame. */
+   char                status_text[32];
+
    /* First-run setup progress animation.  displayed lerps toward a
     * per-segment target each frame; the asymptotic curve (target - cur)
     * gives the bar a "moving but never quite full" feel within each
@@ -1997,17 +2005,53 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
          title, sizeof(title));
 }
 
-/* Placeholder battery indicator — real telemetry wires up later. */
-static const char DOWNPLAY_STATUS_TEXT[] = "100%";
+/* Build the status-pill text from RA's built-in helpers: "HH:MM"
+ * (24h) + battery, where battery is "NN%" / "NN% AC" (charging) /
+ * "AC" (no battery, e.g. desktop builds).  Two-space gap so the
+ * two halves read as separate elements.  Locale-aware time isn't
+ * wired up yet — we pick the 24h style for now and revisit later
+ * (PLAN: JNI hook for android.text.format.DateFormat.is24HourFormat). */
+static void downplay_build_status_text(char *out, size_t len)
+{
+   gfx_display_ctx_powerstate_t ps;
+   gfx_display_ctx_datetime_t dt;
+   char time_buf[16];
+   /* menu_display_powerstate writes a "NN%" string we don't use (we
+    * read the struct fields instead) but it requires a non-NULL
+    * buffer.  One byte is enough — snprintf truncates to fit. */
+   char discard[1];
+
+   time_buf[0] = '\0';
+
+   dt.time_mode      = MENU_TIMEDATE_STYLE_HM;
+   dt.date_separator = MENU_TIMEDATE_DATE_SEPARATOR_HYPHEN;
+   menu_display_timedate(&dt, time_buf, sizeof(time_buf));
+
+   ps.battery_enabled = false;
+   ps.percent         = 0;
+   ps.charging        = false;
+   menu_display_powerstate(&ps, discard, sizeof(discard));
+
+   if (ps.battery_enabled)
+   {
+      if (ps.charging)
+         snprintf(out, len, "%s  %u%% AC", time_buf, ps.percent);
+      else
+         snprintf(out, len, "%s  %u%%", time_buf, ps.percent);
+   }
+   else
+      snprintf(out, len, "%s  AC", time_buf);
+}
 
 /* Width of the rendered status pill — useful to callers (e.g. the
  * title pill) that need to reserve space for it without coupling to
- * its draw site. */
+ * its draw site.  Text is dp->status_text, recomputed once per
+ * frame in downplay_menu_frame. */
 static int downplay_status_pill_width(font_data_t *font,
-      const downplay_layout_t *L)
+      const downplay_layout_t *L, const char *text)
 {
-   int text_w = font_driver_get_message_width(font, DOWNPLAY_STATUS_TEXT,
-         (unsigned)strlen(DOWNPLAY_STATUS_TEXT), 1.0f);
+   int text_w = font_driver_get_message_width(font, text,
+         (unsigned)strlen(text), 1.0f);
    int pill_w;
    if (text_w < 0)
       text_w = 0;
@@ -2019,18 +2063,19 @@ static int downplay_status_pill_width(font_data_t *font,
 
 static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset,
-      const downplay_layout_t *L, uintptr_t cap_tex, float *bg_color)
+      const downplay_layout_t *L, uintptr_t cap_tex, float *bg_color,
+      const char *text)
 {
    /* Right-anchored: pill sized to text + padding (with a row-h floor
     * so single-glyph values still look pill-shaped), positioned so its
     * right edge sits on the right margin. */
-   int pill_w = downplay_status_pill_width(font, L);
+   int pill_w = downplay_status_pill_width(font, L, text);
    int x      = (int)L->vid_w - L->margin_x - pill_w;
    int text_y = downplay_baseline_y(L->margin_y, L->row_h, centre_offset);
 
    downplay_draw_pill(p_disp, userdata, L, cap_tex,
          x, L->margin_y, pill_w, L->row_h, bg_color);
-   downplay_draw_text(font, DOWNPLAY_STATUS_TEXT,
+   downplay_draw_text(font, text,
          (float)(x + pill_w / 2), (float)text_y,
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
 }
@@ -3888,7 +3933,8 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
     * has_title pushes the list past that row entirely. */
    int      top_row_max_w = has_title ? row_max_w
          : (row_max_w
-            - downplay_status_pill_width(dp->chrome_font, L)
+            - downplay_status_pill_width(dp->chrome_font, L,
+                  dp->status_text)
             - L->margin_x);
    if (top_row_max_w < 0)
       top_row_max_w = 0;
@@ -4183,14 +4229,15 @@ static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
 
 static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)data;
-   gfx_display_t     *p_disp;
-   void              *userdata;
-   settings_t        *settings;
-   float              user_scale;
-   int                          bottom_y;
-   float                       *chrome_bg;
-   enum downplay_render_mode    mode;
+   downplay_handle_t       *dp = (downplay_handle_t*)data;
+   gfx_display_t           *p_disp;
+   void                    *userdata;
+   settings_t              *settings;
+   video_driver_state_t    *video_st;
+   float                    user_scale;
+   int                      bottom_y;
+   float                   *chrome_bg;
+   enum downplay_render_mode mode;
 
    if (!dp)
       return;
@@ -4198,11 +4245,24 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    p_disp     = disp_get_ptr();
    userdata   = video_info->userdata;
    settings   = config_get_ptr();
+   video_st   = video_state_get_ptr();
    user_scale = (settings && settings->floats.menu_scale_factor > 0.0f)
                 ? settings->floats.menu_scale_factor : 1.0f;
 
    if (!p_disp)
       return;
+
+   /* Force the video viewport to the full window for the duration of
+    * our menu frame.  Without this, the menu inherits the running core's
+    * aspect-corrected viewport — so launcher chrome ends up scaled into
+    * a corner (or letterboxed) when video_aspect_ratio_idx isn't
+    * full/stretched.  Restored at the end of the frame so the next core
+    * frame uses the user's chosen aspect again. */
+   if (video_st && video_st->current_video
+         && video_st->current_video->set_viewport)
+      video_st->current_video->set_viewport(
+            video_st->data, video_info->width, video_info->height,
+            true, false);
 
    /* Pump the setup state machine on every frame.  Cheap; only does
     * work when the buildbot list has just landed or a bucket task has
@@ -4264,6 +4324,13 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       downplay_reload_fonts(dp, video_driver_is_threaded());
    }
 
+   /* Refresh status-pill text once per frame, before anything reads it
+    * (draw_list's top-row width budget, the INGAME title pill's right
+    * limit, and the pill draw call below).  RA throttles the underlying
+    * powerstate + timedate work internally, so calling every frame is
+    * cheap. */
+   downplay_build_status_text(dp->status_text, sizeof(dp->status_text));
+
    /* Background — opaque normally, dim-overlay over the running game so
     * INGAME reads as a HUD instead of hiding the frame underneath. */
    downplay_draw_rect(p_disp, userdata, &dp->layout,
@@ -4278,7 +4345,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    /* Top-right status pill */
    downplay_draw_status_pill(p_disp, userdata, dp->chrome_font,
          dp->chrome_font_centre_offset, &dp->layout, dp->pill_cap_tex,
-         chrome_bg);
+         chrome_bg, dp->status_text);
 
    if (dp->view == DOWNPLAY_VIEW_INGAME)
    {
@@ -4288,7 +4355,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
        * the same font that draw_status_pill above renders with —
        * mismatch would silently misalign the gap. */
       int status_w = downplay_status_pill_width(dp->chrome_font,
-            &dp->layout);
+            &dp->layout, dp->status_text);
       int title_right_limit = (int)dp->layout.vid_w - dp->layout.margin_x
             - status_w - dp->layout.margin_x;
       downplay_draw_title_pill(p_disp, userdata, dp->font,
@@ -4326,7 +4393,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     * SETTINGS view hides the footer entirely so the row block + the
     * fixed description band can extend to the bottom margin. */
    if (dp->view == DOWNPLAY_VIEW_SETTINGS)
-      return;
+      goto restore_viewport;
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.row_h;
 
    /* CONFIRM view: just the modal-specific buttons, no POWER hint —
@@ -4349,7 +4416,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
             dp->chrome_font_centre_offset, &dp->layout,
             dp->pill_cap_tex, x, bottom_y,
             DOWNPLAY_ANCHOR_RIGHT, right, n, chrome_bg);
-      return;
+      goto restore_viewport;
    }
 
    {
@@ -4396,6 +4463,18 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
             dp->pill_cap_tex, x, bottom_y,
             DOWNPLAY_ANCHOR_RIGHT, right, n, chrome_bg);
    }
+
+restore_viewport:
+   /* Restore the running core's aspect-corrected viewport so the next
+    * core frame draws where the user expects (matches XMB / Ozone).
+    * Reached via fall-through or via the SETTINGS / CONFIRM gotos
+    * above — every path that took the force_full set_viewport at the
+    * top of the frame must come through here. */
+   if (video_st && video_st->current_video
+         && video_st->current_video->set_viewport)
+      video_st->current_video->set_viewport(
+            video_st->data, video_info->width, video_info->height,
+            false, true);
 }
 
 /* ---------- input ---------- */
