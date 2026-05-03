@@ -102,7 +102,8 @@ enum downplay_view
    DOWNPLAY_VIEW_RECENTS,    /* drilled into recents history */
    DOWNPLAY_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
    DOWNPLAY_VIEW_SAVE_PICKER,/* drilled into save-state list (M7) */
-   DOWNPLAY_VIEW_SETTINGS    /* M8 — settings-style list (Options → core opts) */
+   DOWNPLAY_VIEW_SETTINGS,   /* M8 — settings-style list (Options → core opts) */
+   DOWNPLAY_VIEW_CONFIRM     /* M8 — modal confirm/ack screen (centered text) */
 };
 
 /* INGAME row composition is conditional: Save hidden when the core
@@ -314,6 +315,21 @@ typedef struct
     * happen inside on_change because the rebuild frees the row
     * userdata that on_change was just called on. */
    bool                      settings_rebuild_pending;
+
+   /* Confirm view (DOWNPLAY_VIEW_CONFIRM).  A small modal screen
+    * driven entirely by these fields — no per-call allocation.
+    * Used for both confirm-before prompts ("Restore defaults?
+    * YES / CANCEL") and confirm-after acknowledgements ("Saved
+    * for console.  OKAY").  prior_view is restored on dismiss;
+    * the settings stack underneath is preserved unchanged. */
+   struct
+   {
+      char               message[256];
+      char               a_label[16];
+      char               b_label[16];        /* empty = no B button */
+      void             (*on_confirm)(void *dp);
+      enum downplay_view prior_view;
+   } confirm;
 
    /* Save-state picker (DOWNPLAY_VIEW_SAVE_PICKER).  Cached on view
     * enter, freed (textures unloaded) on view exit.  Sorted desc by
@@ -2097,6 +2113,45 @@ static downplay_settings_list_t *downplay_settings_top(
    return dp->settings_stack[dp->settings_depth - 1];
 }
 
+/* Open the confirm modal.  `b_label` may be NULL/empty to suppress
+ * the cancel button (acknowledgement-only screen).  `on_confirm` is
+ * invoked when the user presses A, *before* the view is restored —
+ * callbacks may call downplay_open_confirm again to chain screens.
+ * The settings stack underneath is preserved unchanged. */
+static void downplay_open_confirm(downplay_handle_t *dp,
+      const char *message, const char *a_label, const char *b_label,
+      void (*on_confirm)(void *dp))
+{
+   if (!dp)
+      return;
+   strlcpy(dp->confirm.message, message ? message : "",
+         sizeof(dp->confirm.message));
+   strlcpy(dp->confirm.a_label, (a_label && *a_label) ? a_label : "OKAY",
+         sizeof(dp->confirm.a_label));
+   strlcpy(dp->confirm.b_label, b_label ? b_label : "",
+         sizeof(dp->confirm.b_label));
+   dp->confirm.on_confirm = on_confirm;
+   /* Don't overwrite prior_view if we're already in CONFIRM (chained
+    * confirms — keep the original return target). */
+   if (dp->view != DOWNPLAY_VIEW_CONFIRM)
+      dp->confirm.prior_view = dp->view;
+   dp->view = DOWNPLAY_VIEW_CONFIRM;
+}
+
+/* Dismiss the confirm modal.  If `fire` is true and an on_confirm
+ * callback is set, it runs first — and may re-enter CONFIRM, in
+ * which case we leave the new view alone. */
+static void downplay_close_confirm(downplay_handle_t *dp, bool fire)
+{
+   void (*cb)(void *) = dp->confirm.on_confirm;
+   enum downplay_view ret = dp->confirm.prior_view;
+   dp->confirm.on_confirm = NULL;
+   if (fire && cb)
+      cb(dp);
+   if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+      dp->view = ret;
+}
+
 /* Fixed vertical clearance around the row block to host the up /
  * down scroll chevrons.  Reserved unconditionally (not only when a
  * chevron is visible) so visible_rows stays stable as scroll
@@ -2519,6 +2574,31 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
    }
 }
 
+/* Render the confirm modal: a single line of centered text mid-screen.
+ * Background and chrome (status pill, footer hints) are drawn by the
+ * outer frame — we only paint the message.  No word wrap yet; messages
+ * are short ("Saved for console.", "Restore all options to defaults?")
+ * and would otherwise need a measure-and-truncate pass like the
+ * settings rows. */
+static void downplay_draw_confirm_view(void *userdata,
+      const downplay_handle_t *dp)
+{
+   const downplay_layout_t *L  = &dp->layout;
+   font_data_t             *f  = dp->font ? dp->font : dp->chrome_font;
+   int                      cx;
+   int                      cy;
+   int                      ascent;
+   (void)userdata;
+   if (!f || !*dp->confirm.message)
+      return;
+   cx     = (int)L->vid_w / 2;
+   cy     = (int)L->vid_h / 2;
+   ascent = dp->font ? dp->font_centre_offset : dp->chrome_font_centre_offset;
+   downplay_draw_text(f, dp->confirm.message,
+         (float)cx, (float)(cy + ascent),
+         L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+}
+
 /* ---------- settings: builders ---------- */
 
 #include "../../core_option_manager.h"
@@ -2610,17 +2690,89 @@ static void downplay_action_open_shortcuts(void *userdata)
    downplay_settings_push(dp, downplay_build_stub_list("Shortcuts"));
 }
 
-/* Save Changes: flush the core-options manager to its config file
- * and pop the entire settings stack so the user lands back in the
- * in-game menu. */
-static void downplay_action_save_changes(void *userdata)
+/* Save Changes submenu — three scoped persist operations.  Each
+ * action calls into the existing retroarch.h helpers (no new patch
+ * point needed) and shows a confirm/ack via DOWNPLAY_VIEW_CONFIRM. */
+
+/* Save the current core-option values as the per-core defaults
+ * file (~/Downplay/config/<core>/<core>.opt or platform equivalent).
+ * Applies to every game launched with this core unless a per-game
+ * override exists. */
+static void downplay_action_save_for_console(void *userdata)
 {
-   downplay_handle_t     *dp   = (downplay_handle_t*)userdata;
-   core_option_manager_t *opts = NULL;
-   retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
-   if (opts && opts->conf)
-      core_option_manager_flush(opts, opts->conf);
-   downplay_settings_pop_all(dp);
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   core_options_flush();
+   downplay_open_confirm(dp, "Saved for console.", "OKAY", NULL, NULL);
+}
+
+/* Save the current core-option values as a per-game override
+ * (<core>/<game>.opt).  Takes precedence over the per-core file
+ * when this specific ROM is loaded next time. */
+static void downplay_action_save_for_game(void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   core_options_create_override(true);
+   downplay_open_confirm(dp, "Saved for game.", "OKAY", NULL, NULL);
+}
+
+/* Restore step 2: user pressed YES on the confirm prompt.  Reset
+ * every option to its libretro-declared default in memory, then
+ * flush so the change is durable on disk.  We don't trigger our
+ * settings_rebuild_pending here — the rebuild path assumes the
+ * top-of-stack frame is the core-options list, but Restore is
+ * invoked from the Save Changes submenu (one level above).  When
+ * the user navigates back into Emulator the list is rebuilt fresh
+ * from coreopts->opts[i].index anyway. */
+static void downplay_action_restore_defaults_confirmed(void *userdata)
+{
+   (void)userdata;
+   /* Guard against the core having unloaded between the user
+    * pressing YES on the prompt and this callback firing.  Both
+    * helpers below dereference runloop core-options state and
+    * would touch freed memory if the core is gone. */
+   if (!(runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING))
+      return;
+   core_options_reset(NULL);
+   core_options_flush();
+}
+
+/* Restore step 1: open a YES/CANCEL prompt before doing anything
+ * destructive.  YES chains to ..._confirmed above. */
+static void downplay_action_restore_defaults(void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   downplay_open_confirm(dp,
+         "Restore all options to defaults?",
+         "YES", "CANCEL",
+         downplay_action_restore_defaults_confirmed);
+}
+
+static downplay_settings_list_t *downplay_build_save_changes_list(
+      downplay_handle_t *dp)
+{
+   downplay_settings_list_t *L =
+      downplay_settings_list_new("Save Changes", 3, 0, 60);
+   if (!L)
+      return NULL;
+   L->rows[0].title      = "Save for console";
+   L->rows[0].desc       = "Use these values for every game with this core.";
+   L->rows[0].on_confirm = downplay_action_save_for_console;
+   L->rows[0].userdata   = dp;
+   L->rows[1].title      = "Save for game";
+   L->rows[1].desc       = "Use these values only for the current game.";
+   L->rows[1].on_confirm = downplay_action_save_for_game;
+   L->rows[1].userdata   = dp;
+   L->rows[2].title      = "Restore defaults";
+   L->rows[2].desc       = "Reset all options to the core's defaults.";
+   L->rows[2].on_confirm = downplay_action_restore_defaults;
+   L->rows[2].userdata   = dp;
+   return L;
+}
+
+static void downplay_action_open_save_changes(void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   downplay_settings_push(dp, downplay_build_save_changes_list(dp));
 }
 
 /* Build the root Options list.  Static row labels live in .rodata,
@@ -2648,7 +2800,7 @@ static downplay_settings_list_t *downplay_build_root_options_list(
    L->rows[3].userdata   = dp;
    L->rows[4].title      = "Save Changes";
    L->rows[4].desc       = "Persist core option changes to disk.";
-   L->rows[4].on_confirm = downplay_action_save_changes;
+   L->rows[4].on_confirm = downplay_action_open_save_changes;
    L->rows[4].userdata   = dp;
    return L;
 }
@@ -2955,10 +3107,13 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       const downplay_handle_t *dp)
 {
    size_t   i;
-   /* List shares its top row with the status pill — the pill is
-    * right-anchored and short, the rows are left-anchored, so they
-    * sit beside each other. */
-   int      list_top   = L->margin_y;
+   /* INGAME draws a left-anchored title pill on the top row, so the
+    * list has to start one row below.  Other views leave that row
+    * to the (right-anchored, short) status pill, which sits beside
+    * the left-anchored row 0. */
+   bool     has_title  = (dp->view == DOWNPLAY_VIEW_INGAME);
+   int      list_top   = L->margin_y
+                       + (has_title ? L->row_h : 0);
    int      list_x     = L->margin_x;
    int      row_max_w  = (int)L->vid_w - (2 * L->margin_x);
    int      list_bot   = (int)L->vid_h - L->margin_y - L->row_h;
@@ -2978,10 +3133,12 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    int      row_w;
    /* Top row shares its line with the status pill — shorten its max
     * width by the pill width plus a margin's gap so a long title
-    * truncates instead of overlapping. */
-   int      top_row_max_w = row_max_w
-         - downplay_status_pill_width(dp->chrome_font, L)
-         - L->margin_x;
+    * truncates instead of overlapping.  Skipped in INGAME because
+    * has_title pushes the list past that row entirely. */
+   int      top_row_max_w = has_title ? row_max_w
+         : (row_max_w
+            - downplay_status_pill_width(dp->chrome_font, L)
+            - L->margin_x);
    if (top_row_max_w < 0)
       top_row_max_w = 0;
 
@@ -3045,7 +3202,8 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
    if (running
          && dp->view != DOWNPLAY_VIEW_INGAME
          && dp->view != DOWNPLAY_VIEW_SAVE_PICKER
-         && dp->view != DOWNPLAY_VIEW_SETTINGS)
+         && dp->view != DOWNPLAY_VIEW_SETTINGS
+         && dp->view != DOWNPLAY_VIEW_CONFIRM)
    {
       dp->prior_view      = dp->view;
       dp->prior_selection = dp->selection;
@@ -3079,11 +3237,14 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
       downplay_refresh_resume(dp);
       downplay_recompute_total_rows(dp);
    }
-   else if (!running && dp->view == DOWNPLAY_VIEW_SETTINGS)
+   else if (!running && (dp->view == DOWNPLAY_VIEW_SETTINGS
+                      || dp->view == DOWNPLAY_VIEW_CONFIRM))
    {
-      /* Same edge case as SAVE_PICKER: core died while in Options.
-       * Tear down the settings stack and snap to TOP. */
+      /* Same edge case as SAVE_PICKER: core died while in Options
+       * (or a confirm modal opened from there).  Tear down the
+       * settings stack and snap to TOP. */
       downplay_settings_pop_all(dp);
+      dp->confirm.on_confirm = NULL;
       dp->view      = DOWNPLAY_VIEW_TOP;
       dp->selection = 0;
       downplay_refresh_resume(dp);
@@ -3283,6 +3444,8 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       case DOWNPLAY_RENDER_LIST:
          if (dp->view == DOWNPLAY_VIEW_SETTINGS)
             downplay_draw_settings_view(p_disp, userdata, dp);
+         else if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+            downplay_draw_confirm_view(userdata, dp);
          else
             downplay_draw_list(p_disp, userdata,
                   &dp->layout, dp->pill_cap_tex, dp);
@@ -3305,6 +3468,30 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    if (dp->view == DOWNPLAY_VIEW_SETTINGS)
       return;
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.row_h;
+
+   /* CONFIRM view: just the modal-specific buttons, no POWER hint —
+    * the modal is meant to read as focused, single-decision UX. */
+   if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+   {
+      downplay_hint_t right[2];
+      size_t          n = 0;
+      int             x = (int)dp->layout.vid_w - dp->layout.margin_x;
+      if (*dp->confirm.b_label)
+      {
+         right[n].glyph = "B";
+         right[n].label = dp->confirm.b_label;
+         n++;
+      }
+      right[n].glyph = "A";
+      right[n].label = dp->confirm.a_label;
+      n++;
+      downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
+            dp->chrome_font_centre_offset, &dp->layout,
+            dp->pill_cap_tex, x, bottom_y,
+            DOWNPLAY_ANCHOR_RIGHT, right, n, chrome_bg);
+      return;
+   }
+
    {
       downplay_hint_t left[1];
       left[0].glyph = "POWER";
@@ -3372,6 +3559,20 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          downplay_clear_pending_launch(dp);
          downplay_cores_cancel();
       }
+      return 0;
+   }
+
+   /* CONFIRM modal: A fires the optional callback and returns to
+    * prior_view; B always dismisses without firing.  For
+    * acknowledgement-only screens the B button isn't drawn, but we
+    * still honour Cancel as a way out — pressing it on an ack screen
+    * just dismisses, which is what the user expects. */
+   if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+   {
+      if (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT)
+         downplay_close_confirm(dp, true);
+      else if (action == MENU_ACTION_CANCEL)
+         downplay_close_confirm(dp, false);
       return 0;
    }
 
