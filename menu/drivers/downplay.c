@@ -52,6 +52,9 @@
 #include "../../verbosity.h"
 
 #include "../../downplay/downplay_cores.h"
+#include "../../downplay/downplay_setup.h"
+
+#include <features/features_cpu.h>
 
 /* Reference design height in pixels — the mockup was drawn at this size,
  * and every dimension below is a fraction of it.  Scaling to any actual
@@ -347,6 +350,22 @@ typedef struct
    size_t              resume_pl_idx;
    /* Pre-formatted "Resume Foo" label, mutated only on rebuild. */
    char                resume_label[NAME_MAX_LENGTH];
+
+   /* First-run setup progress animation.  displayed lerps toward a
+    * per-segment target each frame; the asymptotic curve (target - cur)
+    * gives the bar a "moving but never quite full" feel within each
+    * segment, snapping when the underlying task completes.  last_us is
+    * the timestamp of the last frame's update, used to compute dt.
+    * was_running tracks the previous frame's setup phase so we can
+    * reset displayed on a fresh pass — otherwise a second setup pass
+    * (e.g. lazy install after boot setup completed) would start its
+    * bar at 100% from the previous pass. */
+   struct
+   {
+      float        displayed;
+      retro_time_t last_us;
+      bool         was_running;
+   } setup_anim;
 } downplay_handle_t;
 
 /* Solid colors expressed as 4×RGBA (one vertex each, flat shaded).  Kept
@@ -1370,7 +1389,7 @@ static void downplay_launch_rom(downplay_handle_t *dp,
    strlcpy(dp->pending_launch_rom,  rom_path,
          sizeof(dp->pending_launch_rom));
    idents[0] = core_ident;
-   downplay_cores_begin_boot_setup(idents, 1);
+   downplay_setup_begin_boot(idents, 1);
 }
 
 
@@ -3252,32 +3271,28 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
    }
 }
 
-/* What the frame should render.  AWAITING_LIST is intentionally rendered
- * BLANK rather than LIST: showing the system list briefly and then
- * snapping into the splash once the first download starts looks like a
- * glitch.  Better to stay blank until we know whether we're going to
- * splash at all. */
+/* What the frame should render.  Setup activity (cores + content
+ * buckets) suppresses the normal menu — we want a single, deliberate
+ * "let's get you set up" screen from the very first frame instead of a
+ * flash of empty list before the splash takes over. */
 enum downplay_render_mode
 {
    DOWNPLAY_RENDER_LIST = 0,   /* normal menu */
-   DOWNPLAY_RENDER_BLANK,      /* awaiting buildbot list — chrome only */
-   DOWNPLAY_RENDER_SPLASH      /* download in flight */
+   DOWNPLAY_RENDER_WELCOME,    /* PLANNED — waiting for A to start */
+   DOWNPLAY_RENDER_SPLASH      /* setup pass in flight */
 };
 
 static enum downplay_render_mode downplay_get_render_mode(void)
 {
-   switch (downplay_cores_get_state())
+   switch (downplay_setup_get_phase())
    {
-      case DOWNPLAY_CORES_INSTALLING:
-         return DOWNPLAY_RENDER_SPLASH;
-      case DOWNPLAY_CORES_AWAITING_LIST:
-         return DOWNPLAY_RENDER_BLANK;
-      default:
-         return DOWNPLAY_RENDER_LIST;
+      case DOWNPLAY_SETUP_PLANNED: return DOWNPLAY_RENDER_WELCOME;
+      case DOWNPLAY_SETUP_RUNNING: return DOWNPLAY_RENDER_SPLASH;
+      default:                     return DOWNPLAY_RENDER_LIST;
    }
 }
 
-/* Called every frame after downplay_cores_pump.  When the cores module
+/* Called every frame after downplay_setup_pump.  When the setup module
  * settles back to DONE/INACTIVE (rendering as LIST again) and we have a
  * pending pick, finish the launch.  If install failed (core still not
  * installed), do_launch logs and bails — we still clear the slot so the
@@ -3298,32 +3313,139 @@ static void downplay_drive_pending_launch(downplay_handle_t *dp)
    downplay_do_launch_rom(core, rom);
 }
 
-/* Only called in DOWNPLAY_RENDER_SPLASH (i.e. cores state == INSTALLING),
- * so we always have a current ident and progress to draw. */
-static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
-      const downplay_handle_t *dp)
+/* Asymptotic progress curve: each frame, displayed lerps toward target.
+ * target is the *next* segment boundary biased by ASYMPTOTE — the bar
+ * settles at ~85% of a segment then snaps when the underlying task
+ * actually completes (which advances the segment cursor and bumps target
+ * by 1/total).  Within a segment, the lerp's (target - displayed) factor
+ * decays so the bar visibly slows down — the "Zeno" feel — without ever
+ * reaching the segment edge.  k controls how snappy: 3.0 feels alive
+ * without being jittery. */
+#define DOWNPLAY_SETUP_BAR_K        2.0f
+#define DOWNPLAY_SETUP_BAR_ASYMPTOTE 0.85f
+
+static void downplay_setup_anim_step(downplay_handle_t *dp,
+      size_t done, size_t total)
 {
-   const downplay_layout_t *L     = &dp->layout;
-   const char              *ident;
-   size_t                   done  = 0;
-   size_t                   total = 0;
+   retro_time_t now = cpu_features_get_time_usec();
+   float        dt;
+   float        target;
+
+   if (!dp->setup_anim.was_running)
+   {
+      dp->setup_anim.displayed   = 0.0f;
+      dp->setup_anim.last_us     = now;
+      dp->setup_anim.was_running = true;
+   }
+   if (dp->setup_anim.last_us == 0)
+      dp->setup_anim.last_us = now;
+   dt = (float)((double)(now - dp->setup_anim.last_us) / 1000000.0);
+   dp->setup_anim.last_us = now;
+   /* Clamp dt to keep a hitched frame from yanking the bar forward. */
+   if (dt < 0.0f)      dt = 0.0f;
+   if (dt > 0.1f)      dt = 0.1f;
+
+   if (total == 0)
+      total = 1;
+
+   if (downplay_setup_get_phase() == DOWNPLAY_SETUP_DONE)
+      target = 1.0f;
+   else
+      target = ((float)done + DOWNPLAY_SETUP_BAR_ASYMPTOTE)
+             / (float)total;
+   if (target > 1.0f) target = 1.0f;
+
+   /* Lerp toward target.  Never let displayed move backward — segment
+    * skips (e.g. a bucket that turned out to be already populated and
+    * was filtered before begin) shouldn't snap the bar back. */
+   if (target > dp->setup_anim.displayed)
+      dp->setup_anim.displayed +=
+            (target - dp->setup_anim.displayed) * dt
+            * DOWNPLAY_SETUP_BAR_K;
+   if (dp->setup_anim.displayed > 1.0f)
+      dp->setup_anim.displayed = 1.0f;
+}
+
+/* Only called in DOWNPLAY_RENDER_WELCOME.  A static "Let's get you set
+ * up" screen that gates the actual download until the user presses A.
+ * No visible progress, no decisions — just a beat so the dive-in isn't
+ * jarring. */
+static void downplay_draw_welcome_view(const downplay_handle_t *dp)
+{
+   const downplay_layout_t *L      = &dp->layout;
+   size_t                   cores  = downplay_setup_planned_core_count();
+   size_t                   bucks  = downplay_setup_planned_bucket_count();
    char                     subline[160];
-   float                    cy    = (float)L->vid_h * 0.5f;
+   float                    cy     = (float)L->vid_h * 0.5f;
 
-   ident      = downplay_cores_get_progress(&done, &total);
-   subline[0] = '\0';
-   if (ident)
-      snprintf(subline, sizeof(subline), "%s   (%u of %u)",
-            ident, (unsigned)(done + 1), (unsigned)total);
+   /* Compose the "we'll fetch X cores and Y bundles" line.  Both counts
+    * can be zero individually but we never reach this view with both
+    * zero (PLANNED implies something to do). */
+   if (cores > 0 && bucks > 0)
+      snprintf(subline, sizeof(subline),
+            "We'll download %u cores and %u content bundles.",
+            (unsigned)cores, (unsigned)bucks);
+   else if (cores > 0)
+      snprintf(subline, sizeof(subline),
+            "We'll download %u cores.", (unsigned)cores);
+   else
+      snprintf(subline, sizeof(subline),
+            "We'll download %u content bundles.", (unsigned)bucks);
 
-   downplay_draw_text(dp->font, "Downloading core…",
+   downplay_draw_text(dp->font, "Let's get you set up",
          (float)L->vid_w * 0.5f,
-         cy + (L->font_size * 0.35f),
+         cy - (L->font_size * 0.3f),
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
-   if (*subline)
-      downplay_draw_text(dp->chrome_font, subline,
+   downplay_draw_text(dp->chrome_font, subline,
+         (float)L->vid_w * 0.5f,
+         cy + L->font_size * 0.5f
+               + (L->chrome_font_size * 0.85f) + (12.0f * L->scale),
+         L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
+}
+
+/* Only called in DOWNPLAY_RENDER_SPLASH.  Centered title + asymptotic
+ * progress bar + optional sub-line (current core ident during the
+ * cores phase). */
+static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
+      downplay_handle_t *dp)
+{
+   const downplay_layout_t *L      = &dp->layout;
+   const char              *phase  = NULL;
+   const char              *item   = NULL;
+   size_t                   done   = 0;
+   size_t                   total  = 0;
+   int                      bar_w, bar_h, bar_x, bar_y, fill_w;
+   float                    cy     = (float)L->vid_h * 0.5f;
+
+   downplay_setup_get_progress(&total, &done, &phase, &item);
+   downplay_setup_anim_step(dp, done, total);
+
+   downplay_draw_text(dp->font,
+         phase ? phase : "Setting up...",
+         (float)L->vid_w * 0.5f,
+         cy - (L->font_size * 0.5f) - (12.0f * L->scale),
+         L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+
+   /* Bar geometry: 60% of width, ~10px scaled tall, centered.  Drawn
+    * as two flat rects (bg track + fill).  Pill caps would be a nicer
+    * primitive but two rects keep this self-contained. */
+   bar_w  = (int)((float)L->vid_w * 0.60f);
+   bar_h  = (int)(10.0f * L->scale);
+   if (bar_h < 4) bar_h = 4;
+   bar_x  = ((int)L->vid_w - bar_w) / 2;
+   bar_y  = (int)cy + (int)(8.0f * L->scale);
+   fill_w = (int)((float)bar_w * dp->setup_anim.displayed);
+
+   downplay_draw_rect(p_disp, userdata, L,
+         bar_x, bar_y, bar_w, bar_h, DP_COLOR_PILL_DARK);
+   downplay_draw_rect(p_disp, userdata, L,
+         bar_x, bar_y, fill_w, bar_h, DP_COLOR_PILL_LIGHT);
+
+   if (item && *item)
+      downplay_draw_text(dp->chrome_font, item,
             (float)L->vid_w * 0.5f,
-            cy + L->font_size + (L->chrome_font_size * 0.35f) + (8.0f * L->scale),
+            (float)(bar_y + bar_h) + (L->chrome_font_size * 0.85f)
+                  + (8.0f * L->scale),
             L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
 }
 
@@ -3350,11 +3472,12 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    if (!p_disp)
       return;
 
-   /* Pump the cores state machine on every frame.  Cheap; only does work
-    * when the buildbot list has just landed. */
-   downplay_cores_pump();
-   /* If the pump just transitioned the cores state to DONE, this fires
-    * on the same frame and the splash's "complete" state is never drawn.
+   /* Pump the setup state machine on every frame.  Cheap; only does
+    * work when the buildbot list has just landed or a bucket task has
+    * settled. */
+   downplay_setup_pump();
+   /* If the pump just transitioned setup to DONE, this fires on the
+    * same frame and the splash's "complete" state is never drawn.
     * That's intentional: content-load is async, so the splash dismissing
     * straight into the loading screen is the desired UX. */
    downplay_drive_pending_launch(dp);
@@ -3391,6 +3514,11 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       dp->settings_rebuild_pending = false;
    }
    mode = downplay_get_render_mode();
+   /* When we leave splash, drop the anim flag so the next setup pass
+    * (lazy install) starts fresh at displayed=0 instead of carrying
+    * the previous run's full bar. */
+   if (mode != DOWNPLAY_RENDER_SPLASH)
+      dp->setup_anim.was_running = false;
 
    /* Recompute layout (and reload fonts at new size) only when the
     * window or user scale changed.  The font reload is the expensive
@@ -3441,6 +3569,9 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       case DOWNPLAY_RENDER_SPLASH:
          downplay_draw_setup_splash(p_disp, userdata, dp);
          break;
+      case DOWNPLAY_RENDER_WELCOME:
+         downplay_draw_welcome_view(dp);
+         break;
       case DOWNPLAY_RENDER_LIST:
          if (dp->view == DOWNPLAY_VIEW_SETTINGS)
             downplay_draw_settings_view(p_disp, userdata, dp);
@@ -3449,9 +3580,6 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          else
             downplay_draw_list(p_disp, userdata,
                   &dp->layout, dp->pill_cap_tex, dp);
-         break;
-      case DOWNPLAY_RENDER_BLANK:
-         /* Nothing — chrome below still draws, but no list / no splash. */
          break;
    }
 
@@ -3502,14 +3630,13 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
             DOWNPLAY_ANCHOR_LEFT, left, 1, chrome_bg);
    }
 
-   /* Right-aligned hint depends on mode.  Hidden in BLANK since there's
-    * no action to advertise yet.  When the current view supports going
-    * back, a B BACK pair shares the outer pill with the primary hint. */
-   if (mode != DOWNPLAY_RENDER_BLANK)
+   /* Right-aligned hint depends on mode.  When the current view
+    * supports going back, a B BACK pair shares the outer pill with
+    * the primary hint. */
    {
       downplay_hint_t right[2];
       size_t          n          = 0;
-      bool            show_back  = (mode != DOWNPLAY_RENDER_SPLASH
+      bool            show_back  = (mode == DOWNPLAY_RENDER_LIST
                                    && dp->view != DOWNPLAY_VIEW_TOP);
       int             x          = (int)dp->layout.vid_w - dp->layout.margin_x;
 
@@ -3520,8 +3647,16 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          right[n].label = "BACK";
          n++;
       }
-      right[n].glyph = (mode == DOWNPLAY_RENDER_SPLASH) ? "B" : "A";
-      right[n].label = (mode == DOWNPLAY_RENDER_SPLASH) ? "CANCEL" : "OPEN";
+      right[n].glyph = "A";
+      if (mode == DOWNPLAY_RENDER_SPLASH)
+      {
+         right[n].glyph = "B";
+         right[n].label = "CANCEL";
+      }
+      else if (mode == DOWNPLAY_RENDER_WELCOME)
+         right[n].label = "START";
+      else
+         right[n].label = "OPEN";
       n++;
 
       downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
@@ -3549,17 +3684,28 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
     * to DONE; during INSTALLING the in-flight task runs to completion
     * but its result is discarded.  The screen leaves splash/blank state
     * naturally as the cores state advances. */
-   if (downplay_get_render_mode() != DOWNPLAY_RENDER_LIST)
    {
-      if (action == MENU_ACTION_CANCEL)
+      enum downplay_render_mode m = downplay_get_render_mode();
+      if (m == DOWNPLAY_RENDER_WELCOME)
       {
-         /* Drop any pending lazy launch so a cancelled lazy install
-          * returns to the menu instead of auto-launching when the
-          * in-flight task completes. */
-         downplay_clear_pending_launch(dp);
-         downplay_cores_cancel();
+         if (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT)
+            downplay_setup_start();
+         /* No CANCEL path — once we've decided setup is needed, the
+          * user shouldn't be able to dismiss it.  POWER still works. */
+         return 0;
       }
-      return 0;
+      if (m == DOWNPLAY_RENDER_SPLASH)
+      {
+         if (action == MENU_ACTION_CANCEL)
+         {
+            /* Drop any pending lazy launch so a cancelled lazy install
+             * returns to the menu instead of auto-launching when the
+             * in-flight task completes. */
+            downplay_clear_pending_launch(dp);
+            downplay_setup_cancel();
+         }
+         return 0;
+      }
    }
 
    /* CONFIRM modal: A fires the optional callback and returns to
@@ -3852,7 +3998,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
          size_t i;
          for (i = 0; i < dp->system_count; i++)
             idents[i] = dp->systems[i].core_ident;
-         downplay_cores_begin_boot_setup(idents, dp->system_count);
+         downplay_setup_plan_boot(idents, dp->system_count);
          free(idents);
       }
    }

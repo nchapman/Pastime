@@ -1085,6 +1085,7 @@ ifeq ($(HAVE_MENU), 1)
    ifeq ($(HAVE_DOWNPLAY), 1)
       OBJ += menu/drivers/downplay.o
       OBJ += downplay/downplay_cores.o
+      OBJ += downplay/downplay_setup.o
       OBJ += downplay/downplay_defaults.o
       OBJ += downplay/downplay_bootstrap.o
       DEFINES += -DHAVE_DOWNPLAY
