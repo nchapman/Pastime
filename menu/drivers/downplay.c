@@ -2890,19 +2890,85 @@ static void dp_frontend_scaling_apply(enum dp_scaling_mode mode)
 
 /* Slang shader presets shown by Screen Effect.  Paths are relative to
  * <directory_video_shader>/shaders_slang and must match the layout that
- * downplay_setup.c lays down for the slang shaders bucket. */
+ * downplay_setup.c lays down for the slang shaders bucket.
+ *
+ * match_pass_stem is a fallback identifier for read-back when the
+ * .slang pass filenames don't share a stem with the .slangp basename.
+ * Most presets have a pass that names them (e.g. crt-easymode.slangp
+ * → crt-easymode.slang), so leave it NULL.  Required for:
+ *   - LCD:        pass is zfast_lcd.slang  (preset has a dash)
+ *   - Dot Matrix: passes are gb-pass0..gb-pass4.slang
+ * Without this, dp_shader_current_idx returns 0 (Off) for these
+ * presets even when they're loaded.
+ *
+ * param_overrides is a NULL-terminated list of #pragma parameter
+ * tweaks applied after the preset loads — used to ship Downplay's
+ * own defaults on top of the upstream shader (e.g. softer LCD grid,
+ * subtler crt-geom curvature).  Captured by Save Changes since we
+ * write to both the live and menu shader copies. */
 typedef struct
 {
-   const char *label;
-   const char *path;
+   const char *id;
+   float       value;
+} dp_shader_param_override_t;
+
+typedef struct
+{
+   const char                       *label;
+   const char                       *path;
+   const char                       *match_pass_stem;
+   const dp_shader_param_override_t *param_overrides;
 } dp_shader_preset_t;
 
+/* zfast-lcd's BORDERMULT default (14.0) draws fairly dark grid lines.
+ * 10.0 is gentler — the LCD structure stays visible without the lines
+ * fighting the picture for attention. */
+static const dp_shader_param_override_t dp_lcd_overrides[] = {
+   { "BORDERMULT", 10.0f },
+   { NULL,          0.0f }
+};
+
+/* CRT Monitor — broadcast/PVM look:
+ *  - R=5.0:        gentler bend than crt-geom default (2.0); the
+ *                  "barely there" arc of a pro monitor.
+ *  - cornersize:   shrunk from default 0.03 to 0.015 — more squared-
+ *                  off than a consumer set, but with enough rounding
+ *                  to read as a real bezel rather than a hard
+ *                  rectangle.  Stays well below TV's 0.04. */
+static const dp_shader_param_override_t dp_geom_overrides[] = {
+   { "R",          5.0f   },
+   { "cornersize", 0.015f },
+   { NULL,         0.0f   }
+};
+
+/* CRT TV — consumer-set look:
+ *  - R=2.5:        more pronounced bend than geom-deluxe default
+ *                  (3.5), closer to a real living-room CRT bow.
+ *  - cornersize:   pushed from default 0.01 up to 0.04 — visibly
+ *                  rounded corners, the way a consumer set's bezel
+ *                  hugged the tube.
+ *  - halation:     0.13 (default 0.1) — slightly brighter bloom on
+ *                  whites; consumer sets bloomed more aggressively
+ *                  than studio monitors but we keep it tasteful.
+ *  - aperture_strength: 0.32 (default 0.4) — slightly softer mask
+ *                  gives the halation room to read.
+ *  - scanline_weight: 0.32 (default 0.3) — tiny scanline bump
+ *                  reinforces the across-the-room TV feel. */
+static const dp_shader_param_override_t dp_geom_deluxe_overrides[] = {
+   { "R",                 2.5f  },
+   { "cornersize",        0.04f },
+   { "halation",          0.13f },
+   { "aperture_strength", 0.32f },
+   { "scanline_weight",   0.32f },
+   { NULL,                0.0f  }
+};
+
 static const dp_shader_preset_t dp_shader_presets[] = {
-   { "LCD Grid",  "handheld/lcd-grid-v2.slangp" },
-   { "Sharp CRT", "crt/crt-aperture.slangp" },
-   { "Soft CRT",  "crt/crt-consumer.slangp" },
-   { "CRT Glow",  "crt/crt-easymode-halation.slangp" },
-   { "CRT Lite",  "crt/zfast-crt.slangp" },
+   { "LCD",         "handheld/zfast-lcd.slangp",                "zfast_lcd", dp_lcd_overrides },
+   { "Dot Matrix",  "handheld/gameboy-color-dot-matrix.slangp", "gb-pass0",  NULL },
+   { "CRT",         "crt/crt-easymode.slangp",                  NULL,        NULL },
+   { "CRT TV",      "crt/crt-geom-deluxe.slangp",               NULL,        dp_geom_deluxe_overrides },
+   { "CRT Monitor", "crt/crt-geom.slangp",                      NULL,        dp_geom_overrides },
 };
 #define DP_SHADER_PRESET_COUNT \
    (sizeof(dp_shader_presets)/sizeof(dp_shader_presets[0]))
@@ -2932,6 +2998,56 @@ static bool dp_shader_resolve_path(const char *rel, char *out, size_t out_len)
    return true;
 }
 
+/* Set parameter `id` on `s` to `value`, no-op if not present. */
+static void dp_shader_set_param(struct video_shader *s,
+      const char *id, float value)
+{
+   unsigned i;
+   if (!s)
+      return;
+   for (i = 0; i < s->num_parameters; i++)
+   {
+      if (string_is_equal(s->parameters[i].id, id))
+      {
+         s->parameters[i].current = value;
+         return;
+      }
+   }
+}
+
+/* Apply Downplay's #pragma parameter overrides to both shader copies:
+ *   - the video driver's live shader (so the picture changes on the
+ *     next set_params call), and
+ *   - menu_shader (so Save Changes serialises our values to the
+ *     per-core / per-game .slangp).
+ *
+ * The live-shader write assumes the synchronous shader-load path
+ * (DEFAULT_SHADER_DEFERRED_LOADING == false, the Android default).
+ * If deferred loading is ever enabled, this races: the chain may
+ * still be compiling and our writes land on a struct that's about
+ * to be freed.  Re-evaluate this hook point if that flag flips. */
+static void dp_shader_apply_param_overrides(size_t preset_idx)
+{
+   const dp_shader_param_override_t *o;
+   video_shader_ctx_t                ctx;
+   struct video_shader              *live;
+   struct video_shader              *menu;
+
+   if (preset_idx >= DP_SHADER_PRESET_COUNT)
+      return;
+   o = dp_shader_presets[preset_idx].param_overrides;
+   if (!o)
+      return;
+
+   live = video_shader_driver_get_current_shader(&ctx) ? ctx.data : NULL;
+   menu = menu_shader_get();
+   for (; o->id; o++)
+   {
+      dp_shader_set_param(live, o->id, o->value);
+      dp_shader_set_param(menu, o->id, o->value);
+   }
+}
+
 /* Apply (or clear) the Effect shader.  Called from the Frontend
  * submenu's on_close after deferred staging — see dp_frontend_on_close
  * for why scrolling stages instead of applying live.  effect_preset_idx
@@ -2947,28 +3063,86 @@ static void dp_frontend_apply_effect(size_t effect_preset_idx)
    menu_shader_manager_set_preset(menu_shader_get(),
          RARCH_SHADER_SLANG,
          have_effect ? effect_abs : NULL, true);
+
+   if (have_effect)
+      dp_shader_apply_param_overrides(effect_preset_idx);
 }
 
-/* Match the running shader against our preset table by walking
- * every pass and comparing extension-stripped basenames.
+/* Does any visible row in `ud` claim to be `stem`?  A preset matches
+ * if `stem` equals either its .slangp basename (extension stripped)
+ * or its match_pass_stem override.  Returns the row index, or 0.
  *
- * pass[].source.path is the absolute path to a .slang file (e.g.
- * .../crt/shaders/crt-aperture.slang); preset table paths point at
- * .slangp files (e.g. crt/crt-aperture.slangp).  Strip the extension
- * on both sides before comparing.
+ * Assumes pass filenames are unique across the preset table.  If a
+ * future preset reuses a .slang from another preset (e.g. a generic
+ * `linearize.slang` shared by two effects), this returns the first
+ * match in row order, which may be wrong. */
+static size_t dp_shader_match_stem(
+      const dp_shader_row_ud_t *ud, const char *stem)
+{
+   size_t i;
+   for (i = 1; i < ud->count; i++)
+   {
+      const dp_shader_preset_t *p;
+      char                      preset_stem[NAME_MAX_LENGTH];
+      const char               *bn;
+      if (ud->preset_idx[i] >= DP_SHADER_PRESET_COUNT)
+         continue;
+      p = &dp_shader_presets[ud->preset_idx[i]];
+      if (p->match_pass_stem && string_is_equal(p->match_pass_stem, stem))
+         return i;
+      bn = path_basename(p->path);
+      if (!bn)
+         continue;
+      strlcpy(preset_stem, bn, sizeof(preset_stem));
+      path_remove_extension(preset_stem);
+      if (string_is_equal(preset_stem, stem))
+         return i;
+   }
+   return 0;
+}
+
+/* Identify which preset (if any) is currently loaded.
  *
- * Multi-pass effects (crt-easymode-halation has 5 passes:
- * linearize/blur_horiz/blur_vert/threshold/crt-easymode-halation)
- * land their identifying pass last, not first — so we scan ALL
- * passes, not just pass 0. */
+ * Two paths to a match:
+ *
+ * 1. shader->loaded_preset_path is the .slangp the user explicitly
+ *    loaded — when that's one of our presets, basename comparison is
+ *    direct.  Falls back to shader->path (the resolved root preset)
+ *    when loaded_preset_path is empty, which can happen when the
+ *    shader was set without going through the preset loader.
+ *
+ * 2. Per-pass scan over shader->pass[].source.path.  Catches Save
+ *    Changes wrappers (auto-loaded per-core/per-game .slangp files),
+ *    where loaded_preset_path is the wrapper but the passes are still
+ *    the original preset's .slang files.  match_pass_stem in the
+ *    preset table covers the cases where the .slang basename doesn't
+ *    match the .slangp basename. */
 static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
 {
    struct video_shader *shader = menu_shader_get();
+   const char          *src;
    unsigned             p;
-   size_t               i;
+   size_t               match;
    char                 cur_stem[NAME_MAX_LENGTH];
+
    if (!shader || shader->passes == 0)
       return 0;
+
+   src = (shader->loaded_preset_path[0] != '\0')
+       ? shader->loaded_preset_path : shader->path;
+   if (src && *src)
+   {
+      const char *bn = path_basename(src);
+      if (bn && *bn)
+      {
+         strlcpy(cur_stem, bn, sizeof(cur_stem));
+         path_remove_extension(cur_stem);
+         match = dp_shader_match_stem(ud, cur_stem);
+         if (match)
+            return match;
+      }
+   }
+
    for (p = 0; p < shader->passes; p++)
    {
       const char *cur = path_basename(shader->pass[p].source.path);
@@ -2976,20 +3150,9 @@ static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
          continue;
       strlcpy(cur_stem, cur, sizeof(cur_stem));
       path_remove_extension(cur_stem);
-      for (i = 1; i < ud->count; i++)
-      {
-         char        cand_stem[NAME_MAX_LENGTH];
-         const char *cand;
-         if (ud->preset_idx[i] >= DP_SHADER_PRESET_COUNT)
-            continue;
-         cand = path_basename(dp_shader_presets[ud->preset_idx[i]].path);
-         if (!cand)
-            continue;
-         strlcpy(cand_stem, cand, sizeof(cand_stem));
-         path_remove_extension(cand_stem);
-         if (string_is_equal(cand_stem, cur_stem))
-            return i;
-      }
+      match = dp_shader_match_stem(ud, cur_stem);
+      if (match)
+         return match;
    }
    return 0;
 }
