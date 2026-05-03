@@ -180,9 +180,12 @@ typedef struct
    void               *userdata;
 } downplay_settings_row_t;
 
+/* Forward decl so on_close can name the typedef. */
+typedef struct downplay_settings_list downplay_settings_list_t;
+
 /* One settings list.  Stack-allocated when small / static (root
  * Options); heap-allocated when row count is dynamic (core options). */
-typedef struct
+struct downplay_settings_list
 {
    const char              *title;       /* reserved for future header */
    downplay_settings_row_t *rows;        /* owned: free()d on list dispose */
@@ -192,10 +195,19 @@ typedef struct
     * userdata (e.g. root Options list — its on_confirm handlers take
     * dp itself). */
    void                    *userdata_pool;
+   /* Optional flush callback fired by downplay_settings_pop just
+    * before the list is freed.  Used when row changes are staged in
+    * row state during navigation and committed once on back-out (the
+    * Frontend submenu does this so scrolling Effect doesn't recompile
+    * shaders on every L/R press).  on_close_userdata is
+    * passed verbatim. */
+   void                   (*on_close)(downplay_settings_list_t *L,
+                                      void *userdata);
+   void                    *on_close_userdata;
    unsigned                 width_pct;   /* % of vid_w */
    size_t                   sel;
    size_t                   scroll;      /* topmost visible row index */
-} downplay_settings_list_t;
+};
 
 /* Cap of 4 is plenty for the current flow (INGAME → Options →
  * Emulator → maybe a category submenu later).  Bumps cheap if needed. */
@@ -2099,10 +2111,16 @@ static void downplay_settings_push(downplay_handle_t *dp,
 /* Pop the top list.  When the stack empties, restore the prior view. */
 static void downplay_settings_pop(downplay_handle_t *dp)
 {
+   downplay_settings_list_t *L;
    if (dp->settings_depth == 0)
       return;
    dp->settings_depth--;
-   downplay_settings_list_free(dp->settings_stack[dp->settings_depth]);
+   L = dp->settings_stack[dp->settings_depth];
+   /* Fire the optional flush callback before disposing the list.  The
+    * callback may still inspect L->rows[] (it is not yet freed). */
+   if (L && L->on_close)
+      L->on_close(L, L->on_close_userdata);
+   downplay_settings_list_free(L);
    dp->settings_stack[dp->settings_depth] = NULL;
    if (dp->settings_depth == 0)
    {
@@ -2699,73 +2717,169 @@ static downplay_settings_list_t *downplay_build_stub_list(const char *title)
    return L;
 }
 
-/* ---- Frontend submenu (M8): Screen Scaling / Effect / Sharpness ----
+/* ---- Frontend submenu (M8): Screen Scaling / Effect ----
  *
- * Three rows.  Each row is a value cycler whose on_change writes
- * into settings_t and dispatches the appropriate command_event so the
- * change takes effect on the next frame without leaving the menu.
+ * Each row is a value cycler whose on_change writes into settings_t
+ * (or the menu shader manager) and dispatches the appropriate
+ * command_event so the change takes effect on the next frame without
+ * leaving the menu.
  *
- * Scaling and Sharpness combine two RA knobs each — see the apply
- * helpers for the mapping.  Effect drives the slang shader pipeline
- * via menu_shader_manager_set_preset; rows are filtered to presets
+ * Scaling combines a few RA knobs — see dp_frontend_scaling_apply
+ * for the mapping.  Effect drives the slang shader pipeline via
+ * menu_shader_manager_set_preset; rows are filtered to presets
  * present on disk so cores without the slang shaders content bucket
  * installed get a usable (smaller) list rather than a wall of
  * "shader not found" errors. */
 
-/* Native and Cropped both use square pixels (ASPECT_RATIO_SQUARE) +
- * integer scaling.  They differ only in scale_integer_scaling:
- * UNDERSCALE for Native (largest integer factor that fits inside the
- * display) vs OVERSCALE for Cropped (next factor up — clips a few
- * rows/columns at the display edges to fill more of the screen).
- * OVERSCALE is most useful on small handheld displays where the
- * underscale factor wastes a noticeable border. */
-static const char *const dp_frontend_scaling_labels[] = {
-   "Native", "Cropped", "Aspect", "Fullscreen"
+/* The Screen Scaling row is a 2-axis cycler over (PAR × scaling
+ * discipline), plus two outliers.  Six logical modes:
+ *
+ *   DP_SCALING_ASPECT          CORE   PAR + fractional
+ *   DP_SCALING_NATIVE          CORE   PAR + integer underscale
+ *   DP_SCALING_FULLSCREEN      FULL stretch (no PAR)
+ *   DP_SCALING_ASPECT_SQUARE   SQUARE PAR + fractional
+ *   DP_SCALING_NATIVE_SQUARE   SQUARE PAR + integer underscale
+ *   DP_SCALING_CROPPED_SQUARE  SQUARE PAR + integer overscale (clip)
+ *
+ * The SQUARE-PAR three only appear when the loaded core's intended
+ * DAR differs from the source's natural DAR (i.e. core PAR ≠ 1:1).
+ * On square-PAR cores (GB, GBA, NDS) those three rows would all
+ * produce identical pictures to their CORE-PAR siblings, so we
+ * suppress them for a 3-row list.  On non-square cores the SQUARE
+ * variants are labeled with the source DAR (e.g. "Aspect (8:7)") so
+ * the user can see exactly which ratio they're picking. */
+enum dp_scaling_mode
+{
+   DP_SCALING_ASPECT          = 0,
+   DP_SCALING_NATIVE          = 1,
+   DP_SCALING_FULLSCREEN      = 2,
+   DP_SCALING_ASPECT_SQUARE   = 3,
+   DP_SCALING_NATIVE_SQUARE   = 4,
+   DP_SCALING_CROPPED_SQUARE  = 5
 };
 
-static size_t dp_frontend_scaling_current_idx(void)
+#define DP_SCALING_MODE_MAX 6
+/* "Aspect (NN:NN)" — 8 base + up to 11 ratio = ~20 chars; +slack. */
+#define DP_SCALING_LABEL_MAX 28
+
+/* Per-row userdata for the Screen Scaling cycler.  storage[] backs
+ * the dynamic "(W:H)" labels; labels[] points into storage[] for the
+ * SQUARE rows and at static literals for the unqualified rows.
+ * mode[] maps row idx → enum dp_scaling_mode so the visible rows can
+ * be dense (3 on square-PAR cores, 6 otherwise) while mode IDs stay
+ * stable. */
+typedef struct
+{
+   downplay_handle_t   *dp;
+   char                 storage[DP_SCALING_MODE_MAX][DP_SCALING_LABEL_MAX];
+   const char          *labels[DP_SCALING_MODE_MAX];
+   uint8_t              mode[DP_SCALING_MODE_MAX];
+   size_t               count;
+} dp_scaling_row_ud_t;
+
+static unsigned dp_gcd(unsigned a, unsigned b)
+{
+   unsigned t;
+   while (b)
+   {
+      t = b;
+      b = a % b;
+      a = t;
+   }
+   return a;
+}
+
+/* Reduce the source's natural DAR (base_w / base_h) to lowest terms
+ * and write into *out_w / *out_h.  Returns true iff the loaded core's
+ * intended DAR (geometry.aspect_ratio) differs from the source's
+ * natural DAR — i.e., the core's pixels are non-square.  When this
+ * returns false, square pixels and core PAR produce the same picture
+ * and the SQUARE-variant rows would be redundant. */
+static bool dp_scaling_compute_square_dar(unsigned *out_w, unsigned *out_h)
+{
+   const struct retro_game_geometry *g
+      = &video_state_get_ptr()->av_info.geometry;
+   unsigned bw, bh, gd;
+   float    core_dar, square_dar, diff;
+   if (!g->base_width || !g->base_height)
+      return false;
+   bw = g->base_width;
+   bh = g->base_height;
+   gd = dp_gcd(bw, bh);
+   if (out_w)
+      *out_w = bw / gd;
+   if (out_h)
+      *out_h = bh / gd;
+   square_dar = (float)bw / (float)bh;
+   core_dar   = (g->aspect_ratio > 0.0f) ? g->aspect_ratio : square_dar;
+   diff       = core_dar - square_dar;
+   if (diff < 0.0f)
+      diff = -diff;
+   return diff > 0.005f;
+}
+
+static enum dp_scaling_mode dp_frontend_scaling_current_mode(void)
 {
    settings_t *s = config_get_ptr();
    if (!s)
-      return 2;
+      return DP_SCALING_ASPECT;
    if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_FULL)
-      return 3;
-   if (    s->bools.video_scale_integer
-        && s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE)
-      return (s->uints.video_scale_integer_scaling
-            == VIDEO_SCALE_INTEGER_SCALING_OVERSCALE) ? 1 : 0;
-   return 2;
+      return DP_SCALING_FULLSCREEN;
+   if (s->bools.video_scale_integer)
+   {
+      bool over = (s->uints.video_scale_integer_scaling
+            == VIDEO_SCALE_INTEGER_SCALING_OVERSCALE);
+      if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_CORE && !over)
+         return DP_SCALING_NATIVE;
+      if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE && !over)
+         return DP_SCALING_NATIVE_SQUARE;
+      if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE && over)
+         return DP_SCALING_CROPPED_SQUARE;
+      /* Integer + something exotic (4:3, 16:9, etc. in the user's
+       * config).  Fall through to Aspect rather than mis-labeling. */
+   }
+   if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE)
+      return DP_SCALING_ASPECT_SQUARE;
+   return DP_SCALING_ASPECT;
 }
 
-static void dp_frontend_scaling_apply(size_t idx)
+static void dp_frontend_scaling_apply(enum dp_scaling_mode mode)
 {
    settings_t *s = config_get_ptr();
    if (!s)
       return;
-   switch (idx)
+   switch (mode)
    {
-      case 0: /* Native — square pixels, fit inside */
+      case DP_SCALING_NATIVE:
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
+         s->bools.video_scale_integer        = true;
+         s->uints.video_scale_integer_scaling
+                                             = VIDEO_SCALE_INTEGER_SCALING_UNDERSCALE;
+         break;
+      case DP_SCALING_FULLSCREEN:
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_FULL;
+         s->bools.video_scale_integer        = false;
+         break;
+      case DP_SCALING_ASPECT_SQUARE:
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_SQUARE;
+         s->bools.video_scale_integer        = false;
+         break;
+      case DP_SCALING_NATIVE_SQUARE:
          s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_SQUARE;
          s->bools.video_scale_integer        = true;
          s->uints.video_scale_integer_scaling
                                              = VIDEO_SCALE_INTEGER_SCALING_UNDERSCALE;
          break;
-      case 1: /* Cropped — square pixels, overscale & clip */
+      case DP_SCALING_CROPPED_SQUARE:
          s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_SQUARE;
          s->bools.video_scale_integer        = true;
          s->uints.video_scale_integer_scaling
                                              = VIDEO_SCALE_INTEGER_SCALING_OVERSCALE;
          break;
-      case 3: /* Fullscreen — stretch */
-         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_FULL;
-         s->bools.video_scale_integer        = false;
-         break;
-      case 2:
-      default: /* Aspect — core PAR, fit inside */
+      case DP_SCALING_ASPECT:
+      default:
          s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
-         s->bools.video_scale_integer        = true;
-         s->uints.video_scale_integer_scaling
-                                             = VIDEO_SCALE_INTEGER_SCALING_UNDERSCALE;
+         s->bools.video_scale_integer        = false;
          break;
    }
    /* SET_ASPECT_RATIO already raises the SHOULD_RESIZE flag on every
@@ -2773,19 +2887,6 @@ static void dp_frontend_scaling_apply(size_t idx)
     * follow-up APPLY_STATE_CHANGES would be redundant. */
    command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
 }
-
-/* Sharp = nearest, Soft = bilinear, Crisp = pixel_aa interpolation
- * shader prepended to the pipeline (supersample-style AA at any
- * scale, MinUI's signature look).  Crisp is only offered when the
- * running video driver speaks slang — on gl1/gl/glsl the shader load
- * silently fails, so we drop to the 2-element label set and the row
- * just shows Sharp/Soft. */
-static const char *const dp_frontend_sharpness_labels_2[] = {
-   "Sharp", "Soft"
-};
-static const char *const dp_frontend_sharpness_labels_3[] = {
-   "Sharp", "Crisp", "Soft"
-};
 
 /* Slang shader presets shown by Screen Effect.  Paths are relative to
  * <directory_video_shader>/shaders_slang and must match the layout that
@@ -2831,86 +2932,41 @@ static bool dp_shader_resolve_path(const char *rel, char *out, size_t out_len)
    return true;
 }
 
-/* True iff pass 0 of the running shader is one of the pixel_aa
- * variants (pixel_aa.slang, pixel_aa_fast.slang, pixel_aa_xform.slang
- * etc.).  Used as the source-of-truth for "is Crisp on?" — survives
- * override reloads with no extra wiring, since when a saved per-core
- * preset has pixel_aa as pass 0 the cycler will read Crisp on next
- * render. */
-static bool dp_shader_first_pass_is_crisp(void)
+/* Apply (or clear) the Effect shader.  Called from the Frontend
+ * submenu's on_close after deferred staging — see dp_frontend_on_close
+ * for why scrolling stages instead of applying live.  effect_preset_idx
+ * == SIZE_MAX (or out of range) clears the running shader. */
+static void dp_frontend_apply_effect(size_t effect_preset_idx)
 {
-   struct video_shader *s = menu_shader_get();
-   const char          *bn;
-   if (!s || s->passes == 0)
-      return false;
-   bn = path_basename(s->pass[0].source.path);
-   return bn && !strncmp(bn, "pixel_aa", 8);
-}
-
-/* Apply the combined Sharpness=Crisp + Effect pipeline.  Both rows'
- * on_change callbacks funnel through here so the shader stack always
- * reflects the union of their states.  When Crisp is on we set the
- * effect first (or NULL) and prepend pixel_aa, so pixel_aa always
- * runs as pass 0 — matters for read-back, and is the order the
- * MinUI-style supersample wants (interpolate then apply CRT etc.). */
-static void dp_frontend_apply_pipeline(bool crisp,
-      size_t effect_preset_idx)
-{
-   const char *crisp_rel = "pixel-art-scaling/pixel_aa.slangp";
-   char        crisp_abs[PATH_MAX_LENGTH];
-   char        effect_abs[PATH_MAX_LENGTH];
-   bool        have_crisp  = crisp
-        && dp_shader_resolve_path(crisp_rel, crisp_abs, sizeof(crisp_abs))
-        && path_is_valid(crisp_abs);
-   bool        have_effect = (effect_preset_idx < DP_SHADER_PRESET_COUNT)
+   char effect_abs[PATH_MAX_LENGTH];
+   bool have_effect = (effect_preset_idx < DP_SHADER_PRESET_COUNT)
         && dp_shader_resolve_path(dp_shader_presets[effect_preset_idx].path,
               effect_abs, sizeof(effect_abs))
         && path_is_valid(effect_abs);
 
-   if (!have_crisp && !have_effect)
-   {
-      menu_shader_manager_set_preset(menu_shader_get(),
-            RARCH_SHADER_SLANG, NULL, true);
-      return;
-   }
-   if (have_crisp && !have_effect)
-   {
-      menu_shader_manager_set_preset(menu_shader_get(),
-            RARCH_SHADER_SLANG, crisp_abs, true);
-      return;
-   }
-   if (!have_crisp && have_effect)
-   {
-      menu_shader_manager_set_preset(menu_shader_get(),
-            RARCH_SHADER_SLANG, effect_abs, true);
-      return;
-   }
    menu_shader_manager_set_preset(menu_shader_get(),
-         RARCH_SHADER_SLANG, effect_abs, true);
-   /* append_preset clears the menu's pass count on failure (see
-    * menu_driver.c:7069), which would leave the shader struct empty
-    * even though the Effect was already applied to the GPU.  On
-    * failure, re-set the Effect alone so the menu mirror matches
-    * what's actually rendering — read-back stays consistent and the
-    * user sees Crisp drop back off rather than the Effect vanishing. */
-   if (!menu_shader_manager_append_preset(menu_shader_get(),
-            crisp_abs, true))
-      menu_shader_manager_set_preset(menu_shader_get(),
-            RARCH_SHADER_SLANG, effect_abs, true);
+         RARCH_SHADER_SLANG,
+         have_effect ? effect_abs : NULL, true);
 }
 
-/* Match the running shader's first non-pixel_aa pass against our
- * preset table by basename.  Walking pass[].source.path (rather than
- * shader->path) is necessary because Crisp prepends pixel_aa as a
- * separate preset — shader->path would only name the most recent
- * set_preset target, not the composed effect.  Each table entry has
- * a unique source-file basename, so basename match is sufficient and
- * avoids absolute-path fragility (case, symlinks, #reference). */
+/* Match the running shader against our preset table by walking
+ * every pass and comparing extension-stripped basenames.
+ *
+ * pass[].source.path is the absolute path to a .slang file (e.g.
+ * .../crt/shaders/crt-aperture.slang); preset table paths point at
+ * .slangp files (e.g. crt/crt-aperture.slangp).  Strip the extension
+ * on both sides before comparing.
+ *
+ * Multi-pass effects (crt-easymode-halation has 5 passes:
+ * linearize/blur_horiz/blur_vert/threshold/crt-easymode-halation)
+ * land their identifying pass last, not first — so we scan ALL
+ * passes, not just pass 0. */
 static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
 {
    struct video_shader *shader = menu_shader_get();
    unsigned             p;
    size_t               i;
+   char                 cur_stem[NAME_MAX_LENGTH];
    if (!shader || shader->passes == 0)
       return 0;
    for (p = 0; p < shader->passes; p++)
@@ -2918,141 +2974,93 @@ static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
       const char *cur = path_basename(shader->pass[p].source.path);
       if (!cur || !*cur)
          continue;
-      if (!strncmp(cur, "pixel_aa", 8))
-         continue;
+      strlcpy(cur_stem, cur, sizeof(cur_stem));
+      path_remove_extension(cur_stem);
       for (i = 1; i < ud->count; i++)
       {
+         char        cand_stem[NAME_MAX_LENGTH];
          const char *cand;
          if (ud->preset_idx[i] >= DP_SHADER_PRESET_COUNT)
             continue;
          cand = path_basename(dp_shader_presets[ud->preset_idx[i]].path);
-         if (cand && string_is_equal(cand, cur))
+         if (!cand)
+            continue;
+         strlcpy(cand_stem, cand, sizeof(cand_stem));
+         path_remove_extension(cand_stem);
+         if (string_is_equal(cand_stem, cur_stem))
             return i;
       }
-      /* First non-pixel_aa pass didn't match — Effect is set to
-       * something we don't track.  Don't keep walking; report Off. */
-      break;
    }
    return 0;
 }
 
 static void dp_frontend_scaling_on_change(int delta, void *userdata)
 {
-   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
+   dp_scaling_row_ud_t      *ud = (dp_scaling_row_ud_t*)userdata;
    downplay_settings_list_t *S;
-   (void)delta;
-   if (!dp)
-      return;
-   S = downplay_settings_top(dp);
-   if (!S || S->sel >= S->row_count)
-      return;
-   dp_frontend_scaling_apply(S->rows[S->sel].idx_value);
-}
-
-/* Forward decl — sharpness on_change reaches the effect row by
- * function-pointer identity, and effect on_change does the
- * symmetrical lookup; one of the two needs to be visible early. */
-static void dp_frontend_effect_on_change(int delta, void *userdata);
-
-/* Walk the active settings list for the row whose on_change matches
- * the passed function pointer; returns NULL if no such row exists
- * (e.g. Effect row hidden on a non-slang driver). */
-static const downplay_settings_row_t *dp_frontend_find_row(
-      downplay_settings_list_t *S,
-      void (*on_change)(int, void*))
-{
-   size_t i;
-   if (!S)
-      return NULL;
-   for (i = 0; i < S->row_count; i++)
-      if (S->rows[i].on_change == on_change)
-         return &S->rows[i];
-   return NULL;
-}
-
-/* Pull the currently-selected effect preset index off the Effect
- * row's userdata (a dp_shader_row_ud_t).  Returns SIZE_MAX when the
- * row is absent or selected on Off. */
-static size_t dp_frontend_current_effect_idx(downplay_settings_list_t *S)
-{
-   const downplay_settings_row_t *r = dp_frontend_find_row(S,
-         dp_frontend_effect_on_change);
-   const dp_shader_row_ud_t      *ud;
-   if (!r || !r->userdata)
-      return SIZE_MAX;
-   ud = (const dp_shader_row_ud_t*)r->userdata;
-   if (r->idx_value >= ud->count)
-      return SIZE_MAX;
-   return ud->preset_idx[r->idx_value];
-}
-
-static void dp_frontend_sharpness_on_change(int delta, void *userdata)
-{
-   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
-   downplay_settings_list_t *S;
-   settings_t               *s  = config_get_ptr();
-   size_t                    sharp_idx;
-   bool                      crisp;
-   bool                      three_label;
-   (void)delta;
-   if (!dp || !s)
-      return;
-   S = downplay_settings_top(dp);
-   if (!S || S->sel >= S->row_count)
-      return;
-   sharp_idx   = S->rows[S->sel].idx_value;
-   /* The label set is 2 (Sharp/Soft) on non-slang drivers and 3
-    * (Sharp/Crisp/Soft) elsewhere — read off the row to know which
-    * index means which. */
-   three_label = (S->rows[S->sel].values_count == 3);
-   crisp       = three_label && (sharp_idx == 1);
-   /* Sharp/Soft drive video_smooth; Crisp forces it false (the
-    * shader does its own filtering via filter_linear directives, so
-    * the sampler state doesn't matter once pixel_aa runs). */
-   s->bools.video_smooth = three_label
-        ? (sharp_idx == 2)
-        : (sharp_idx == 1);
-   command_event(CMD_EVENT_VIDEO_APPLY_STATE_CHANGES, NULL);
-   dp_frontend_apply_pipeline(crisp, dp_frontend_current_effect_idx(S));
-   /* Pipeline composition changed → Save Changes must persist the
-    * combined .slangp.  Effect row's dirty flag is the same flag and
-    * gets set from there too; one source of truth. */
-   dp->frontend_effect_dirty = true;
-}
-
-static void dp_frontend_effect_on_change(int delta, void *userdata)
-{
-   dp_shader_row_ud_t       *ud = (dp_shader_row_ud_t*)userdata;
-   downplay_settings_list_t *S;
-   const downplay_settings_row_t *sharp_row;
-   size_t                    idx, effect_preset_idx;
-   bool                      crisp = false;
+   size_t                    row_idx;
    (void)delta;
    if (!ud || !ud->dp)
       return;
    S = downplay_settings_top(ud->dp);
    if (!S || S->sel >= S->row_count)
       return;
-   idx = S->rows[S->sel].idx_value;
-   if (idx >= ud->count)
+   row_idx = S->rows[S->sel].idx_value;
+   if (row_idx >= ud->count)
       return;
-   effect_preset_idx = ud->preset_idx[idx];
-   sharp_row         = dp_frontend_find_row(S,
-         dp_frontend_sharpness_on_change);
-   if (sharp_row && sharp_row->values_count == 3)
-      crisp = (sharp_row->idx_value == 1);
-   dp_frontend_apply_pipeline(crisp, effect_preset_idx);
+   dp_frontend_scaling_apply((enum dp_scaling_mode)ud->mode[row_idx]);
+}
+
+static void dp_frontend_effect_on_change(int delta, void *userdata)
+{
+   dp_shader_row_ud_t *ud = (dp_shader_row_ud_t*)userdata;
+   (void)delta;
+   if (!ud || !ud->dp)
+      return;
+   /* Defer the shader load to on_close — recompiling on every L/R
+    * cycle while scrolling caused visible jank.  Mark dirty so the
+    * close hook knows to flush the final selection. */
    ud->dp->frontend_effect_dirty = true;
+}
+
+/* Flush hook fired when the user backs out of the Frontend submenu.
+ * Picks up the final Effect row value and applies it.  No-op if
+ * nothing was touched (saves an unnecessary shader recompile). */
+static void dp_frontend_on_close(downplay_settings_list_t *L,
+      void *userdata)
+{
+   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
+   const dp_shader_row_ud_t *ud;
+   size_t                    i;
+   size_t                    effect_preset_idx = SIZE_MAX;
+   if (!dp || !L || !dp->frontend_effect_dirty)
+      return;
+   for (i = 0; i < L->row_count; i++)
+   {
+      if (L->rows[i].on_change != dp_frontend_effect_on_change)
+         continue;
+      ud = (const dp_shader_row_ud_t*)L->rows[i].userdata;
+      if (ud && L->rows[i].idx_value < ud->count)
+         effect_preset_idx = ud->preset_idx[L->rows[i].idx_value];
+      break;
+   }
+   dp_frontend_apply_effect(effect_preset_idx);
 }
 
 static downplay_settings_list_t *downplay_build_frontend_list(
       downplay_handle_t *dp)
 {
    downplay_settings_list_t *L;
+   dp_scaling_row_ud_t      *scaling_ud;
    dp_shader_row_ud_t       *shader_ud;
    downplay_settings_row_t  *r;
    size_t                    i;
    size_t                    out_row   = 0;
+   size_t                    pool_sz;
+   unsigned                  square_w  = 0;
+   unsigned                  square_h  = 0;
+   bool                      show_sq;
+   enum dp_scaling_mode      cur_mode;
    /* Slang shader pipeline only works on slang-capable contexts
     * (vulkan / glcore / d3d10+ / metal).  On gl1/gl/glsl drivers,
     * menu_shader_manager_set_preset silently fails — the user would
@@ -3063,31 +3071,103 @@ static downplay_settings_list_t *downplay_build_frontend_list(
     * tolerate but the row itself would still be a no-op). */
    bool                      slang_ok  = video_driver_test_all_flags(
          GFX_CTX_FLAGS_SHADERS_SLANG) && menu_shader_get() != NULL;
-   size_t                    row_count = slang_ok ? 3 : 2;
+   size_t                    row_count = slang_ok ? 2 : 1;
    char                      path[PATH_MAX_LENGTH];
 
-   L = downplay_settings_list_new("Frontend", row_count,
-         slang_ok ? sizeof(dp_shader_row_ud_t) : 0, 60);
+   /* userdata_pool layout: scaling_ud first, then shader_ud iff slang.
+    * Alignment is guaranteed because (a) calloc returns memory aligned
+    * to alignof(max_align_t), and (b) sizeof(dp_scaling_row_ud_t) is
+    * padded by the compiler to a multiple of its own alignment, which
+    * is at least sizeof(void*) since the struct leads with a pointer
+    * — so the offset places shader_ud's leading pointer member on a
+    * pointer-aligned address on both LP64 and ILP32 ABIs. */
+   pool_sz = sizeof(dp_scaling_row_ud_t)
+           + (slang_ok ? sizeof(dp_shader_row_ud_t) : 0);
+   L       = downplay_settings_list_new("Frontend", row_count, pool_sz, 60);
    if (!L)
       return NULL;
 
-   /* Screen Scaling */
-   r              = &L->rows[out_row++];
-   r->title       = "Screen Scaling";
-   r->desc        = "Native is square pixels; Cropped fills the "
-                    "screen and clips edges; Aspect uses the game's "
-                    "intended ratio; Fullscreen stretches.";
-   r->values      = dp_frontend_scaling_labels;
-   r->values_count = sizeof(dp_frontend_scaling_labels)
-                  / sizeof(dp_frontend_scaling_labels[0]);
-   r->idx_value   = dp_frontend_scaling_current_idx();
-   r->on_change   = dp_frontend_scaling_on_change;
-   r->userdata    = dp;
+   /* Screen Scaling — build the variable-length value list and label
+    * the SQUARE rows with the source's natural DAR (e.g. "Aspect
+    * (8:7)") so the user can see the ratio they're picking. */
+   scaling_ud      = (dp_scaling_row_ud_t*)L->userdata_pool;
+   scaling_ud->dp  = dp;
+   show_sq         = dp_scaling_compute_square_dar(&square_w, &square_h);
+
+   /* Common-case rows always shown. */
+   scaling_ud->labels[0] = "Aspect";
+   scaling_ud->mode[0]   = DP_SCALING_ASPECT;
+   scaling_ud->labels[1] = "Native";
+   scaling_ud->mode[1]   = DP_SCALING_NATIVE;
+   scaling_ud->labels[2] = "Fullscreen";
+   scaling_ud->mode[2]   = DP_SCALING_FULLSCREEN;
+   scaling_ud->count     = 3;
+
+   /* Square-PAR variants — only when the core's pixels actually differ
+    * from square (otherwise these would be visual duplicates of the
+    * common rows above). */
+   if (show_sq)
+   {
+      snprintf(scaling_ud->storage[3], DP_SCALING_LABEL_MAX,
+            "Aspect (%u:%u)", square_w, square_h);
+      scaling_ud->labels[3] = scaling_ud->storage[3];
+      scaling_ud->mode[3]   = DP_SCALING_ASPECT_SQUARE;
+      snprintf(scaling_ud->storage[4], DP_SCALING_LABEL_MAX,
+            "Native (%u:%u)", square_w, square_h);
+      scaling_ud->labels[4] = scaling_ud->storage[4];
+      scaling_ud->mode[4]   = DP_SCALING_NATIVE_SQUARE;
+      snprintf(scaling_ud->storage[5], DP_SCALING_LABEL_MAX,
+            "Cropped (%u:%u)", square_w, square_h);
+      scaling_ud->labels[5] = scaling_ud->storage[5];
+      scaling_ud->mode[5]   = DP_SCALING_CROPPED_SQUARE;
+      scaling_ud->count     = 6;
+   }
+
+   /* Map the current settings_t state back to a row idx.  When the
+    * SQUARE block is suppressed (square-PAR core, or migrating from an
+    * older Downplay where Native wrote SQUARE+integer+UNDERSCALE), any
+    * SQUARE-flavor mode in settings_t has no row to display.  Remap
+    * each to its CORE-PAR sibling for the search — visually identical
+    * on a square-PAR core, and the rendered picture matches the
+    * displayed label.  The first user-driven cycle re-applies the
+    * canonical settings_t state for that row. */
+   cur_mode = dp_frontend_scaling_current_mode();
+   if (!show_sq)
+   {
+      if (cur_mode == DP_SCALING_ASPECT_SQUARE)
+         cur_mode = DP_SCALING_ASPECT;
+      else if (cur_mode == DP_SCALING_NATIVE_SQUARE
+            || cur_mode == DP_SCALING_CROPPED_SQUARE)
+         cur_mode = DP_SCALING_NATIVE;
+   }
+   {
+      size_t cur_idx = 0;
+      for (i = 0; i < scaling_ud->count; i++)
+      {
+         if (scaling_ud->mode[i] == (uint8_t)cur_mode)
+         {
+            cur_idx = i;
+            break;
+         }
+      }
+
+      r              = &L->rows[out_row++];
+      r->title       = "Screen Scaling";
+      r->desc        = "Aspect fits the screen; Native is integer-"
+                       "scaled; Fullscreen stretches.  Parenthesized "
+                       "variants use 1:1 pixels.";
+      r->values      = scaling_ud->labels;
+      r->values_count = scaling_ud->count;
+      r->idx_value   = cur_idx;
+      r->on_change   = dp_frontend_scaling_on_change;
+      r->userdata    = scaling_ud;
+   }
 
    /* Screen Effect — only when the running video driver speaks slang. */
    if (slang_ok)
    {
-      shader_ud      = (dp_shader_row_ud_t*)L->userdata_pool;
+      shader_ud      = (dp_shader_row_ud_t*)((char*)L->userdata_pool
+                              + sizeof(dp_scaling_row_ud_t));
       shader_ud->dp  = dp;
       /* Row 0 is always Off; further rows added per existing preset. */
       shader_ud->labels[0]     = "Off";
@@ -3114,36 +3194,12 @@ static downplay_settings_list_t *downplay_build_frontend_list(
       r->idx_value   = dp_shader_current_idx(shader_ud);
       r->on_change   = dp_frontend_effect_on_change;
       r->userdata    = shader_ud;
-   }
 
-   /* Screen Sharpness — Sharp/Crisp/Soft when slang is available,
-    * Sharp/Soft otherwise (Crisp needs the pixel_aa interpolation
-    * shader). */
-   {
-      settings_t *s        = config_get_ptr();
-      bool        smooth   = s && s->bools.video_smooth;
-      bool        crisp_on = slang_ok && dp_shader_first_pass_is_crisp();
-      r              = &L->rows[out_row++];
-      r->title       = "Screen Sharpness";
-      r->desc        = slang_ok
-           ? "Sharp keeps hard pixel edges; Crisp smooths them with "
-             "subpixel anti-aliasing; Soft applies bilinear blur."
-           : "Sharp keeps hard pixel edges; Soft applies bilinear "
-             "smoothing.";
-      if (slang_ok)
-      {
-         r->values       = dp_frontend_sharpness_labels_3;
-         r->values_count = 3;
-         r->idx_value    = crisp_on ? 1 : (smooth ? 2 : 0);
-      }
-      else
-      {
-         r->values       = dp_frontend_sharpness_labels_2;
-         r->values_count = 2;
-         r->idx_value    = smooth ? 1 : 0;
-      }
-      r->on_change   = dp_frontend_sharpness_on_change;
-      r->userdata    = dp;
+      /* Wire the close-flush so Effect scrolling stages in row state
+       * and applies once on back-out — only meaningful when the
+       * Effect row exists.  See dp_frontend_on_close. */
+      L->on_close          = dp_frontend_on_close;
+      L->on_close_userdata = dp;
    }
 
    return L;

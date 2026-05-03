@@ -130,14 +130,17 @@ void downplay_defaults_apply(void)
    settings->bools.savestate_auto_load        = true;
    settings->bools.savestate_thumbnail_enable = true;
 
-   /* Frontend video defaults (M8): Sharp + Aspect.  These map to the
-    * Frontend submenu's Screen Scaling = Aspect (core PAR + integer
-    * scaling) and Screen Sharpness = Sharp (nearest-neighbor — RA's
-    * desktop default, intentionally retained).  Applied unconditionally
-    * since RA's aspect default elsewhere can be ASPECT_RATIO_CONFIG /
-    * 16:9 / 4:3 depending on platform. */
+   /* Frontend video default: Screen Scaling = Aspect (core PAR,
+    * fractional fill).  Integer scaling here would leave thick borders
+    * on handhelds — the Frontend submenu's Native row is the integer-
+    * locked alternative.  Applied unconditionally since RA's aspect
+    * default elsewhere can be ASPECT_RATIO_CONFIG / 16:9 / 4:3
+    * depending on platform.  video_smooth is intentionally not pinned
+    * — RA's default is nearest on every Downplay target platform, and
+    * the Sharpness row was dropped (Vulkan/GLCore have no runtime
+    * filter toggle), so any user-set override should be respected. */
    settings->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
-   settings->bools.video_scale_integer        = true;
+   settings->bools.video_scale_integer        = false;
 
    /* In-game settings persistence model (M8).  Two pieces:
     *
