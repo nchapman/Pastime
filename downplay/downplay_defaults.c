@@ -98,6 +98,22 @@ void downplay_defaults_apply(void)
    strlcpy(settings->arrays.menu_driver, "downplay",
          sizeof(settings->arrays.menu_driver));
 
+#ifdef ANDROID
+   /* Force Vulkan on Android.  Upstream defaults to legacy GLES2 (the
+    * "gl" driver) which is glsl-only — slang shaders silently fail to
+    * load, so the Frontend submenu's Effect/Crisp rows have nothing
+    * to drive.  Snapdragon 800-series and Mali-Gxx have shipped solid
+    * Vulkan for years; falling back to gl/glcore on devices without
+    * Vulkan is the user's call via an explicit override. */
+   /* "gl" is the upstream Android default (configuration.c:455 picks
+    * VIDEO_GL when HAVE_OPENGLES is set, before HAVE_VULKAN gets a
+    * chance) — equality with that string lets us re-overlay on a
+    * fresh install without trampling an explicit user choice. */
+   if (downplay_should_overlay(settings->arrays.video_driver, "gl"))
+      strlcpy(settings->arrays.video_driver, "vulkan",
+            sizeof(settings->arrays.video_driver));
+#endif
+
    /* Gamepad menu combo: pick START+SELECT only when the user hasn't
     * chosen a combo (NONE).  Any explicit choice — L3+R3, hold START,
     * etc. — wins. */
