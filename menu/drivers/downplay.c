@@ -353,6 +353,14 @@ static float DP_COLOR_PILL_DARK[16] = {
    0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f,
    0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f
 };
+/* Chrome pill bg in launcher views (status pill, footer hints).  Pure
+ * black would vanish against DP_COLOR_BG; a mid-gray reads as a chip.
+ * INGAME keeps DP_COLOR_PILL_DARK because the dimmed-game bg already
+ * provides contrast. */
+static float DP_COLOR_PILL_CHROME_GRAY[16] = {
+   0.125f, 0.125f, 0.125f, 1.0f,   0.125f, 0.125f, 0.125f, 1.0f,
+   0.125f, 0.125f, 0.125f, 1.0f,   0.125f, 0.125f, 0.125f, 1.0f
+};
 /* Mid-gray background for the selected option row in the settings list
  * — visible against pure black, subtle enough not to fight with the
  * white title pill drawn on top. */
@@ -370,6 +378,9 @@ static float DP_COLOR_PILL_BG_GRAY[16] = {
 
 #define DP_TEXT_LIGHT   0xFFFFFFFF
 #define DP_TEXT_DARK    0x000000FF
+/* Mid-gray (#979797) used for the key-cap glyph on footer hint badges
+ * — softer than pure black against the white badge fill. */
+#define DP_TEXT_BADGE   0x979797FF
 #define DP_TEXT_MUTED   0x808080FF
 
 /* ---------- list (systems + recents) ---------- */
@@ -1699,37 +1710,49 @@ enum downplay_anchor
    DOWNPLAY_ANCHOR_RIGHT
 };
 
+/* One badge + label pair inside a footer hint pill. */
+typedef struct downplay_hint
+{
+   const char *glyph;
+   const char *label;
+} downplay_hint_t;
+
 /* Footer hint = outer dark pill (row_h tall, auto-sized to content)
- * containing a single light glyph badge and its white label.  The
- * inner badge is inset vertically so the outer pill reads as a
- * footer surface and the badge as a key cap sitting on it.
+ * containing one or more (badge, label) pairs.  The inner badges are
+ * inset vertically so the outer pill reads as a footer surface and the
+ * badges as key caps sitting on it.  Multiple pairs share one pill
+ * with a `chrome_pad_x` separator between them.
  *
  * `anchor_x` is the left edge for ANCHOR_LEFT, or the right edge for
  * ANCHOR_RIGHT — the function measures the content and positions the
- * outer pill accordingly.  This keeps callers from having to predict
- * the auto-sized width. */
-static void downplay_draw_footer_hint(gfx_display_t *p_disp, void *userdata,
+ * outer pill accordingly. */
+static int downplay_draw_footer_hints(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset,
       const downplay_layout_t *L, uintptr_t cap_tex,
       int anchor_x, int y, enum downplay_anchor anchor,
-      const char *glyph, const char *label)
+      const downplay_hint_t *hints, size_t hint_count, float *bg_color)
 {
-   int badge_inset_y = (int)(6.0f * L->scale);
-   /* Inner padding sits between the tight badge_inset_y (felt cramped)
-    * and the loose chrome_pad_x (felt floaty) — splits the difference
-    * for the "key cap on a footer surface" look. */
-   int inner_pad_x   = (int)(9.0f * L->scale);
-   int badge_h       = L->row_h - 2 * badge_inset_y;
-   int badge_x;
-   int badge_w;
-   int label_w;
-   int pill_w;
-   int pill_x;
-   int label_x;
-   int badge_text_y;
-   int label_y;
-   int glyph_w;
-   int min_badge_w;
+   int    badge_inset_y = (int)(6.0f * L->scale);
+   /* Asymmetric inner padding so the *visible text* is equally inset
+    * from each outer cap: the left side already has the badge's own
+    * chrome_pad_x between cap and glyph, so the right side adds
+    * chrome_pad_x on top of inner_pad_l to match. */
+   int    inner_pad_l   = (int)(9.0f * L->scale);
+   int    inner_pad_r   = inner_pad_l + L->chrome_pad_x;
+   int    sep_gap       = 2 * L->chrome_pad_x;
+   int    badge_h       = L->row_h - 2 * badge_inset_y;
+   int    pill_w        = 0;
+   int    pill_x;
+   int    cursor_x;
+   int    label_y;
+   size_t i;
+   int    badge_w[8];
+   int    label_w[8];
+   int    glyph_w;
+   int    min_badge_w;
+
+   if (hint_count == 0 || hint_count > 8)
+      return 0;
 
    if (badge_h < 1)
    {
@@ -1737,24 +1760,26 @@ static void downplay_draw_footer_hint(gfx_display_t *p_disp, void *userdata,
       badge_inset_y = 0;
    }
 
-   /* Replicate downplay_badge_width but against badge_h (the inset
-    * inner height), not row_h, so the badge stays proportional to its
-    * own height even when the outer pill is taller. */
-   glyph_w     = font_driver_get_message_width(font, glyph,
-         (unsigned)strlen(glyph), 1.0f);
+   /* Pass 1 — measure each badge and label, accumulate pill_w. */
    min_badge_w = badge_h;
-   badge_w     = (glyph_w > 0) ? glyph_w + 2 * L->chrome_pad_x : min_badge_w;
-   if (badge_w < min_badge_w)
-      badge_w = min_badge_w;
+   pill_w      = inner_pad_l + inner_pad_r;
+   for (i = 0; i < hint_count; i++)
+   {
+      glyph_w    = font_driver_get_message_width(font, hints[i].glyph,
+            (unsigned)strlen(hints[i].glyph), 1.0f);
+      badge_w[i] = (glyph_w > 0) ? glyph_w + 2 * L->chrome_pad_x : min_badge_w;
+      if (badge_w[i] < min_badge_w)
+         badge_w[i] = min_badge_w;
 
-   label_w = font_driver_get_message_width(font, label,
-         (unsigned)strlen(label), 1.0f);
-   if (label_w < 0)
-      label_w = 0;
+      label_w[i] = font_driver_get_message_width(font, hints[i].label,
+            (unsigned)strlen(hints[i].label), 1.0f);
+      if (label_w[i] < 0)
+         label_w[i] = 0;
 
-   /* Outer pill: padding-left + badge + gap + label + padding-right. */
-   pill_w = inner_pad_x + badge_w + L->chrome_gap + label_w
-          + inner_pad_x;
+      pill_w += badge_w[i] + L->chrome_gap + label_w[i];
+      if (i + 1 < hint_count)
+         pill_w += sep_gap;
+   }
    if (pill_w < L->row_h)
       pill_w = L->row_h;
 
@@ -1762,24 +1787,32 @@ static void downplay_draw_footer_hint(gfx_display_t *p_disp, void *userdata,
           ? anchor_x - pill_w
           : anchor_x;
 
+   /* Pass 2 — draw outer pill, then each badge + label in order. */
    downplay_draw_pill(p_disp, userdata, L, cap_tex,
-         pill_x, y, pill_w, L->row_h, DP_COLOR_PILL_DARK);
+         pill_x, y, pill_w, L->row_h, bg_color);
 
-   badge_x      = pill_x + inner_pad_x;
-   badge_text_y = downplay_baseline_y(y + badge_inset_y, badge_h,
-         centre_offset);
-   downplay_draw_pill(p_disp, userdata, L, cap_tex,
-         badge_x, y + badge_inset_y, badge_w, badge_h,
-         DP_COLOR_PILL_LIGHT);
-   downplay_draw_text(font, glyph,
-         (float)(badge_x + badge_w / 2), (float)badge_text_y,
-         L, DP_TEXT_DARK, TEXT_ALIGN_CENTER);
+   label_y  = downplay_baseline_y(y, L->row_h, centre_offset);
+   cursor_x = pill_x + inner_pad_l;
+   for (i = 0; i < hint_count; i++)
+   {
+      int badge_x      = cursor_x;
+      int badge_text_y = downplay_baseline_y(y + badge_inset_y, badge_h,
+            centre_offset);
+      int label_x      = badge_x + badge_w[i] + L->chrome_gap;
 
-   label_x = badge_x + badge_w + L->chrome_gap;
-   label_y = downplay_baseline_y(y, L->row_h, centre_offset);
-   downplay_draw_text(font, label,
-         (float)label_x, (float)label_y,
-         L, DP_TEXT_LIGHT, TEXT_ALIGN_LEFT);
+      downplay_draw_pill(p_disp, userdata, L, cap_tex,
+            badge_x, y + badge_inset_y, badge_w[i], badge_h,
+            DP_COLOR_PILL_LIGHT);
+      downplay_draw_text(font, hints[i].glyph,
+            (float)(badge_x + badge_w[i] / 2), (float)badge_text_y,
+            L, DP_TEXT_BADGE, TEXT_ALIGN_CENTER);
+      downplay_draw_text(font, hints[i].label,
+            (float)label_x, (float)label_y,
+            L, DP_TEXT_LIGHT, TEXT_ALIGN_LEFT);
+
+      cursor_x = label_x + label_w[i] + sep_gap;
+   }
+   return pill_w;
 }
 
 /* Trim `buf` in-place so its rendered width through `font` fits in
@@ -1930,7 +1963,7 @@ static int downplay_status_pill_width(font_data_t *font,
 
 static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset,
-      const downplay_layout_t *L, uintptr_t cap_tex)
+      const downplay_layout_t *L, uintptr_t cap_tex, float *bg_color)
 {
    /* Right-anchored: pill sized to text + padding (with a row-h floor
     * so single-glyph values still look pill-shaped), positioned so its
@@ -1940,7 +1973,7 @@ static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
    int text_y = downplay_baseline_y(L->margin_y, L->row_h, centre_offset);
 
    downplay_draw_pill(p_disp, userdata, L, cap_tex,
-         x, L->margin_y, pill_w, L->row_h, DP_COLOR_PILL_DARK);
+         x, L->margin_y, pill_w, L->row_h, bg_color);
    downplay_draw_text(font, DOWNPLAY_STATUS_TEXT,
          (float)(x + pill_w / 2), (float)text_y,
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
@@ -2922,8 +2955,10 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       const downplay_handle_t *dp)
 {
    size_t   i;
-   /* Push the list below the status pill row so they don't collide. */
-   int      list_top   = L->margin_y + L->row_h + (int)(16.0f * L->scale);
+   /* List shares its top row with the status pill — the pill is
+    * right-anchored and short, the rows are left-anchored, so they
+    * sit beside each other. */
+   int      list_top   = L->margin_y;
    int      list_x     = L->margin_x;
    int      row_max_w  = (int)L->vid_w - (2 * L->margin_x);
    int      list_bot   = (int)L->vid_h - L->margin_y - L->row_h;
@@ -2940,6 +2975,15 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    size_t   scroll     = 0;
    size_t   row_idx;
    int      row_y;
+   int      row_w;
+   /* Top row shares its line with the status pill — shorten its max
+    * width by the pill width plus a margin's gap so a long title
+    * truncates instead of overlapping. */
+   int      top_row_max_w = row_max_w
+         - downplay_status_pill_width(dp->chrome_font, L)
+         - L->margin_x;
+   if (top_row_max_w < 0)
+      top_row_max_w = 0;
 
    if (dp->total_rows > visible && dp->selection >= visible)
    {
@@ -2952,9 +2996,10 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    {
       row_idx = scroll + i;
       row_y   = list_top + (int)(i * (size_t)L->row_h);
+      row_w   = (i == 0) ? top_row_max_w : row_max_w;
       downplay_draw_list_row(p_disp, userdata, dp->font,
             dp->font_centre_offset, L, cap_tex,
-            list_x, row_y, row_max_w,
+            list_x, row_y, row_w,
             downplay_row_label(dp, row_idx),
             row_idx == dp->selection);
    }
@@ -3129,6 +3174,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    settings_t        *settings;
    float              user_scale;
    int                          bottom_y;
+   float                       *chrome_bg;
    enum downplay_render_mode    mode;
 
    if (!dp)
@@ -3203,9 +3249,15 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          0, 0, (int)dp->layout.vid_w, (int)dp->layout.vid_h,
          dp->view == DOWNPLAY_VIEW_INGAME ? DP_COLOR_BG_INGAME : DP_COLOR_BG);
 
+   /* Chrome bg: gray in launcher (would vanish against pure-black
+    * DP_COLOR_BG), dark in INGAME (sits on dimmed game). */
+   chrome_bg = (dp->view == DOWNPLAY_VIEW_INGAME)
+             ? DP_COLOR_PILL_DARK : DP_COLOR_PILL_CHROME_GRAY;
+
    /* Top-right status pill */
    downplay_draw_status_pill(p_disp, userdata, dp->chrome_font,
-         dp->chrome_font_centre_offset, &dp->layout, dp->pill_cap_tex);
+         dp->chrome_font_centre_offset, &dp->layout, dp->pill_cap_tex,
+         chrome_bg);
 
    if (dp->view == DOWNPLAY_VIEW_INGAME)
    {
@@ -3253,22 +3305,42 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    if (dp->view == DOWNPLAY_VIEW_SETTINGS)
       return;
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.row_h;
-   downplay_draw_footer_hint(p_disp, userdata, dp->chrome_font,
-         dp->chrome_font_centre_offset, &dp->layout,
-         dp->pill_cap_tex, dp->layout.margin_x, bottom_y,
-         DOWNPLAY_ANCHOR_LEFT, "POWER", "SLEEP");
+   {
+      downplay_hint_t left[1];
+      left[0].glyph = "POWER";
+      left[0].label = "SLEEP";
+      downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
+            dp->chrome_font_centre_offset, &dp->layout,
+            dp->pill_cap_tex, dp->layout.margin_x, bottom_y,
+            DOWNPLAY_ANCHOR_LEFT, left, 1, chrome_bg);
+   }
 
    /* Right-aligned hint depends on mode.  Hidden in BLANK since there's
-    * no action to advertise yet. */
+    * no action to advertise yet.  When the current view supports going
+    * back, a B BACK pair shares the outer pill with the primary hint. */
    if (mode != DOWNPLAY_RENDER_BLANK)
    {
-      const char *glyph = (mode == DOWNPLAY_RENDER_SPLASH) ? "B" : "A";
-      const char *label = (mode == DOWNPLAY_RENDER_SPLASH) ? "CANCEL" : "OPEN";
-      int x = (int)dp->layout.vid_w - dp->layout.margin_x;
-      downplay_draw_footer_hint(p_disp, userdata, dp->chrome_font,
+      downplay_hint_t right[2];
+      size_t          n          = 0;
+      bool            show_back  = (mode != DOWNPLAY_RENDER_SPLASH
+                                   && dp->view != DOWNPLAY_VIEW_TOP);
+      int             x          = (int)dp->layout.vid_w - dp->layout.margin_x;
+
+      /* B BACK first so it sits left of A OPEN inside the pill. */
+      if (show_back)
+      {
+         right[n].glyph = "B";
+         right[n].label = "BACK";
+         n++;
+      }
+      right[n].glyph = (mode == DOWNPLAY_RENDER_SPLASH) ? "B" : "A";
+      right[n].label = (mode == DOWNPLAY_RENDER_SPLASH) ? "CANCEL" : "OPEN";
+      n++;
+
+      downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
             dp->chrome_font_centre_offset, &dp->layout,
             dp->pill_cap_tex, x, bottom_y,
-            DOWNPLAY_ANCHOR_RIGHT, glyph, label);
+            DOWNPLAY_ANCHOR_RIGHT, right, n, chrome_bg);
    }
 }
 
