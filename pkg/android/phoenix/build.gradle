@@ -98,7 +98,7 @@ android {
   sourceSets {
     main {
       manifest.srcFile 'AndroidManifest.xml'
-      assets.srcDirs = ['assets', '../../../downplay/assets'] /* DOWNPLAY: bundle Downplay-owned assets (font, etc.) into the APK */
+      assets.srcDirs = ['assets']
       java.srcDirs = ['src', '../phoenix-common/src', '../../../libretro-common/vfs/saf/src']
       jniLibs.srcDir '../phoenix-common/libs'
       jni.srcDirs = []
@@ -189,5 +189,25 @@ String getManifestAttribute(String attribute) {
 tasks.register("outputVersionCode") {
   doLast {
     println getPlayStoreVersionCode()
+  }
+}
+
+/* DOWNPLAY: Copy our bundled assets (font, etc.) into the merged
+ * assets at assets/downplay/, so the APK ends up with
+ * assets/assets/downplay/InterTight-Bold.ttf.  RA's first-launch
+ * bundle extractor (UserPreferences.java + task_decompress) strips
+ * the leading "assets/" subdir, landing the file at
+ * <app_dir>/assets/downplay/InterTight-Bold.ttf — which is where
+ * downplay_resolve_font_path looks for it.  Source-of-truth lives
+ * at downplay/assets/downplay/InterTight-Bold.ttf (same path the
+ * macOS rebuild-assets.sh consumes). */
+android.applicationVariants.all { variant ->
+  variant.mergeAssetsProvider.configure { mergeTask ->
+    mergeTask.doLast {
+      copy {
+        from "${rootDir}/../../../downplay/assets/downplay"
+        into "${mergeTask.outputDir.get().asFile}/assets/downplay"
+      }
+    }
   }
 }
