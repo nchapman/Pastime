@@ -207,6 +207,15 @@ struct downplay_settings_list
    unsigned                 width_pct;   /* % of vid_w */
    size_t                   sel;
    size_t                   scroll;      /* topmost visible row index */
+   /* Where to put dp->view + dp->selection back when the settings
+    * stack empties.  Captured on the depth-0 push (the frame that
+    * actually transitions us into DOWNPLAY_VIEW_SETTINGS); ignored
+    * on deeper frames since pop just unstacks within SETTINGS.  Owned
+    * by the frame so settings_push/pop don't need to reuse the
+    * shared dp->prior_view slot — keeping that field clean of
+    * settings-stack pollution. */
+   enum downplay_view       pre_view;
+   size_t                   pre_selection;
 };
 
 /* Cap of 4 is plenty for the current flow (INGAME → Options →
@@ -361,6 +370,12 @@ typedef struct
     * exists alongside manual slots. */
    downplay_save_entry_t save_picker[DOWNPLAY_MAX_SAVE_ENTRIES];
    size_t              save_picker_count;
+   /* Where the picker should restore view + selection to on
+    * Cancel / load.  Owned by the picker so it doesn't have to
+    * borrow dp->prior_view (which is sync_ingame's slot — sharing
+    * caused the in-game-menu-freeze-after-Quit bug). */
+   enum downplay_view  save_picker_pre_view;
+   size_t              save_picker_pre_selection;
 
    /* Cached "Resume <Game>" availability for the launcher's TOP view.
     * Refreshed on rebuild_lists; if true, a Resume row is prepended
@@ -2146,26 +2161,39 @@ static void downplay_settings_push(downplay_handle_t *dp,
       return;
    }
    /* First push from a non-SETTINGS view captures where we came from
-    * so Cancel-from-root returns there. */
+    * so Cancel-from-root returns there.  Stored on the frame, not
+    * on dp->prior_view: that field is owned by sync_ingame's
+    * running↔INGAME transition and gets corrupted if other code
+    * paths overwrite it (the "in-game menu freezes over launcher
+    * after Quit" bug came from exactly that pollution). */
    if (dp->settings_depth == 0)
    {
-      dp->prior_view      = dp->view;
-      dp->prior_selection = dp->selection;
-      dp->view            = DOWNPLAY_VIEW_SETTINGS;
-      dp->selection       = 0;
+      L->pre_view      = dp->view;
+      L->pre_selection = dp->selection;
+      dp->view         = DOWNPLAY_VIEW_SETTINGS;
+      dp->selection    = 0;
    }
    dp->settings_stack[dp->settings_depth++] = L;
    downplay_recompute_total_rows(dp);
 }
 
-/* Pop the top list.  When the stack empties, restore the prior view. */
+/* Pop the top list.  When the stack empties, restore the view we
+ * captured on the depth-0 push. */
 static void downplay_settings_pop(downplay_handle_t *dp)
 {
    downplay_settings_list_t *L;
+   enum downplay_view        restore_view;
+   size_t                    restore_selection;
    if (dp->settings_depth == 0)
       return;
    dp->settings_depth--;
    L = dp->settings_stack[dp->settings_depth];
+   /* Capture the depth-0 frame's restore target before we free L,
+    * since the values live on the frame.  Higher frames don't have
+    * a meaningful pre_view; the dp->settings_depth check below
+    * gates the actual restore. */
+   restore_view      = L ? L->pre_view      : DOWNPLAY_VIEW_TOP;
+   restore_selection = L ? L->pre_selection : 0;
    /* Fire the optional flush callback before disposing the list.  The
     * callback may still inspect L->rows[] (it is not yet freed). */
    if (L && L->on_close)
@@ -2174,8 +2202,8 @@ static void downplay_settings_pop(downplay_handle_t *dp)
    dp->settings_stack[dp->settings_depth] = NULL;
    if (dp->settings_depth == 0)
    {
-      dp->view      = dp->prior_view;
-      dp->selection = dp->prior_selection;
+      dp->view      = restore_view;
+      dp->selection = restore_selection;
       downplay_refresh_ingame_actions(dp);
       downplay_recompute_total_rows(dp);
    }
@@ -4225,21 +4253,25 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
    }
    else if (!running
          && ((dp->view == DOWNPLAY_VIEW_SETTINGS
-                  && dp->prior_view == DOWNPLAY_VIEW_INGAME)
+                  && dp->settings_depth > 0
+                  && dp->settings_stack[0]->pre_view
+                     == DOWNPLAY_VIEW_INGAME)
              || (dp->view == DOWNPLAY_VIEW_CONFIRM
                   && (dp->confirm.prior_view == DOWNPLAY_VIEW_INGAME
                      || (dp->confirm.prior_view == DOWNPLAY_VIEW_SETTINGS
-                        && dp->prior_view == DOWNPLAY_VIEW_INGAME)))))
+                        && dp->settings_depth > 0
+                        && dp->settings_stack[0]->pre_view
+                           == DOWNPLAY_VIEW_INGAME)))))
    {
       /* Edge case: core died while in in-game Options (or a confirm
        * modal opened from there).  Tear down the settings stack and
-       * snap to TOP.  Two slots track "where we came from": SETTINGS
-       * uses dp->prior_view (set on settings_push), CONFIRM uses
-       * dp->confirm.prior_view (set on open_confirm).  The compound
-       * predicate gates teardown to in-game-rooted views only — a
-       * launcher-rooted SETTINGS or CONFIRM (no game involved)
-       * legitimately persists across "no core loaded" frames and
-       * must not be ripped down. */
+       * snap to TOP.  "Rooted in INGAME" is determined by the depth-0
+       * settings frame's pre_view (for SETTINGS) and by
+       * confirm.prior_view (for CONFIRM); CONFIRM-over-SETTINGS
+       * requires both checks.  Launcher-rooted SETTINGS / CONFIRM
+       * views (e.g. the global Settings menu opened from the TOP
+       * launcher row) legitimately persist across "no core loaded"
+       * frames and must not be ripped down. */
       downplay_settings_pop_all(dp);
       dp->confirm.on_confirm = NULL;
       dp->view      = DOWNPLAY_VIEW_TOP;
@@ -4869,10 +4901,10 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                   downplay_save_picker_free(dp);
                   downplay_savestate_enumerate(dp->save_picker,
                         &dp->save_picker_count, true);
-                  dp->prior_view      = dp->view;
-                  dp->prior_selection = dp->selection;
-                  dp->view            = DOWNPLAY_VIEW_SAVE_PICKER;
-                  dp->selection       = 0;
+                  dp->save_picker_pre_view      = dp->view;
+                  dp->save_picker_pre_selection = dp->selection;
+                  dp->view                      = DOWNPLAY_VIEW_SAVE_PICKER;
+                  dp->selection                 = 0;
                   downplay_recompute_total_rows(dp);
                   break;
                }
@@ -4897,8 +4929,8 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                 * freed.  CMD_EVENT_LOAD_STATE doesn't unload the
                 * core, so the user resumes play directly. */
                downplay_save_picker_free(dp);
-               dp->view      = dp->prior_view;
-               dp->selection = dp->prior_selection;
+               dp->view      = dp->save_picker_pre_view;
+               dp->selection = dp->save_picker_pre_selection;
                downplay_refresh_ingame_actions(dp);
                downplay_recompute_total_rows(dp);
                command_event(CMD_EVENT_MENU_TOGGLE, NULL);
@@ -4953,8 +4985,8 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          {
             /* Back to INGAME: free thumbnails, restore prior cursor. */
             downplay_save_picker_free(dp);
-            dp->view      = dp->prior_view;
-            dp->selection = dp->prior_selection;
+            dp->view      = dp->save_picker_pre_view;
+            dp->selection = dp->save_picker_pre_selection;
             downplay_refresh_ingame_actions(dp);
             downplay_recompute_total_rows(dp);
             return 0;
