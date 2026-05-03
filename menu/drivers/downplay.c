@@ -2926,19 +2926,37 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    int      list_top   = L->margin_y + L->row_h + (int)(16.0f * L->scale);
    int      list_x     = L->margin_x;
    int      row_max_w  = (int)L->vid_w - (2 * L->margin_x);
+   int      list_bot   = (int)L->vid_h - L->margin_y - L->row_h;
+   int      avail_h    = list_bot - list_top;
+   /* Capacity of the visible window in whole rows.  Clamped to >=1 so a
+    * window too short for one row still shows the selected row rather
+    * than nothing. */
+   size_t   visible    = (avail_h > L->row_h)
+                       ? (size_t)(avail_h / L->row_h) : 1;
+   /* Scroll offset derived from selection — keep the selected row in
+    * view by sliding the window forward once selection passes the last
+    * visible index.  Source of truth is dp->selection; deriving scroll
+    * here means input handlers don't need to track it. */
+   size_t   scroll     = 0;
+   size_t   row_idx;
    int      row_y;
 
-   for (i = 0; i < dp->total_rows; i++)
+   if (dp->total_rows > visible && dp->selection >= visible)
    {
-      row_y = list_top + (int)(i * (size_t)L->row_h);
-      /* Skip rows that fall below the bottom hint strip — saves draws on
-       * long lists and avoids text colliding with the chrome. */
-      if (row_y + L->row_h > (int)L->vid_h - L->margin_y - L->row_h)
-         break;
+      scroll = dp->selection + 1 - visible;
+      if (scroll + visible > dp->total_rows)
+         scroll = dp->total_rows - visible;
+   }
+
+   for (i = 0; i < visible && scroll + i < dp->total_rows; i++)
+   {
+      row_idx = scroll + i;
+      row_y   = list_top + (int)(i * (size_t)L->row_h);
       downplay_draw_list_row(p_disp, userdata, dp->font,
             dp->font_centre_offset, L, cap_tex,
             list_x, row_y, row_max_w,
-            downplay_row_label(dp, i), i == dp->selection);
+            downplay_row_label(dp, row_idx),
+            row_idx == dp->selection);
    }
 
    /* Right-pane preview: SAVE_PICKER shows the selected save's
