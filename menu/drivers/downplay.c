@@ -101,7 +101,8 @@ enum downplay_view
    DOWNPLAY_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
    DOWNPLAY_VIEW_RECENTS,    /* drilled into recents history */
    DOWNPLAY_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
-   DOWNPLAY_VIEW_SAVE_PICKER /* drilled into save-state list (M7) */
+   DOWNPLAY_VIEW_SAVE_PICKER,/* drilled into save-state list (M7) */
+   DOWNPLAY_VIEW_SETTINGS    /* M8 — settings-style list (Options → core opts) */
 };
 
 /* INGAME row composition is conditional: Save hidden when the core
@@ -114,6 +115,7 @@ enum downplay_ingame_action
    DP_INGAME_CONTINUE = 0,
    DP_INGAME_SAVE,
    DP_INGAME_LOAD,
+   DP_INGAME_OPTIONS,
    DP_INGAME_QUIT
 };
 
@@ -144,6 +146,54 @@ typedef struct
     * "Auto".  Built once on enumeration; the picker just draws it. */
    char       label[40];
 } downplay_save_entry_t;
+
+/* Settings-style list (M8).  A second list aesthetic — denser rows,
+ * smaller font, optional value-cycler on the right, optional
+ * description band at the bottom.  Powers the in-game Options menu and
+ * its core-options child.
+ *
+ * One row covers all three "kinds" we need: an options row (title +
+ * cyclable value + on_change), a navigation row (title + on_confirm
+ * that pushes a child list), or an action row (title + on_confirm that
+ * does something).  The visual differs only in whether `values` is
+ * non-NULL (selected option rows get a full-width gray background pill
+ * showing what's being adjusted; nav/action rows just show a title
+ * pill).  Confirm fires `on_confirm` regardless. */
+typedef struct
+{
+   const char         *title;        /* required; not owned */
+   const char         *desc;         /* nullable; not owned */
+   const char *const  *values;       /* nullable; not owned */
+   size_t              values_count;
+   size_t              idx_value;    /* current value index */
+   /* on_change is called *after* idx_value is updated by the input
+    * handler.  delta is +1 or -1.  Allowed to mutate other rows in
+    * the list (e.g. visibility) — the handler refreshes after. */
+   void              (*on_change)(int delta, void *userdata);
+   void              (*on_confirm)(void *userdata);
+   void               *userdata;
+} downplay_settings_row_t;
+
+/* One settings list.  Stack-allocated when small / static (root
+ * Options); heap-allocated when row count is dynamic (core options). */
+typedef struct
+{
+   const char              *title;       /* reserved for future header */
+   downplay_settings_row_t *rows;        /* owned: free()d on list dispose */
+   size_t                   row_count;
+   /* Optional userdata pool that backs row->userdata pointers.  Owned;
+    * free()d alongside rows.  NULL when no row needs per-row allocated
+    * userdata (e.g. root Options list — its on_confirm handlers take
+    * dp itself). */
+   void                    *userdata_pool;
+   unsigned                 width_pct;   /* % of vid_w */
+   size_t                   sel;
+   size_t                   scroll;      /* topmost visible row index */
+} downplay_settings_list_t;
+
+/* Cap of 4 is plenty for the current flow (INGAME → Options →
+ * Emulator → maybe a category submenu later).  Bumps cheap if needed. */
+#define DOWNPLAY_SETTINGS_STACK_MAX 4
 
 typedef struct
 {
@@ -177,6 +227,14 @@ typedef struct
 
    float font_size;         /* main list font px */
    float chrome_font_size;  /* status / button-hint label font px */
+
+   /* Settings-list (M8) sizing.  Smaller rows + font than the launcher
+    * list so a settings menu can show more options at once.  Description
+    * font reuses chrome_font (close enough size) — these are only the
+    * row geometry / row font. */
+   int   settings_row_h;
+   float settings_font_size;
+   int   settings_value_gap;   /* horizontal gap between title pill and value */
 } downplay_layout_t;
 
 typedef struct
@@ -233,11 +291,29 @@ typedef struct
    /* INGAME view row composition.  Built on the running→ingame
     * transition (and refreshed after a Save action), so row_label and
     * OK dispatch read the same array.  ingame_action_count is in
-    * [2,4]: Continue + Quit are unconditional, Save and Load are
-    * conditional on core_info_current_supports_savestate() and
-    * whether manual saves exist on disk. */
-   enum downplay_ingame_action ingame_actions[4];
+    * [3,5]: Continue + Options + Quit are unconditional, Save and
+    * Load are conditional on core_info_current_supports_savestate()
+    * and whether manual saves exist on disk. */
+   enum downplay_ingame_action ingame_actions[5];
    size_t              ingame_action_count;
+
+   /* Settings stack (M8).  Push when a nav row enters a child list;
+    * pop on Cancel.  Empty stack + view==SETTINGS is a transient
+    * inconsistency we never let happen (view flips to INGAME on the
+    * pop that empties the stack). */
+   downplay_settings_list_t *settings_stack[DOWNPLAY_SETTINGS_STACK_MAX];
+   size_t                    settings_depth;
+   /* Dedicated font for settings-list rows (smaller than dp->font).
+    * Description band reuses dp->chrome_font — its size already lives
+    * close to the desc target (~18*scale). */
+   font_data_t              *settings_font;
+   int                       settings_font_centre_offset;
+   /* Set by core-option on_change when the core flipped visibility
+    * via update_display; consumed at the top of the next frame to
+    * rebuild the active core-options list in place.  Rebuild can't
+    * happen inside on_change because the rebuild frees the row
+    * userdata that on_change was just called on. */
+   bool                      settings_rebuild_pending;
 
    /* Save-state picker (DOWNPLAY_VIEW_SAVE_PICKER).  Cached on view
     * enter, freed (textures unloaded) on view exit.  Sorted desc by
@@ -277,6 +353,13 @@ static float DP_COLOR_PILL_DARK[16] = {
    0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f,
    0.0f, 0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 0.0f, 1.0f
 };
+/* Mid-gray background for the selected option row in the settings list
+ * — visible against pure black, subtle enough not to fight with the
+ * white title pill drawn on top. */
+static float DP_COLOR_PILL_BG_GRAY[16] = {
+   0.18f, 0.18f, 0.18f, 1.0f,   0.18f, 0.18f, 0.18f, 1.0f,
+   0.18f, 0.18f, 0.18f, 1.0f,   0.18f, 0.18f, 0.18f, 1.0f
+};
 
 /* Cap texture is generated 1:1 (no scaling) at this size, then sampled
  * by the GPU when drawn into the actual pill cap area.  Larger source
@@ -311,6 +394,7 @@ static const char *downplay_ingame_label(enum downplay_ingame_action a)
       case DP_INGAME_CONTINUE: return "Continue";
       case DP_INGAME_SAVE:     return "Save";
       case DP_INGAME_LOAD:     return "Load";
+      case DP_INGAME_OPTIONS:  return "Options";
       case DP_INGAME_QUIT:     return "Quit";
    }
    return "";
@@ -678,6 +762,16 @@ static void downplay_recompute_total_rows(downplay_handle_t *dp)
       dp->total_rows = dp->rom_count;
    else if (dp->view == DOWNPLAY_VIEW_RECENTS)
       dp->total_rows = dp->recent_row_count;
+   else if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+   {
+      /* Settings view manages its own selection/scroll on the active
+       * stack frame; the main `selection` cursor isn't meaningful
+       * here.  total_rows kept at 0 keeps any stray default-list
+       * input handler a no-op. */
+      dp->total_rows = 0;
+      dp->selection  = 0;
+      return;
+   }
    else
       dp->total_rows = (downplay_has_resume_row(dp)  ? 1 : 0)
                      + (downplay_has_recents_row(dp) ? 1 : 0)
@@ -1044,6 +1138,7 @@ static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
       dp->ingame_actions[n++] = DP_INGAME_SAVE;
    if (supports && manual_count > 0)
       dp->ingame_actions[n++] = DP_INGAME_LOAD;
+   dp->ingame_actions[n++] = DP_INGAME_OPTIONS;
    dp->ingame_actions[n++] = DP_INGAME_QUIT;
    dp->ingame_action_count = n;
 
@@ -1362,6 +1457,14 @@ static void downplay_layout_recompute(downplay_layout_t *L,
 
    L->font_size        = DOWNPLAY_FONT_BASE_SIZE * scale;
    L->chrome_font_size = (DOWNPLAY_FONT_BASE_SIZE * 0.65f) * scale;
+
+   /* Settings-list dimensions.  Row height + font picked so ~10 rows
+    * fit on a 480px-tall reference design with room for top/bottom
+    * margins, the status pill, the description band, and a hint
+    * footer.  Tweak after the first build on a real device. */
+   L->settings_row_h     = (int)(36.0f * scale);
+   L->settings_font_size = 22.0f * scale;
+   L->settings_value_gap = (int)(24.0f * scale);
 }
 
 static bool downplay_layout_changed(const downplay_layout_t *L,
@@ -1375,6 +1478,9 @@ static bool downplay_layout_changed(const downplay_layout_t *L,
            || L->vid_h != video_height
            || L->scale != want_scale;
 }
+
+/* Forward decls for settings-list lifecycle (defined further down). */
+static void downplay_settings_pop_all(downplay_handle_t *dp);
 
 /* ---------- font handling ---------- */
 
@@ -1420,6 +1526,11 @@ static void downplay_release_fonts(downplay_handle_t *dp)
       font_driver_free(dp->chrome_font);
       dp->chrome_font = NULL;
    }
+   if (dp->settings_font)
+   {
+      font_driver_free(dp->settings_font);
+      dp->settings_font = NULL;
+   }
 }
 
 static void downplay_reload_fonts(downplay_handle_t *dp,
@@ -1438,6 +1549,10 @@ static void downplay_reload_fonts(downplay_handle_t *dp,
          ? font_driver_get_line_centre_offset(dp->font, 1.0f) : 0;
    dp->chrome_font_centre_offset = dp->chrome_font
          ? font_driver_get_line_centre_offset(dp->chrome_font, 1.0f) : 0;
+   dp->settings_font = downplay_load_font(p_disp,
+         dp->layout.settings_font_size, is_threaded);
+   dp->settings_font_centre_offset = dp->settings_font
+         ? font_driver_get_line_centre_offset(dp->settings_font, 1.0f) : 0;
 }
 
 /* ---------- pill cap texture ---------- */
@@ -1831,6 +1946,799 @@ static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
 }
 
+/* ---------- settings list (M8) ---------- */
+
+static void downplay_settings_list_free(downplay_settings_list_t *L)
+{
+   if (!L)
+      return;
+   free(L->rows);
+   free(L->userdata_pool);
+   free(L);
+}
+
+/* Heap-allocate an empty list with capacity for `row_count` rows.
+ * `userdata_pool_size` reserves a contiguous backing buffer for
+ * per-row userdata structs (caller carves it up).  Pass 0 if no row
+ * needs allocated userdata. */
+static downplay_settings_list_t *downplay_settings_list_new(
+      const char *title, size_t row_count,
+      size_t userdata_pool_size, unsigned width_pct)
+{
+   downplay_settings_list_t *L;
+   if (!(L = (downplay_settings_list_t*)calloc(1, sizeof(*L))))
+      return NULL;
+   if (row_count > 0)
+   {
+      if (!(L->rows = (downplay_settings_row_t*)calloc(
+                  row_count, sizeof(*L->rows))))
+      {
+         free(L);
+         return NULL;
+      }
+   }
+   if (userdata_pool_size > 0)
+   {
+      if (!(L->userdata_pool = calloc(1, userdata_pool_size)))
+      {
+         free(L->rows);
+         free(L);
+         return NULL;
+      }
+   }
+   L->title     = title;
+   L->row_count = row_count;
+   L->width_pct = width_pct;
+   return L;
+}
+
+/* Push a fully-built list onto the stack and switch to SETTINGS view.
+ * Takes ownership: a pop will free the list.  Drops the push if the
+ * stack is full or the list is NULL (logs and frees the orphan). */
+static void downplay_settings_push(downplay_handle_t *dp,
+      downplay_settings_list_t *L)
+{
+   if (!L)
+      return;
+   if (dp->settings_depth >= DOWNPLAY_SETTINGS_STACK_MAX)
+   {
+      RARCH_WARN("[Downplay] settings stack full; dropping push\n");
+      downplay_settings_list_free(L);
+      return;
+   }
+   /* First push from a non-SETTINGS view captures where we came from
+    * so Cancel-from-root returns there. */
+   if (dp->settings_depth == 0)
+   {
+      dp->prior_view      = dp->view;
+      dp->prior_selection = dp->selection;
+      dp->view            = DOWNPLAY_VIEW_SETTINGS;
+      dp->selection       = 0;
+   }
+   dp->settings_stack[dp->settings_depth++] = L;
+   downplay_recompute_total_rows(dp);
+}
+
+/* Pop the top list.  When the stack empties, restore the prior view. */
+static void downplay_settings_pop(downplay_handle_t *dp)
+{
+   if (dp->settings_depth == 0)
+      return;
+   dp->settings_depth--;
+   downplay_settings_list_free(dp->settings_stack[dp->settings_depth]);
+   dp->settings_stack[dp->settings_depth] = NULL;
+   if (dp->settings_depth == 0)
+   {
+      dp->view      = dp->prior_view;
+      dp->selection = dp->prior_selection;
+      downplay_refresh_ingame_actions(dp);
+      downplay_recompute_total_rows(dp);
+   }
+}
+
+static void downplay_settings_pop_all(downplay_handle_t *dp)
+{
+   while (dp->settings_depth > 0)
+      downplay_settings_pop(dp);
+}
+
+/* Free all stack entries without the view-restore side effects of
+ * pop_all.  Used at teardown when there's nowhere to restore to. */
+static void downplay_settings_clear(downplay_handle_t *dp)
+{
+   size_t i;
+   for (i = 0; i < dp->settings_depth; i++)
+   {
+      downplay_settings_list_free(dp->settings_stack[i]);
+      dp->settings_stack[i] = NULL;
+   }
+   dp->settings_depth = 0;
+}
+
+/* Top of the stack; NULL if the stack is empty. */
+static downplay_settings_list_t *downplay_settings_top(
+      const downplay_handle_t *dp)
+{
+   if (dp->settings_depth == 0)
+      return NULL;
+   return dp->settings_stack[dp->settings_depth - 1];
+}
+
+/* Fixed vertical clearance around the row block to host the up /
+ * down scroll chevrons.  Reserved unconditionally (not only when a
+ * chevron is visible) so visible_rows stays stable as scroll
+ * advances — otherwise paging would shift the row block as the
+ * top/bottom chevrons appeared and disappeared. */
+#define DOWNPLAY_SETTINGS_CHEVRON_ZONE_PX(L) ((int)(20.0f * (L)->scale))
+
+/* How many rows fit in the visible area for the active list.
+ * Geometry mirrors downplay_draw_settings_view: top = below the
+ * status row (with the same gap the launcher list uses); bottom =
+ * just above the description band, which sits at the very bottom
+ * margin (the SETTINGS view hides the footer hint pills so the row
+ * block can extend that far).  Chevron zones are reserved at both
+ * ends. */
+static size_t downplay_settings_visible_rows(const downplay_handle_t *dp,
+      const downplay_settings_list_t *L)
+{
+   const downplay_layout_t *Ly = &dp->layout;
+   int chev_z   = DOWNPLAY_SETTINGS_CHEVRON_ZONE_PX(Ly);
+   int top_y    = Ly->margin_y + Ly->row_h + (int)(16.0f * Ly->scale)
+                + chev_z;
+   int desc_h   = (int)(Ly->chrome_font_size * 2.4f);
+   int bottom_y = (int)Ly->vid_h - Ly->margin_y - desc_h - chev_z;
+   int avail    = bottom_y - top_y;
+   int n;
+   if (avail <= 0 || Ly->settings_row_h <= 0)
+      return 1;
+   n = avail / Ly->settings_row_h;
+   if (n < 1)
+      n = 1;
+   if ((size_t)n > L->row_count)
+      n = (int)L->row_count;
+   return (size_t)n;
+}
+
+/* Keep `scroll` such that `sel` is in the visible window.  Symmetric
+ * snap on both ends so a single Down past the edge advances scroll
+ * by 1 (no jumpy auto-centring). */
+static void downplay_settings_snap_scroll(const downplay_handle_t *dp,
+      downplay_settings_list_t *L)
+{
+   size_t visible = downplay_settings_visible_rows(dp, L);
+   if (L->row_count == 0)
+   {
+      L->scroll = 0;
+      return;
+   }
+   if (L->sel < L->scroll)
+      L->scroll = L->sel;
+   else if (L->sel >= L->scroll + visible)
+      L->scroll = L->sel + 1 - visible;
+   if (L->scroll + visible > L->row_count)
+      L->scroll = (L->row_count > visible) ? L->row_count - visible : 0;
+}
+
+/* Draw a downward-pointing chevron centered on (cx, cy_top).  Built
+ * from filled rects so we don't depend on the bundled font carrying
+ * U+25BC.  `dir` is +1 down, -1 up. */
+static void downplay_draw_chevron(gfx_display_t *p_disp, void *userdata,
+      const downplay_layout_t *L, int cx, int cy_top, int dir)
+{
+   /* Drawn as a triangle approximated by stacked horizontal bars.
+    * `bars` is the height in source rows; width tapers to zero.
+    * Tested values keep the chevron crisp at both 1× and 2× scale. */
+   int   bars   = (int)(8.0f * L->scale);
+   int   half_w = (int)(8.0f * L->scale);
+   int   i;
+   float color[16];
+   /* Mid-gray, matches DP_TEXT_MUTED tone; gfx_display_draw_quad takes
+    * a per-vertex RGBA float array. */
+   for (i = 0; i < 16; i += 4)
+   {
+      color[i]     = 0.5f;
+      color[i + 1] = 0.5f;
+      color[i + 2] = 0.5f;
+      color[i + 3] = 1.0f;
+   }
+   if (bars < 2)
+      bars = 2;
+   for (i = 0; i < bars; i++)
+   {
+      int row     = (dir > 0) ? i : (bars - 1 - i);
+      int w       = (half_w * (bars - row)) / bars * 2;
+      int x       = cx - w / 2;
+      int y       = cy_top + i;
+      if (w < 1)
+         continue;
+      downplay_draw_rect(p_disp, userdata, L, x, y, w, 1, color);
+   }
+}
+
+/* Render the active settings list.  Geometry: width = width_pct%,
+ * centered horizontally; vertically centered in the available area
+ * (between top/bottom margins, footer hint, and description band).
+ * Description band is fixed at the bottom — height = ~2 lines of
+ * chrome font, separated from the row block by one row's worth of
+ * gap. */
+static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
+      const downplay_handle_t *dp)
+{
+   const downplay_layout_t        *L = &dp->layout;
+   const downplay_settings_list_t *S = downplay_settings_top(dp);
+   const downplay_settings_row_t  *sel_row;
+   font_data_t                    *row_font;
+   int                             row_centre;
+   int                             desc_centre;
+   unsigned                        width_pct;
+   int                             block_w;
+   int                             block_x;
+   int                             desc_band_h;
+   int                             avail_top;
+   int                             avail_bottom;
+   int                             avail_h;
+   size_t                          visible;
+   int                             block_h;
+   int                             block_top;
+   size_t                          i;
+
+   if (!S || S->row_count == 0)
+      return;
+   row_font    = dp->settings_font ? dp->settings_font : dp->font;
+   row_centre  = dp->settings_font ? dp->settings_font_centre_offset
+                                   : dp->font_centre_offset;
+   desc_centre = dp->chrome_font_centre_offset;
+
+   /* width_pct is a fraction of the *content area* (vid_w minus the
+    * outer left/right margins), not of the raw screen width.  At
+    * 100% the block fills from margin_x to vid_w-margin_x — i.e.
+    * full width with the same margins the launcher uses.  Smaller
+    * values let narrower lists like Options stay visually centred. */
+   {
+      int avail_w;
+      width_pct  = S->width_pct ? S->width_pct : 60;
+      if (width_pct > 100)
+         width_pct = 100;
+      avail_w   = (int)L->vid_w - 2 * L->margin_x;
+      if (avail_w < 0)
+         avail_w = 0;
+      block_w   = avail_w * (int)width_pct / 100;
+      block_x   = ((int)L->vid_w - block_w) / 2;
+   }
+
+   desc_band_h  = (int)(L->chrome_font_size * 2.4f);
+   /* Top edge sits just below the status pill row, with the same
+    * 16*scale gap the launcher list uses — keeps the two views
+    * visually consistent.  Bottom extends to vid_h - margin_y minus
+    * the description band; SETTINGS view hides the footer hint pills
+    * so that bottom margin is purely outer padding.  Chevron zones
+    * are reserved at both ends so the up/down chevrons never collide
+    * with the status row or description band. */
+   {
+      int chev_z = DOWNPLAY_SETTINGS_CHEVRON_ZONE_PX(L);
+      avail_top    = L->margin_y + L->row_h + (int)(16.0f * L->scale)
+                   + chev_z;
+      avail_bottom = (int)L->vid_h - L->margin_y - desc_band_h - chev_z;
+      avail_h      = avail_bottom - avail_top;
+   }
+   if (avail_h < L->settings_row_h)
+      return;
+
+   visible      = downplay_settings_visible_rows(dp, S);
+   block_h      = (int)visible * L->settings_row_h;
+   /* Top-align the row block.  Earlier centering looked good for
+    * short lists but pushed long ones (with a chevron) into the
+    * middle of the screen with a confusing gap above.  Empty space
+    * — when the list is short — falls between the bottom of the
+    * rows and the description band, where the eye doesn't notice
+    * it. */
+   block_top    = avail_top;
+   (void)avail_h;
+
+   /* Selected row data once, used for both background pill and desc
+    * band below. */
+   sel_row = (S->sel < S->row_count) ? &S->rows[S->sel] : NULL;
+
+   for (i = 0; i < visible; i++)
+   {
+      size_t                         row_idx = S->scroll + i;
+      const downplay_settings_row_t *r;
+      int                            row_y   = block_top + (int)i * L->settings_row_h;
+      bool                           selected;
+      int                            text_y;
+      char                           title_buf[NAME_MAX_LENGTH];
+      char                           value_buf[NAME_MAX_LENGTH];
+      bool                           has_value;
+      int                            avail;
+      int                            title_natural;
+      int                            value_natural;
+      int                            title_budget;
+      int                            value_budget;
+      int                            text_w;
+      int                            value_w   = 0;
+      uint32_t                       title_color;
+
+      if (row_idx >= S->row_count)
+         break;
+      r         = &S->rows[row_idx];
+      selected  = (row_idx == S->sel);
+      has_value = (r->values && r->values_count > 0
+                && r->idx_value < r->values_count
+                && r->values[r->idx_value] != NULL);
+
+      /* Selected option-row: full-width gray background pill so it's
+       * visually obvious which row left/right will adjust.  Nav /
+       * action rows skip this — same row layout, but no value to
+       * adjust means no full-width chrome. */
+      if (selected && has_value)
+         downplay_draw_pill(p_disp, userdata, L, dp->pill_cap_tex,
+               block_x, row_y, block_w, L->settings_row_h,
+               DP_COLOR_PILL_BG_GRAY);
+
+      /* Buffers + budgets.  The text-area budget is the row width
+       * minus left + right indents.  When a value is present, we
+       * also subtract one settings_value_gap so the two columns
+       * don't touch.  Each side has its own buffer because both may
+       * need ellipsis-truncation. */
+      strlcpy(title_buf, r->title ? r->title : "", sizeof(title_buf));
+      value_buf[0] = '\0';
+      if (has_value)
+         strlcpy(value_buf, r->values[r->idx_value], sizeof(value_buf));
+
+      avail = block_w - 2 * L->row_text_indent;
+      if (has_value)
+         avail -= L->settings_value_gap;
+      if (avail < L->settings_row_h)
+         avail = L->settings_row_h;
+
+      title_natural = font_driver_get_message_width(row_font, title_buf,
+            (unsigned)strlen(title_buf), 1.0f);
+      if (title_natural < 0)
+         title_natural = 0;
+
+      if (has_value)
+      {
+         value_natural = font_driver_get_message_width(row_font, value_buf,
+               (unsigned)strlen(value_buf), 1.0f);
+         if (value_natural < 0)
+            value_natural = 0;
+      }
+      else
+         value_natural = 0;
+
+      /* Fair-share allocator: both natural widths fit → render
+       * verbatim.  Otherwise each side gets at least half of avail;
+       * if one side is shorter than half, the other claims the
+       * leftover.  Keeps the value column from steamrolling a long
+       * title (and vice versa). */
+      if (!has_value)
+      {
+         title_budget = avail;
+         value_budget = 0;
+      }
+      else if (title_natural + value_natural <= avail)
+      {
+         title_budget = title_natural;
+         value_budget = value_natural;
+      }
+      else
+      {
+         int half = avail / 2;
+         if (title_natural <= half)
+         {
+            title_budget = title_natural;
+            value_budget = avail - title_natural;
+         }
+         else if (value_natural <= half)
+         {
+            value_budget = value_natural;
+            title_budget = avail - value_natural;
+         }
+         else
+         {
+            title_budget = half;
+            value_budget = avail - half;
+         }
+      }
+
+      /* Truncate each to its budget, then measure the actual width
+       * for placement.  truncate_to_width is a no-op when the text
+       * already fits. */
+      downplay_truncate_to_width(row_font, title_buf,
+            sizeof(title_buf), title_budget);
+      if (has_value)
+         downplay_truncate_to_width(row_font, value_buf,
+               sizeof(value_buf), value_budget);
+
+      text_y = downplay_baseline_y(row_y, L->settings_row_h, row_centre);
+
+      /* Right-aligned value text first — measured here too so we
+       * know value_w for any callers below (currently unused, but
+       * cheap to keep for future row chrome). */
+      if (has_value)
+      {
+         int value_x = block_x + block_w - L->row_text_indent;
+         value_w = font_driver_get_message_width(row_font, value_buf,
+               (unsigned)strlen(value_buf), 1.0f);
+         if (value_w < 0)
+            value_w = 0;
+         downplay_draw_text(row_font, value_buf,
+               (float)value_x, (float)text_y,
+               L, DP_TEXT_LIGHT, TEXT_ALIGN_RIGHT);
+      }
+      (void)value_w;
+
+      /* Title — selected gets a white pill behind it, sized to the
+       * truncated text (with row_text_indent padding on each side).
+       * Pill's left cap aligns with the gray background's left cap
+       * so the two read as concentric. */
+      title_color = selected ? DP_TEXT_DARK : DP_TEXT_LIGHT;
+      text_w = font_driver_get_message_width(row_font, title_buf,
+            (unsigned)strlen(title_buf), 1.0f);
+      if (text_w < 0)
+         text_w = 0;
+      if (selected)
+      {
+         int pill_w  = text_w + 2 * L->row_text_indent;
+         if (pill_w < L->settings_row_h)
+            pill_w = L->settings_row_h;
+         downplay_draw_pill(p_disp, userdata, L, dp->pill_cap_tex,
+               block_x, row_y, pill_w, L->settings_row_h,
+               DP_COLOR_PILL_LIGHT);
+      }
+      downplay_draw_text(row_font, title_buf,
+            (float)(block_x + L->row_text_indent), (float)text_y,
+            L, title_color, TEXT_ALIGN_LEFT);
+   }
+
+   /* Scroll chevrons — only when there's content above / below the
+    * visible window.  Drawn just outside the row block in muted gray. */
+   if (S->scroll > 0)
+      downplay_draw_chevron(p_disp, userdata, L,
+            block_x + block_w / 2,
+            block_top - (int)(12.0f * L->scale), -1);
+   if (S->scroll + visible < S->row_count)
+      downplay_draw_chevron(p_disp, userdata, L,
+            block_x + block_w / 2,
+            block_top + block_h + (int)(4.0f * L->scale), +1);
+
+   /* Description band: fixed at the bottom, above the footer hint
+    * row.  Two-line max — we naive-wrap on the first whitespace past
+    * the midpoint that fits, ellipsing line two if it overflows. */
+   if (sel_row && sel_row->desc && *sel_row->desc)
+   {
+      char        line1[256];
+      char        line2[256];
+      int         line_w     = (int)L->vid_w - 2 * L->margin_x;
+      int         desc_y_top = (int)L->vid_h - L->margin_y - desc_band_h;
+      int         line1_y;
+      int         line2_y;
+      const char *src        = sel_row->desc;
+      size_t      src_len    = strlen(src);
+      int         full_w     = font_driver_get_message_width(dp->chrome_font,
+            src, (unsigned)src_len, 1.0f);
+
+      line1[0] = line2[0] = '\0';
+      if (full_w >= 0 && full_w <= line_w)
+         strlcpy(line1, src, sizeof(line1));
+      else
+      {
+         /* Find the longest prefix ending on a space that fits.
+          * Linear scan is fine — descriptions are at most a couple
+          * hundred chars and this runs once per frame. */
+         size_t cut = 0;
+         size_t i2;
+         for (i2 = 1; i2 <= src_len; i2++)
+         {
+            int w;
+            char ch = src[i2];
+            if (ch != '\0' && ch != ' ')
+               continue;
+            {
+               char tmp[256];
+               size_t take = i2;
+               if (take >= sizeof(tmp))
+                  break;
+               memcpy(tmp, src, take);
+               tmp[take] = '\0';
+               w = font_driver_get_message_width(dp->chrome_font,
+                     tmp, (unsigned)take, 1.0f);
+            }
+            if (w >= 0 && w <= line_w)
+               cut = i2;
+            else
+               break;
+         }
+         if (cut == 0)
+         {
+            /* No fit-on-space — fall back to char-truncated single
+             * line + ellipsis. */
+            strlcpy(line1, src, sizeof(line1));
+            downplay_truncate_to_width(dp->chrome_font, line1,
+                  sizeof(line1), line_w);
+         }
+         else
+         {
+            size_t take = cut < sizeof(line1) ? cut : sizeof(line1) - 1;
+            memcpy(line1, src, take);
+            line1[take] = '\0';
+            /* Skip the trailing space we cut on, then second line. */
+            while (src[cut] == ' ')
+               cut++;
+            strlcpy(line2, src + cut, sizeof(line2));
+            downplay_truncate_to_width(dp->chrome_font, line2,
+                  sizeof(line2), line_w);
+         }
+      }
+
+      line1_y = downplay_baseline_y(desc_y_top,
+            (int)L->chrome_font_size + (int)(4.0f * L->scale), desc_centre);
+      downplay_draw_text(dp->chrome_font, line1,
+            (float)L->vid_w / 2.0f, (float)line1_y,
+            L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+      if (*line2)
+      {
+         line2_y = line1_y + (int)(L->chrome_font_size * 1.2f);
+         downplay_draw_text(dp->chrome_font, line2,
+               (float)L->vid_w / 2.0f, (float)line2_y,
+               L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+      }
+   }
+}
+
+/* ---------- settings: builders ---------- */
+
+#include "../../core_option_manager.h"
+
+/* Per-row userdata for a core-option row.  The handle and option
+ * index together let on_change call core_option_manager_adjust_val
+ * without re-fetching the manager every time.  `dp` is along for
+ * the ride so on_change can flip the rebuild-pending flag when
+ * the core's update_display callback flipped option visibility. */
+typedef struct
+{
+   core_option_manager_t *opt;
+   size_t                 idx;
+   downplay_handle_t     *dp;
+} downplay_core_opt_row_ud_t;
+
+/* Per-list userdata payload holding both the core-options manager
+ * pointer (shared by all rows) and the synthesized values arrays
+ * (one const char** per row).  Allocated as one trailing block so
+ * downplay_settings_list_free's `free(userdata_pool)` reclaims
+ * everything in a single call.
+ *
+ * Layout in `userdata_pool`:
+ *   [N × downplay_core_opt_row_ud_t][N × const char* arrays...]
+ * Where N = number of visible options.  rows[i].userdata points at
+ * &per_row[i]; rows[i].values points into the values block. */
+
+static void downplay_core_opt_on_change(int delta, void *userdata)
+{
+   downplay_core_opt_row_ud_t *ud = (downplay_core_opt_row_ud_t*)userdata;
+   if (!ud || !ud->opt)
+      return;
+   /* Direct call rather than RARCH_CTL_CORE_OPTION_NEXT/PREV:
+    * adjust_val takes the index we already have, vs the ctl
+    * variants which look up by the global state_slot-style cursor
+    * we don't use.  refresh_menu=true so any visibility-change
+    * callback in the core fires. */
+   core_option_manager_adjust_val(ud->opt, ud->idx, delta, true);
+   /* If that callback toggled visibility on other options, rebuild
+    * the list at the next safe point.  Doing it here would free the
+    * row userdata we're standing on.  The handler clears `updated`
+    * after consuming it; otherwise every adjust would trigger a
+    * rebuild when the core hasn't actually moved any visibility. */
+   if (ud->opt->updated && ud->dp)
+      ud->dp->settings_rebuild_pending = true;
+}
+
+static downplay_settings_list_t *downplay_build_core_options_list(
+      downplay_handle_t *dp);
+
+/* Push the core-options list — invoked by the Emulator nav row's
+ * on_confirm. */
+static void downplay_action_open_core_options(void *userdata)
+{
+   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
+   downplay_settings_list_t *L  = downplay_build_core_options_list(dp);
+   if (L)
+      downplay_settings_push(dp, L);
+}
+
+/* Stub list — placeholder used by Frontend / Controls / Shortcuts
+ * until they have real implementations.  One nav row that just
+ * cancels back. */
+static downplay_settings_list_t *downplay_build_stub_list(const char *title)
+{
+   downplay_settings_list_t *L = downplay_settings_list_new(title, 1, 0, 50);
+   if (!L)
+      return NULL;
+   L->rows[0].title      = "Coming soon";
+   L->rows[0].desc       = "Not yet implemented in this build.";
+   return L;
+}
+
+static void downplay_action_open_frontend(void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   downplay_settings_push(dp, downplay_build_stub_list("Frontend"));
+}
+
+static void downplay_action_open_controls(void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   downplay_settings_push(dp, downplay_build_stub_list("Controls"));
+}
+
+static void downplay_action_open_shortcuts(void *userdata)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   downplay_settings_push(dp, downplay_build_stub_list("Shortcuts"));
+}
+
+/* Save Changes: flush the core-options manager to its config file
+ * and pop the entire settings stack so the user lands back in the
+ * in-game menu. */
+static void downplay_action_save_changes(void *userdata)
+{
+   downplay_handle_t     *dp   = (downplay_handle_t*)userdata;
+   core_option_manager_t *opts = NULL;
+   retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
+   if (opts && opts->conf)
+      core_option_manager_flush(opts, opts->conf);
+   downplay_settings_pop_all(dp);
+}
+
+/* Build the root Options list.  Static row labels live in .rodata,
+ * so no per-row userdata pool needed (each on_confirm takes `dp`
+ * directly). */
+static downplay_settings_list_t *downplay_build_root_options_list(
+      downplay_handle_t *dp)
+{
+   downplay_settings_list_t *L =
+      downplay_settings_list_new("Options", 5, 0, 60);
+   if (!L)
+      return NULL;
+   L->rows[0].title      = "Frontend";
+   L->rows[0].on_confirm = downplay_action_open_frontend;
+   L->rows[0].userdata   = dp;
+   L->rows[1].title      = "Emulator";
+   L->rows[1].desc       = "Adjust the running core's options.";
+   L->rows[1].on_confirm = downplay_action_open_core_options;
+   L->rows[1].userdata   = dp;
+   L->rows[2].title      = "Controls";
+   L->rows[2].on_confirm = downplay_action_open_controls;
+   L->rows[2].userdata   = dp;
+   L->rows[3].title      = "Shortcuts";
+   L->rows[3].on_confirm = downplay_action_open_shortcuts;
+   L->rows[3].userdata   = dp;
+   L->rows[4].title      = "Save Changes";
+   L->rows[4].desc       = "Persist core option changes to disk.";
+   L->rows[4].on_confirm = downplay_action_save_changes;
+   L->rows[4].userdata   = dp;
+   return L;
+}
+
+/* Build a settings list mirroring the running core's option set.
+ * Categories (v2) ignored on the first cut — flat list.  Hidden
+ * options are skipped on enumeration; the Emulator nav row will
+ * already have decided to push us by then, so an all-hidden manager
+ * legitimately renders an empty list (gets the "No options" fallback
+ * via downplay_build_no_options_list below). */
+static downplay_settings_list_t *downplay_build_no_options_list(void)
+{
+   downplay_settings_list_t *L =
+      downplay_settings_list_new("Emulator", 1, 0, 50);
+   if (!L)
+      return NULL;
+   L->rows[0].title = "No options";
+   L->rows[0].desc  = "This core exposes no configurable options.";
+   return L;
+}
+
+static downplay_settings_list_t *downplay_build_core_options_list(
+      downplay_handle_t *dp)
+{
+   core_option_manager_t        *opts = NULL;
+   downplay_settings_list_t     *L;
+   downplay_core_opt_row_ud_t   *row_uds;
+   const char                  **values_pool;
+   size_t                        visible_count = 0;
+   size_t                        total_values  = 0;
+   size_t                        i;
+   size_t                        out_row       = 0;
+   size_t                        values_offset = 0;
+   size_t                        ud_bytes;
+
+   retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
+   if (!opts || opts->size == 0)
+      return downplay_build_no_options_list();
+
+   /* Two-pass: count visible rows + total value strings to size the
+    * userdata pool exactly.  Keeps the values array contiguous in
+    * one allocation. */
+   for (i = 0; i < opts->size; i++)
+   {
+      if (!core_option_manager_get_visible(opts, i))
+         continue;
+      visible_count++;
+      if (opts->opts[i].vals)
+         total_values += opts->opts[i].vals->size;
+   }
+   if (visible_count == 0)
+      return downplay_build_no_options_list();
+
+   ud_bytes  = visible_count * sizeof(downplay_core_opt_row_ud_t)
+             + total_values  * sizeof(const char*);
+   /* Core options use the full content width — these strings tend to
+    * be long (especially "On / Off / Lenient / Strict"-style enums)
+    * and the launcher's outer margins are still respected. */
+   L = downplay_settings_list_new("Emulator", visible_count, ud_bytes, 100);
+   if (!L)
+      return NULL;
+   row_uds     = (downplay_core_opt_row_ud_t*)L->userdata_pool;
+   values_pool = (const char**)((char*)L->userdata_pool
+         + visible_count * sizeof(downplay_core_opt_row_ud_t));
+
+   for (i = 0; i < opts->size && out_row < visible_count; i++)
+   {
+      struct core_option        *o = &opts->opts[i];
+      struct string_list        *src;
+      size_t                     k;
+      downplay_settings_row_t   *r;
+
+      if (!core_option_manager_get_visible(opts, i))
+         continue;
+      r              = &L->rows[out_row];
+      /* Prefer desc_categorized when the core publishes v2 options
+       * with category prefixes — disambiguates "Resolution" across
+       * Video / Audio etc.  Falls back to plain desc / key. */
+      r->title       = core_option_manager_get_desc(opts, i, true);
+      if (!r->title || !*r->title)
+         r->title    = o->key ? o->key : "";
+      r->desc        = o->info;
+      /* Prefer val_labels (human-friendly) over vals (raw value
+       * strings).  Either may be NULL — render an empty value
+       * column in that case.
+       *
+       * Visibility can shift between the count pass and this build
+       * pass (the core's update_display callback runs against the
+       * live manager, which other code may have called between
+       * the two loops).  Guard `values_offset` against overrunning
+       * the pool we sized in pass 1 — a newly-visible option here
+       * would otherwise walk past the buffer end. */
+      src            = o->val_labels ? o->val_labels : o->vals;
+      if (src && src->size > 0
+            && values_offset + src->size <= total_values)
+      {
+         for (k = 0; k < src->size; k++)
+            values_pool[values_offset + k] = src->elems[k].data;
+         r->values       = values_pool + values_offset;
+         r->values_count = src->size;
+         values_offset  += src->size;
+      }
+      /* Clamp against a stale o->index that might be ≥ values_count
+       * (rare — shouldn't happen with a well-behaved core, but
+       * cycling code does unguarded modulo and would misbehave
+       * when r->values_count is 0). */
+      r->idx_value    = (r->values_count > 0 && o->index < r->values_count)
+                        ? o->index : 0;
+      r->on_change    = downplay_core_opt_on_change;
+      row_uds[out_row].opt = opts;
+      row_uds[out_row].idx = i;
+      row_uds[out_row].dp  = dp;
+      r->userdata     = &row_uds[out_row];
+      out_row++;
+   }
+   /* Defensive: if the visibility flags shifted between the count
+    * pass and the build pass (multithreaded core?), trim the row
+    * count to what we actually populated.  Excess values pool space
+    * is harmless. */
+   L->row_count = out_row;
+   return L;
+}
+
 /* ---------- main list ---------- */
 
 /* Draw one list row.  The selection pill auto-sizes to the label
@@ -2073,7 +2981,8 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
     * post-load, returning to INGAME via prior_view. */
    if (running
          && dp->view != DOWNPLAY_VIEW_INGAME
-         && dp->view != DOWNPLAY_VIEW_SAVE_PICKER)
+         && dp->view != DOWNPLAY_VIEW_SAVE_PICKER
+         && dp->view != DOWNPLAY_VIEW_SETTINGS)
    {
       dp->prior_view      = dp->view;
       dp->prior_selection = dp->selection;
@@ -2102,6 +3011,16 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
        * stacks on top of SAVE_PICKER, that slot will need to become a
        * small stack. */
       downplay_save_picker_free(dp);
+      dp->view      = DOWNPLAY_VIEW_TOP;
+      dp->selection = 0;
+      downplay_refresh_resume(dp);
+      downplay_recompute_total_rows(dp);
+   }
+   else if (!running && dp->view == DOWNPLAY_VIEW_SETTINGS)
+   {
+      /* Same edge case as SAVE_PICKER: core died while in Options.
+       * Tear down the settings stack and snap to TOP. */
+      downplay_settings_pop_all(dp);
       dp->view      = DOWNPLAY_VIEW_TOP;
       dp->selection = 0;
       downplay_refresh_resume(dp);
@@ -2215,6 +3134,37 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     * straight into the loading screen is the desired UX. */
    downplay_drive_pending_launch(dp);
    downplay_sync_ingame(dp);
+
+   /* Core flipped option visibility on the previous frame's cycle.
+    * Rebuild the active core-options list in place — same stack
+    * position, preserve selection by index (best-effort: if the
+    * row count shrinks past sel, snap_scroll clamps it). */
+   if (dp->settings_rebuild_pending)
+   {
+      core_option_manager_t *opts = NULL;
+      retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
+      if (opts)
+         opts->updated = false;
+      if (dp->view == DOWNPLAY_VIEW_SETTINGS && dp->settings_depth > 0)
+      {
+         downplay_settings_list_t *cur = downplay_settings_top(dp);
+         downplay_settings_list_t *neu =
+               downplay_build_core_options_list(dp);
+         if (neu)
+         {
+            size_t saved_sel    = cur ? cur->sel    : 0;
+            size_t saved_scroll = cur ? cur->scroll : 0;
+            downplay_settings_list_free(cur);
+            if (saved_sel >= neu->row_count && neu->row_count > 0)
+               saved_sel = neu->row_count - 1;
+            neu->sel    = saved_sel;
+            neu->scroll = saved_scroll;
+            dp->settings_stack[dp->settings_depth - 1] = neu;
+            downplay_settings_snap_scroll(dp, neu);
+         }
+      }
+      dp->settings_rebuild_pending = false;
+   }
    mode = downplay_get_render_mode();
 
    /* Recompute layout (and reload fonts at new size) only when the
@@ -2261,8 +3211,11 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          downplay_draw_setup_splash(p_disp, userdata, dp);
          break;
       case DOWNPLAY_RENDER_LIST:
-         downplay_draw_list(p_disp, userdata,
-               &dp->layout, dp->pill_cap_tex, dp);
+         if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+            downplay_draw_settings_view(p_disp, userdata, dp);
+         else
+            downplay_draw_list(p_disp, userdata,
+                  &dp->layout, dp->pill_cap_tex, dp);
          break;
       case DOWNPLAY_RENDER_BLANK:
          /* Nothing — chrome below still draws, but no list / no splash. */
@@ -2275,7 +3228,12 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     * sitting on the footer surface, with the label in white next to
     * it.  Against the launcher's dark background the outer pills
     * visually disappear; against a running game (INGAME mode) they
-    * give the chrome a coherent base. */
+    * give the chrome a coherent base.
+    *
+    * SETTINGS view hides the footer entirely so the row block + the
+    * fixed description band can extend to the bottom margin. */
+   if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+      return;
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.row_h;
    downplay_draw_footer_hint(p_disp, userdata, dp->chrome_font,
          dp->chrome_font_centre_offset, &dp->layout,
@@ -2325,6 +3283,58 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          downplay_cores_cancel();
       }
       return 0;
+   }
+
+   /* SETTINGS view drives its own selection cursor on the active
+    * stack frame, not dp->selection — handled before the generic
+    * up/down code below to avoid two cursors fighting. */
+   if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+   {
+      downplay_settings_list_t *S = downplay_settings_top(dp);
+      if (!S || S->row_count == 0)
+      {
+         if (action == MENU_ACTION_CANCEL)
+            downplay_settings_pop(dp);
+         return 0;
+      }
+      switch (action)
+      {
+         case MENU_ACTION_UP:
+            S->sel = (S->sel + S->row_count - 1) % S->row_count;
+            downplay_settings_snap_scroll(dp, S);
+            return 0;
+         case MENU_ACTION_DOWN:
+            S->sel = (S->sel + 1) % S->row_count;
+            downplay_settings_snap_scroll(dp, S);
+            return 0;
+         case MENU_ACTION_LEFT:
+         case MENU_ACTION_RIGHT:
+         {
+            downplay_settings_row_t *r = &S->rows[S->sel];
+            int    delta = (action == MENU_ACTION_LEFT) ? -1 : +1;
+            size_t inc;
+            if (!r->values || r->values_count == 0)
+               return 0;
+            inc = (delta < 0) ? (r->values_count - 1) : 1;
+            r->idx_value = (r->idx_value + inc) % r->values_count;
+            if (r->on_change)
+               r->on_change(delta, r->userdata);
+            return 0;
+         }
+         case MENU_ACTION_OK:
+         case MENU_ACTION_SELECT:
+         {
+            downplay_settings_row_t *r = &S->rows[S->sel];
+            if (r->on_confirm)
+               r->on_confirm(r->userdata);
+            return 0;
+         }
+         case MENU_ACTION_CANCEL:
+            downplay_settings_pop(dp);
+            return 0;
+         default:
+            return 0;
+      }
    }
 
    /* Empty list (no recents and no system folders): swallow nav silently
@@ -2409,6 +3419,10 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                   downplay_recompute_total_rows(dp);
                   break;
                }
+               case DP_INGAME_OPTIONS:
+                  downplay_settings_push(dp,
+                        downplay_build_root_options_list(dp));
+                  break;
                case DP_INGAME_QUIT:
                   command_event(CMD_EVENT_UNLOAD_CORE, NULL);
                   break;
@@ -2570,6 +3584,11 @@ static void downplay_menu_context_destroy(void *data)
    /* Picker thumbnails are GPU resources; drop them on context loss
     * so they're not dangling handles after a renderer reset. */
    downplay_save_picker_free(dp);
+   /* Settings stack is CPU-only state, but its row data may include
+    * pointers into the core options manager — which is owned by RA
+    * and may be torn down before us.  Easier to clear here than to
+    * track its lifetime. */
+   downplay_settings_clear(dp);
    gfx_display_deinit_white_texture();
 }
 
