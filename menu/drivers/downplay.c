@@ -3982,9 +3982,17 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
  * that we'd ignore. */
 static void downplay_sync_ingame(downplay_handle_t *dp)
 {
-   struct menu_state *menu_st = menu_state_get_ptr();
-   bool               running = (runloop_get_flags()
-         & RUNLOOP_FLAG_CORE_RUNNING) != 0;
+   struct menu_state *menu_st     = menu_state_get_ptr();
+   runloop_state_t   *runloop_st  = runloop_state_get_ptr();
+   /* CMD_EVENT_UNLOAD_CORE clears RUNLOOP_FLAG_CORE_RUNNING but then
+    * starts a dummy core asynchronously, which sets the flag again on
+    * the next frame.  Without this, "Quit" from INGAME would leave us
+    * stuck on the INGAME view forever — running stays true (dummy is
+    * "running"), so the !running transition below never fires.  Treat
+    * the dummy as "no game" instead. */
+   bool               running     =
+         (runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING) != 0
+         && runloop_st->current_core_type != CORE_TYPE_DUMMY;
 
    /* Unconditional: upstream may set this flag at content load even
     * before our frame fires, so we eat it every tick rather than only
