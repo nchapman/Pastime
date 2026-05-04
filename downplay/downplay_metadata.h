@@ -75,9 +75,16 @@ enum downplay_art_state
    DP_ART_MISSING
 };
 
-/* Snapshot of an index entry.  All `const char*` pointers reference
- * storage owned by the index; valid until the next pump op for that
- * basename (or until the index is closed).  Read-only; never free. */
+/* Snapshot of an index entry.  The `const char*` pointers reference
+ * storage owned by the index; read-only, never free.
+ *
+ * Lifetime contract: pointers are valid only within the same call
+ * frame as the lookup that returned them.  Do NOT store across a
+ * subsequent downplay_index_pump / note_present / set_art_state /
+ * close call — the apply path can free and replace the underlying
+ * label/match_value strings.  In practice all current callers (the
+ * menu driver's per-row render) read once and discard, which is
+ * fine. */
 typedef struct
 {
    const char              *label;        /* may be NULL — caller falls back to filename */

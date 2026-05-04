@@ -36,12 +36,16 @@
 #include <encodings/utf.h>
 #include <file/archive_file.h>
 #include <file/file_path.h>
+#include <retro_assert.h>
 #include <retro_miscellaneous.h>
 #include <streams/file_stream.h>
 #include <streams/interface_stream.h>
 #include <string/stdstring.h>
 #include <lists/string_list.h>
 #include <formats/rjson.h>
+#ifdef HAVE_THREADS
+#include <rthreads/rthreads.h>
+#endif
 
 #include "downplay_metadata.h"
 #include "downplay_defaults.h"
@@ -423,7 +427,28 @@ static bool dp_build_serial_query(const char *serial, char *out, size_t out_len)
    return true;
 }
 
-/* ---------- internal: entry storage ---------- */
+/* ---------- internal: entry + queue + result storage ----------
+ *
+ * Threading model (see THREADING_REFACTOR.md for the full design):
+ *
+ *   Main thread owns: json_path, system_folder, dirty, plus all reads
+ *   and writes of dp_entry_t fields.  Worker thread NEVER touches
+ *   entries[] — it operates on snapshotted dp_work_t / dp_result_t
+ *   structures by value.
+ *
+ *   Shared (mutex-protected): entries[] (the array itself, against
+ *   realloc; field reads outside the lock are main-thread-only and
+ *   therefore race-free), queue[], results[], shutdown.
+ *
+ *   Worker-only after sthread_create publishes the worker (read-only
+ *   from there): db, system_root, db_name.  No lock needed because
+ *   thread create/join are full memory barriers (POSIX guarantee).
+ *
+ *   `lookup` and `set_art_state` take the lock briefly to walk
+ *   entries[] — that's the only contention with `note_present` /
+ *   `finish_scan` / `pump` (all main-thread, so the contention is
+ *   really with the worker's queue/results pushes happening
+ *   underneath, which is also serialised). */
 
 /* One entry in the index.  basename is the dictionary key (heap-owned).
  * mtime + size are the validity stamps; mismatch invalidates everything
@@ -443,23 +468,87 @@ typedef struct
    bool                     pending;      /* in the work queue */
 } dp_entry_t;
 
+/* Work item passed from main thread to worker.  POD by design — no heap
+ * pointers — so copying across threads under the queue mutex is safe
+ * with no separate lifetime concerns.  The (mtime, size) stamp is
+ * carried alongside basename so the apply path can validate that the
+ * file hasn't been replaced under the same name during the worker's
+ * (potentially seconds-long) processing window. */
+typedef struct
+{
+   char    basename[NAME_MAX_LENGTH];
+   int64_t mtime;
+   int64_t size;
+} dp_work_t;
+
+/* Result pushed back from worker to main thread.  POD; same lifetime
+ * rationale as dp_work_t.  When kind == DP_MATCH_NONE the file's
+ * extraction failed (unreadable, unsupported); when label[0] == '\0'
+ * the extraction worked but the libretrodb query missed (record what
+ * we tried so we don't re-fingerprint on every visit).  The
+ * basename + (mtime, size) tuple is the validity key for apply. */
+typedef struct
+{
+   char                      basename[NAME_MAX_LENGTH];
+   int64_t                   mtime;
+   int64_t                   size;
+   enum downplay_match_kind  kind;
+   char                      match_value[64];
+   char                      label[NAME_MAX_LENGTH];
+} dp_result_t;
+
+/* Sanity cap on the work queue.  With per-entry pending-flag dedup, the
+ * queue can never exceed entries_count, so this is just a runaway-bug
+ * canary (we'd notice 10k SNES ROMs in one folder long before this fires
+ * organically). */
+#define DP_QUEUE_CAP_LIMIT 10000
+
 struct downplay_index
 {
-   /* Heap-allocated arrays, dynamically grown. */
-   dp_entry_t   *entries;
-   size_t       *queue;        /* indices into entries[] pending match */
-   /* Resolved at open. */
-   char         *json_path;    /* <RA_config>/downplay/index/<system>.json */
+   /* === main-thread-only === */
+   char         *json_path;     /* <RA_config>/downplay/index/<system>.json */
    char         *system_folder;
-   char         *system_root;  /* absolute path of the ROM folder */
-   char         *db_name;
-   libretrodb_t *db;
-   size_t        entries_count;
-   size_t        entries_cap;
-   size_t        queue_count;
-   size_t        queue_cap;
    bool          dirty;
+
+   /* === shared (mutex-protected) ===
+    * Mutate or grow only under idx->mutex.  Reads of dp_entry_t fields
+    * outside the array spine (label/match_value/match_kind/art_state)
+    * are main-thread-only and therefore unlocked. */
+   dp_entry_t   *entries;       size_t entries_count, entries_cap;
+   dp_work_t    *queue;         size_t queue_count, queue_cap, queue_head;
+   dp_result_t  *results;       size_t results_count, results_cap, results_head;
+
+   /* === worker-only after sthread_create publishes the worker ===
+    * Initialised on main thread before sthread_create (full barrier).
+    * Closed on main thread after sthread_join (full barrier).  Read-
+    * only by the worker.  No lock required. */
+   libretrodb_t *db;
+   char         *system_root;   /* absolute path of the ROM folder */
+   char         *db_name;
+
+   /* === lifecycle === */
+#ifdef HAVE_THREADS
+   slock_t      *mutex;
+   scond_t      *cond;
+   sthread_t    *worker;        /* NULL when threads disabled OR spawn failed */
+   bool          shutdown;
+#endif
 };
+
+#ifdef HAVE_THREADS
+#define DP_LOCK(idx)   slock_lock((idx)->mutex)
+#define DP_UNLOCK(idx) slock_unlock((idx)->mutex)
+/* Debug guard: any function that mutates main-thread-owned state must
+ * assert it's not running on the worker.  No-op in release builds. */
+#define DP_ASSERT_MAIN_THREAD(idx) do { \
+   if ((idx)->worker) \
+      retro_assert(!sthread_isself((idx)->worker)); \
+} while (0)
+#else
+#define DP_LOCK(idx)   ((void)0)
+#define DP_UNLOCK(idx) ((void)0)
+#define DP_ASSERT_MAIN_THREAD(idx) ((void)0)
+#endif
 
 static dp_entry_t *dp_entries_find(downplay_index_t *idx, const char *basename)
 {
@@ -519,40 +608,293 @@ static void dp_entry_clear_match(dp_entry_t *e)
    e->match_kind  = DP_MATCH_NONE;
 }
 
-static void dp_queue_push(downplay_index_t *idx, size_t entry_idx)
+/* Push a work item.  Caller holds idx->mutex.  Returns false if the
+ * queue is at the sanity cap or realloc fails (caller leaves
+ * entry->pending unchanged so a future scan can retry). */
+static bool dp_queue_push_locked(downplay_index_t *idx,
+      const dp_work_t *work)
 {
-   if (idx->entries[entry_idx].pending)
-      return;
-   if (idx->queue_count == idx->queue_cap)
+   size_t tail;
+   if (idx->queue_count >= DP_QUEUE_CAP_LIMIT)
    {
-      size_t  new_cap = idx->queue_cap ? idx->queue_cap * 2 : 16;
-      size_t *grown   = (size_t*)realloc(idx->queue,
-            new_cap * sizeof(*idx->queue));
-      if (!grown)
-         return;
-      idx->queue     = grown;
-      idx->queue_cap = new_cap;
-   }
-   idx->queue[idx->queue_count++] = entry_idx;
-   idx->entries[entry_idx].pending = true;
-}
-
-static bool dp_queue_pop(downplay_index_t *idx, size_t *out_entry_idx)
-{
-   size_t entry_idx;
-   if (idx->queue_count == 0)
+      RARCH_WARN("[Downplay] index queue cap (%zu) reached; dropping %s\n",
+            (size_t)DP_QUEUE_CAP_LIMIT, work->basename);
       return false;
-   /* FIFO so background enrichment progresses in scan order, which is
-    * roughly visual order (alphabetical) — matches what the user sees. */
-   entry_idx = idx->queue[0];
-   memmove(idx->queue, idx->queue + 1,
-         (idx->queue_count - 1) * sizeof(*idx->queue));
-   idx->queue_count--;
-   idx->entries[entry_idx].pending = false;
-   if (out_entry_idx)
-      *out_entry_idx = entry_idx;
+   }
+   tail = idx->queue_head + idx->queue_count;
+   if (tail >= idx->queue_cap)
+   {
+      /* No space at tail.  First try compacting the head; that's
+       * cheaper than realloc and reclaims any space the worker has
+       * already drained. */
+      if (idx->queue_head > 0)
+      {
+         memmove(idx->queue, idx->queue + idx->queue_head,
+               idx->queue_count * sizeof(*idx->queue));
+         idx->queue_head = 0;
+         tail            = idx->queue_count;
+      }
+      if (tail >= idx->queue_cap)
+      {
+         size_t     new_cap = idx->queue_cap ? idx->queue_cap * 2 : 16;
+         dp_work_t *grown   = (dp_work_t*)realloc(idx->queue,
+               new_cap * sizeof(*grown));
+         if (!grown)
+            return false;
+         idx->queue     = grown;
+         idx->queue_cap = new_cap;
+      }
+   }
+   idx->queue[tail] = *work;
+   idx->queue_count++;
    return true;
 }
+
+/* Pop the head work item.  Caller holds idx->mutex.  FIFO so background
+ * enrichment progresses in scan order (alphabetical), which matches
+ * what the user is most likely scrolling through. */
+static bool dp_queue_pop_locked(downplay_index_t *idx, dp_work_t *out)
+{
+   if (idx->queue_count == 0)
+      return false;
+   *out = idx->queue[idx->queue_head];
+   idx->queue_head++;
+   idx->queue_count--;
+   /* Lazy compact: when we've consumed more than half the buffer's
+    * capacity from the front, slide remaining items down so the next
+    * push has room without an alloc.  This avoids the O(N²) cost of
+    * memmove-on-every-pop while keeping the buffer bounded. */
+   if (idx->queue_head > 0 && idx->queue_head > idx->queue_cap / 2)
+   {
+      if (idx->queue_count > 0)
+         memmove(idx->queue, idx->queue + idx->queue_head,
+               idx->queue_count * sizeof(*idx->queue));
+      idx->queue_head = 0;
+   }
+   return true;
+}
+
+/* Build a snapshot from `e` and push it.  Caller holds idx->mutex.
+ * No-op if the entry is already in the queue (pending flag).  Sets
+ * pending on success so subsequent calls dedup. */
+static void dp_enqueue_match_locked(downplay_index_t *idx, dp_entry_t *e)
+{
+   dp_work_t work;
+   if (!e || e->pending || !e->basename)
+      return;
+   memset(&work, 0, sizeof(work));
+   strlcpy(work.basename, e->basename, sizeof(work.basename));
+   work.mtime = e->mtime;
+   work.size  = e->size;
+   if (dp_queue_push_locked(idx, &work))
+      e->pending = true;
+}
+
+/* ---------- internal: match-one (worker body) ---------- */
+
+/* Run the full match pipeline on one work snapshot.  Pure: takes a
+ * snapshot in, fills a result out, never touches entries[].  Called
+ * from the worker loop AND from the synchronous fallback pump (when
+ * HAVE_THREADS=0 or worker spawn failed).  No locking required —
+ * the only shared state read is idx->db / idx->system_root, both
+ * worker-only-after-publish (or main-thread-only when no worker
+ * exists). */
+static void dp_match_one(downplay_index_t *idx,
+      const dp_work_t *work, dp_result_t *out)
+{
+   char                     full_path[PATH_MAX_LENGTH];
+   char                     match_val[64];
+   char                     query[256];
+   char                     label[NAME_MAX_LENGTH];
+   enum downplay_match_kind kind;
+   uint32_t                 archive_crc = 0;
+
+   memset(out, 0, sizeof(*out));
+   strlcpy(out->basename, work->basename, sizeof(out->basename));
+   out->mtime = work->mtime;
+   out->size  = work->size;
+
+   fill_pathname_join_special(full_path, idx->system_root, work->basename,
+         sizeof(full_path));
+   if (!path_is_valid(full_path))
+      return;
+
+   if (!dp_extract_match(full_path, &kind, match_val, sizeof(match_val),
+            &archive_crc))
+      return;
+   if (kind == DP_MATCH_NONE)
+      return;
+
+   if (kind == DP_MATCH_CRC)
+   {
+      if (!dp_build_crc_query(match_val, archive_crc, query, sizeof(query)))
+         return;
+   }
+   else
+   {
+      if (!dp_build_serial_query(match_val, query, sizeof(query)))
+         return;
+   }
+
+   /* Successful extraction is itself useful provenance even when the
+    * RDB query misses — record what we tried so a future visit doesn't
+    * re-CRC the file. */
+   out->kind = kind;
+   strlcpy(out->match_value, match_val, sizeof(out->match_value));
+   if (dp_run_query(idx->db, query, label, sizeof(label)))
+      strlcpy(out->label, label, sizeof(out->label));
+}
+
+/* Apply a result to the entries[] table.  Main-thread only.  Validates
+ * that the entry still exists with the same (mtime, size) — if the
+ * file was replaced or removed during the worker's processing window,
+ * discard the result silently and a future scan will re-enqueue. */
+static void dp_apply_result(downplay_index_t *idx, const dp_result_t *r)
+{
+   dp_entry_t *e;
+   bool        applied = false;
+
+   DP_ASSERT_MAIN_THREAD(idx);
+   DP_LOCK(idx);
+   e = dp_entries_find(idx, r->basename);
+   if (!e)
+   {
+      DP_UNLOCK(idx);
+      return; /* entry pruned by finish_scan; orphan result */
+   }
+   if (e->mtime != r->mtime || e->size != r->size)
+   {
+      /* This result is for an old snapshot — the file was replaced
+       * after we enqueued.  Discard it.  Don't touch `pending`: a new
+       * snapshot may already be in the queue (note_present resets
+       * pending and re-enqueues on stale detection), and clearing it
+       * here would let a subsequent note_present enqueue a duplicate. */
+      DP_UNLOCK(idx);
+      return;
+   }
+
+   if (r->kind != DP_MATCH_NONE)
+   {
+      e->match_kind = r->kind;
+      free(e->match_value);
+      e->match_value = strdup(r->match_value);
+      applied        = true;
+   }
+   if (*r->label)
+   {
+      free(e->label);
+      e->label = strdup(r->label);
+      RARCH_LOG("[Downplay] match hit: %s -> \"%s\" (%s=%s)\n",
+            e->basename, e->label,
+            r->kind == DP_MATCH_CRC ? "crc" : "serial", r->match_value);
+   }
+   else if (r->kind != DP_MATCH_NONE)
+      RARCH_LOG("[Downplay] match miss: %s (%s=%s)\n",
+            e->basename,
+            r->kind == DP_MATCH_CRC ? "crc" : "serial", r->match_value);
+
+   e->pending = false;
+   DP_UNLOCK(idx);
+
+   /* `dirty` is main-thread-only (see struct ownership comment); set
+    * after unlock so the read in `flush`'s early-return guard doesn't
+    * race a write inside someone else's locked region. */
+   if (applied)
+      idx->dirty = true;
+}
+
+#ifdef HAVE_THREADS
+/* Push a result.  Caller holds idx->mutex.  On realloc failure we drop
+ * the result and clear the entry's `pending` flag so a future
+ * note_present can re-enqueue — without that step the entry would be
+ * stuck pending forever (dp_enqueue_match_locked short-circuits on
+ * pending=true, and note_present only force-clears it on (mtime, size)
+ * mismatch).
+ *
+ * Mirrors dp_queue_push/pop_locked's head-cursor lazy-compact so the
+ * results buffer doesn't degenerate to O(N²) when the worker is
+ * producing faster than the pump drains. */
+static void dp_results_push_locked(downplay_index_t *idx,
+      const dp_result_t *r)
+{
+   size_t tail = idx->results_head + idx->results_count;
+   if (tail >= idx->results_cap)
+   {
+      if (idx->results_head > 0)
+      {
+         memmove(idx->results, idx->results + idx->results_head,
+               idx->results_count * sizeof(*idx->results));
+         idx->results_head = 0;
+         tail              = idx->results_count;
+      }
+      if (tail >= idx->results_cap)
+      {
+         size_t       new_cap = idx->results_cap ? idx->results_cap * 2 : 16;
+         dp_result_t *grown   = (dp_result_t*)realloc(idx->results,
+               new_cap * sizeof(*grown));
+         if (!grown)
+         {
+            dp_entry_t *e = dp_entries_find(idx, r->basename);
+            if (e && e->mtime == r->mtime && e->size == r->size)
+               e->pending = false;
+            return;
+         }
+         idx->results     = grown;
+         idx->results_cap = new_cap;
+      }
+   }
+   idx->results[tail] = *r;
+   idx->results_count++;
+}
+
+/* Worker thread entry point.  Loops on the queue until shutdown is
+ * signalled.  All heavy work (CRC32 of multi-MB ROMs, libretrodb
+ * cursor scans) happens OUTSIDE the lock so the main thread is never
+ * blocked on a per-frame pump call.
+ *
+ * Cancellation latency: an in-flight CRC of a very large ROM (~700MB
+ * ISO would cart-likes route to CRC; in practice flat-binary homebrew
+ * is the worst case) takes seconds.  The shutdown flag is checked at
+ * loop entry, not mid-CRC, so close() can block for the duration of
+ * one in-flight match.  See THREADING_REFACTOR.md "Non-goals" for the
+ * rationale on not threading cancellation through the intfstream
+ * helpers. */
+static void dp_worker_loop(void *data)
+{
+   downplay_index_t *idx = (downplay_index_t*)data;
+
+   for (;;)
+   {
+      dp_work_t   work;
+      dp_result_t result;
+
+      slock_lock(idx->mutex);
+      while (!idx->shutdown && idx->queue_count == 0)
+         scond_wait(idx->cond, idx->mutex);
+      if (idx->shutdown)
+      {
+         slock_unlock(idx->mutex);
+         break;
+      }
+      /* Predicate above guarantees queue_count > 0, so pop never fails. */
+      dp_queue_pop_locked(idx, &work);
+      slock_unlock(idx->mutex);
+
+      dp_match_one(idx, &work, &result);
+
+      slock_lock(idx->mutex);
+      /* Push regardless of shutdown.  close() doesn't drain results
+       * before sthread_join — the entry is about to be freed — so a
+       * push here that lands during shutdown is silently dropped on
+       * the subsequent free(idx->results).  Pushing under the lock
+       * (rather than checking shutdown first) keeps the pre-shutdown
+       * path simple at the cost of one wasted memcpy on the very last
+       * result during a close. */
+      dp_results_push_locked(idx, &result);
+      slock_unlock(idx->mutex);
+   }
+}
+#endif
 
 /* ---------- internal: JSON ---------- */
 
@@ -1093,6 +1435,23 @@ downplay_index_t *downplay_index_open(const char *system_folder_name,
       }
    }
 
+#ifdef HAVE_THREADS
+   /* Thread primitives + worker.  Spawn only when matching is actually
+    * available (db opened) — otherwise the worker would idle forever.
+    * sthread_create is a full memory barrier (POSIX), so all the
+    * worker-zone fields above are safely visible to the worker on its
+    * first instruction. */
+   idx->mutex = slock_new();
+   idx->cond  = scond_new();
+   if (idx->db && idx->mutex && idx->cond)
+   {
+      idx->worker = sthread_create(dp_worker_loop, idx);
+      if (!idx->worker)
+         RARCH_WARN("[Downplay] index: worker spawn failed; "
+               "falling back to inline matching\n");
+   }
+#endif
+
    return idx;
 }
 
@@ -1101,12 +1460,44 @@ void downplay_index_close(downplay_index_t *idx)
    size_t i;
    if (!idx)
       return;
+   DP_ASSERT_MAIN_THREAD(idx);
+
+#ifdef HAVE_THREADS
+   /* Shutdown sequence per THREADING_REFACTOR.md "Important: shutdown
+    * without a final result drain":
+    *   1. Set shutdown under lock and signal so a waiting worker
+    *      observes both atomically.
+    *   2. Join — may block for up to one large-file CRC.
+    * After join: flush dirty entries, free entries[] / queue / results
+    * (any final result pushed by the worker before observing shutdown
+    * is silently dropped — entries[] is about to be torn down anyway,
+    * applying it would be wasted work). */
+   if (idx->worker)
+   {
+      slock_lock(idx->mutex);
+      idx->shutdown = true;
+      scond_signal(idx->cond);
+      slock_unlock(idx->mutex);
+      sthread_join(idx->worker);
+      idx->worker = NULL;
+   }
+#endif
+
    downplay_index_flush(idx);
    dp_close_rdb(idx->db);
    for (i = 0; i < idx->entries_count; i++)
       dp_entry_free_strings(&idx->entries[i]);
    free(idx->entries);
    free(idx->queue);
+   free(idx->results);
+
+#ifdef HAVE_THREADS
+   if (idx->mutex)
+      slock_free(idx->mutex);
+   if (idx->cond)
+      scond_free(idx->cond);
+#endif
+
    free(idx->json_path);
    free(idx->system_folder);
    free(idx->system_root);
@@ -1119,39 +1510,55 @@ bool downplay_index_lookup(downplay_index_t *idx,
       downplay_index_record_t *out)
 {
    dp_entry_t *e;
+   bool        found = false;
    if (!out)
       return false;
    memset(out, 0, sizeof(*out));
    if (!idx || !basename)
       return false;
-   e = dp_entries_find(idx, basename);
-   if (!e)
-      return false;
-   /* Validity: file must match what we last saw. */
-   if (e->mtime != (int64_t)mtime || e->size != size)
-      return false;
 
-   out->label       = e->label;
-   out->match_kind  = e->match_kind;
-   out->match_value = e->match_value;
-   out->art_state   = e->art_state;
-   return true;
+   /* Lock briefly to walk entries[] safely against a concurrent realloc
+    * by note_present.  The string pointers we hand back are owned by
+    * the entry and only freed by main-thread paths (note_present's
+    * stale invalidation, apply_result's replace).  Caller MUST consume
+    * the pointers within the same frame — see the contract on
+    * downplay_index_record_t in the header.  Storing across a
+    * subsequent pump or note_present is a use-after-free hazard. */
+   DP_LOCK(idx);
+   e = dp_entries_find(idx, basename);
+   if (e && e->mtime == (int64_t)mtime && e->size == size)
+   {
+      out->label       = e->label;
+      out->match_kind  = e->match_kind;
+      out->match_value = e->match_value;
+      out->art_state   = e->art_state;
+      found = true;
+   }
+   DP_UNLOCK(idx);
+   return found;
 }
 
 void downplay_index_note_present(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size)
 {
    dp_entry_t *e;
-   bool        is_new = false;
+   bool        is_new      = false;
+   bool        wake_worker = false;
 
    if (!idx || !basename || !*basename)
       return;
+   DP_ASSERT_MAIN_THREAD(idx);
+
+   DP_LOCK(idx);
    e = dp_entries_find(idx, basename);
    if (!e)
    {
       e = dp_entries_create(idx, basename);
       if (!e)
+      {
+         DP_UNLOCK(idx);
          return;
+      }
       is_new = true;
    }
    e->present = true;
@@ -1160,19 +1567,39 @@ void downplay_index_note_present(downplay_index_t *idx,
    {
       e->mtime = (int64_t)mtime;
       e->size  = size;
-      /* Stale or new — invalidate match and art state, requeue. */
+      /* Stale or new — invalidate match and art state, requeue.  Note
+       * that pending may be true here from a prior queue snapshot for
+       * the old (mtime, size); apply_result will discard that result
+       * via its validity check.  Force-clear pending so we re-enqueue
+       * with the new stamp. */
       dp_entry_clear_match(e);
       e->art_state      = DP_ART_UNKNOWN;
       e->art_checked_at = 0;
+      e->pending        = false;
       idx->dirty        = true;
       if (idx->db)
-         dp_queue_push(idx, (size_t)(e - idx->entries));
+      {
+         dp_enqueue_match_locked(idx, e);
+         wake_worker = true;
+      }
    }
    else if (e->match_kind == DP_MATCH_NONE && idx->db)
    {
       /* Unmatched entry from a prior session — retry now we're up. */
-      dp_queue_push(idx, (size_t)(e - idx->entries));
+      dp_enqueue_match_locked(idx, e);
+      wake_worker = true;
    }
+
+#ifdef HAVE_THREADS
+   /* Signal under the lock per THREADING_REFACTOR.md "Lock discipline":
+    * the simpler model with no lost-wakeup edge cases.  scond_signal
+    * is cheap. */
+   if (wake_worker && idx->cond && idx->worker)
+      scond_signal(idx->cond);
+#else
+   (void)wake_worker;
+#endif
+   DP_UNLOCK(idx);
 }
 
 void downplay_index_finish_scan(downplay_index_t *idx)
@@ -1181,10 +1608,15 @@ void downplay_index_finish_scan(downplay_index_t *idx)
    size_t write_i;
    if (!idx)
       return;
+   DP_ASSERT_MAIN_THREAD(idx);
 
-   /* Compact: keep noted entries, drop the rest.  pending flags survive
-    * the copy and are then used to rebuild the queue without dangling
-    * indices into pre-compaction slots. */
+   /* Compact under the lock: entries[] is shared, and even though the
+    * worker doesn't touch the array directly today, the queue holds
+    * basename-keyed snapshots so apply_result doesn't care if our
+    * indices shift.  Pending flags survive compaction in place — work
+    * items already in flight retain their validity via basename +
+    * (mtime, size) lookup on apply. */
+   DP_LOCK(idx);
    write_i = 0;
    for (read_i = 0; read_i < idx->entries_count; read_i++)
    {
@@ -1202,18 +1634,7 @@ void downplay_index_finish_scan(downplay_index_t *idx)
       }
    }
    idx->entries_count = write_i;
-
-   /* Rebuild queue from pending flags (old indices are stale after
-    * compaction).  dp_queue_push re-sets pending=true on each push. */
-   idx->queue_count = 0;
-   for (read_i = 0; read_i < idx->entries_count; read_i++)
-   {
-      if (idx->entries[read_i].pending)
-      {
-         idx->entries[read_i].pending = false;
-         dp_queue_push(idx, read_i);
-      }
-   }
+   DP_UNLOCK(idx);
 }
 
 void downplay_index_set_art_state(downplay_index_t *idx,
@@ -1222,84 +1643,86 @@ void downplay_index_set_art_state(downplay_index_t *idx,
    dp_entry_t *e;
    if (!idx || !basename)
       return;
+   DP_ASSERT_MAIN_THREAD(idx);
+   DP_LOCK(idx);
    e = dp_entries_find(idx, basename);
-   if (!e || e->art_state == state)
-      return;
-   e->art_state      = state;
-   e->art_checked_at = (int64_t)time(NULL);
-   idx->dirty        = true;
+   if (e && e->art_state != state)
+   {
+      e->art_state      = state;
+      e->art_checked_at = (int64_t)time(NULL);
+      idx->dirty        = true;
+   }
+   DP_UNLOCK(idx);
 }
 
 int downplay_index_pump(downplay_index_t *idx, int max_ops)
 {
-   int    ops = 0;
-   size_t entry_idx;
+   int ops = 0;
 
    if (!idx || max_ops <= 0)
       return 0;
    if (!idx->db)
       return 0; /* matching disabled when RDB not available */
+   DP_ASSERT_MAIN_THREAD(idx);
 
-   while (ops < max_ops && dp_queue_pop(idx, &entry_idx))
+#ifdef HAVE_THREADS
+   if (idx->worker)
    {
-      dp_entry_t              *e = &idx->entries[entry_idx];
-      enum downplay_match_kind kind;
-      uint32_t                 archive_crc = 0;
-      char                     match_val[64];
-      char                     query[256];
-      char                     label[NAME_MAX_LENGTH];
-      char                     full_path[PATH_MAX_LENGTH];
+      /* Drain results produced by the worker.  Each drain hop takes the
+       * lock once: pop the head, release, apply (which retakes the lock
+       * briefly to mutate entries[]).  Bounded by max_ops so per-frame
+       * cost is predictable.  The worker keeps producing concurrently
+       * — we don't need to drain everything in one frame. */
+      while (ops < max_ops)
+      {
+         dp_result_t r;
+         slock_lock(idx->mutex);
+         if (idx->results_count == 0)
+         {
+            slock_unlock(idx->mutex);
+            break;
+         }
+         r = idx->results[idx->results_head];
+         idx->results_head++;
+         idx->results_count--;
+         /* Lazy compact, mirroring dp_queue_pop_locked. */
+         if (idx->results_head > idx->results_cap / 2)
+         {
+            if (idx->results_count > 0)
+               memmove(idx->results, idx->results + idx->results_head,
+                     idx->results_count * sizeof(*idx->results));
+            idx->results_head = 0;
+         }
+         slock_unlock(idx->mutex);
 
+         dp_apply_result(idx, &r);
+         ops++;
+      }
+      return ops;
+   }
+#endif
+
+   /* Synchronous fallback: HAVE_THREADS=0 OR worker spawn failed at
+    * open.  Same dp_match_one helper the worker calls, just invoked
+    * inline from the pump.  Will block the menu thread for as long as
+    * one CRC takes — historical behaviour pre-threading; acceptable on
+    * desktop console targets where HAVE_THREADS=0 is rare and ROMs
+    * tend to be small. */
+   while (ops < max_ops)
+   {
+      dp_work_t   work;
+      dp_result_t result;
+      DP_LOCK(idx);
+      if (!dp_queue_pop_locked(idx, &work))
+      {
+         DP_UNLOCK(idx);
+         break;
+      }
+      DP_UNLOCK(idx);
+
+      dp_match_one(idx, &work, &result);
+      dp_apply_result(idx, &result);
       ops++;
-
-      fill_pathname_join_special(full_path, idx->system_root, e->basename,
-            sizeof(full_path));
-      if (!path_is_valid(full_path))
-         continue;
-
-      if (!dp_extract_match(full_path, &kind, match_val,
-               sizeof(match_val), &archive_crc))
-         continue;
-      if (kind == DP_MATCH_NONE)
-         continue;
-
-      if (kind == DP_MATCH_CRC)
-      {
-         if (!dp_build_crc_query(match_val, archive_crc,
-                  query, sizeof(query)))
-            continue;
-      }
-      else
-      {
-         if (!dp_build_serial_query(match_val, query, sizeof(query)))
-            continue;
-      }
-
-      if (!dp_run_query(idx->db, query, label, sizeof(label)))
-      {
-         RARCH_LOG("[Downplay] match miss: %s (%s=%s)\n",
-               e->basename,
-               kind == DP_MATCH_CRC ? "crc" : "serial", match_val);
-         /* No match — record what we tried so we don't retry every visit.
-          * We still write the match_value (a successful CRC/serial
-          * extraction is itself useful provenance). */
-         e->match_kind  = kind;
-         free(e->match_value);
-         e->match_value = strdup(match_val);
-         /* Leave label NULL so caller falls back to filename. */
-         idx->dirty     = true;
-         continue;
-      }
-
-      RARCH_LOG("[Downplay] match hit: %s -> \"%s\" (%s=%s)\n",
-            e->basename, label,
-            kind == DP_MATCH_CRC ? "crc" : "serial", match_val);
-      free(e->label);
-      e->label       = strdup(label);
-      e->match_kind  = kind;
-      free(e->match_value);
-      e->match_value = strdup(match_val);
-      idx->dirty     = true;
    }
    return ops;
 }
@@ -1310,6 +1733,13 @@ void downplay_index_flush(downplay_index_t *idx)
       return;
    if (!idx->json_path)
       return;
+   DP_ASSERT_MAIN_THREAD(idx);
+   /* No lock: serializing entries[] is safe because the worker never
+    * touches entries[] (it only reads/writes queue and results), and
+    * every main-thread caller that mutates entries[] is mutually
+    * exclusive with flush by virtue of running on the same thread.
+    * Holding the mutex here would block the worker for the full JSON
+    * write — pointless on storage that can stutter for tens of ms. */
    if (dp_index_save_json(idx))
       idx->dirty = false;
 }
