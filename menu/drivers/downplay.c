@@ -116,6 +116,12 @@ typedef struct
     * time to the threshold so the FIRST probe fires on the same frame
     * the row becomes selected, not 250 ms later. */
    float            probe_throttle_acc;
+   /* Cached art state for the row drawer's truncation gate.  Source of
+    * truth lives in the metadata index; this mirror is updated at scan
+    * time and at the streaming-probe transition sites in
+    * downplay_drive_system_thumbnails so the per-frame draw path
+    * doesn't have to call back into the index module per row. */
+   enum downplay_art_state art_state;
 } downplay_rom_t;
 
 /* One row in the recents view.  pl_idx is the entry's index in
@@ -385,6 +391,15 @@ struct downplay_handle_s
     * drive function handles the sentinel naturally (SIZE_MAX exceeds
     * any rom_count). */
    size_t              thumb_prev_selection;
+
+   /* Right-pane preview fade-in.  When the texture being drawn changes
+    * (selection moved, async load completed, missing→ok retry hit), we
+    * restart a 120 ms smoothstep fade so art doesn't pop in.  No cross-
+    * fade — the previous texture vanishes the frame the new one starts
+    * fading.  preview_last_tex is the comparison key; fade_started_us
+    * is the wall-clock origin (cpu_features_get_time_usec). */
+   uintptr_t           preview_last_tex;
+   retro_time_t        preview_fade_started_us;
 
    /* Cached "Resume <Game>" availability for the launcher's TOP view.
     * Refreshed on rebuild_lists; if true, a Resume row is prepended
@@ -890,6 +905,12 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
           * MISSING frame on this row probes immediately rather than
           * waiting for the throttle to fill up. */
          roms[count].probe_throttle_acc = 0.25f;
+         /* art_state is seeded from the persisted index after
+          * downplay_index_finish_scan in downplay_open_system, and
+          * advanced at the AVAILABLE/MISSING transition sites in
+          * downplay_drive_system_thumbnails.  UNKNOWN here keeps the
+          * row at full width until one of those paths runs. */
+         roms[count].art_state = DP_ART_UNKNOWN;
          count++;
       }
    }
@@ -1397,6 +1418,10 @@ static void downplay_save_picker_dispose(void *user, void *side)
    (void)side;
    downplay_save_picker_free(dp);
    downplay_refresh_ingame_actions(dp);
+   /* Drop the right-pane fade key: the next two-pane view should fade
+    * its first texture in from zero, not skip the fade because the
+    * GPU happened to recycle a texture handle we still had cached. */
+   dp->preview_last_tex = 0;
 }
 
 static void downplay_open_recents(downplay_handle_t *dp)
@@ -1435,6 +1460,10 @@ static void downplay_system_dispose(void *user, void *side)
       downplay_index_close(dp->current_index);
       dp->current_index = NULL;
    }
+   /* See save_picker_dispose: clear the right-pane fade key so the
+    * next view's first texture restarts the smoothstep from alpha 0
+    * even if the GPU recycles a previously-seen handle. */
+   dp->preview_last_tex = 0;
 }
 
 /* Drill into a system's ROM list.  No-op when sys_idx is out of
@@ -1491,6 +1520,21 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
                (time_t)dp->roms[i].mtime, dp->roms[i].size);
       }
       downplay_index_finish_scan(dp->current_index);
+
+      /* Seed each row's cached art_state from the persisted index so the
+       * row drawer's truncation gate has something to go on before any
+       * row has been hovered.  Rows whose entries aren't yet matched
+       * stay UNKNOWN (the default), which keeps them at full width. */
+      for (i = 0; i < dp->rom_count; i++)
+      {
+         const char *base = path_basename(dp->roms[i].full_path);
+         downplay_index_record_t rec;
+         if (!base || !*base)
+            continue;
+         if (downplay_index_lookup(dp->current_index, base,
+                  (time_t)dp->roms[i].mtime, dp->roms[i].size, &rec))
+            dp->roms[i].art_state = rec.art_state;
+      }
    }
 
    /* Thumbnail path resolver: alloc once per handle lifetime.
@@ -4202,20 +4246,24 @@ enum downplay_preview_scale
    DOWNPLAY_PREVIEW_SCALE_INTEGER
 };
 
-static float DP_COLOR_PREVIEW_PLACEHOLDER[16] = {
-   1.0f, 1.0f, 1.0f, 0.06f,   1.0f, 1.0f, 1.0f, 0.06f,
-   1.0f, 1.0f, 1.0f, 0.06f,   1.0f, 1.0f, 1.0f, 0.06f
-};
+/* Smoothstep fade duration for right-pane art changes (in microseconds).
+ * 120 ms feels close to LessUI's 100 ms but a touch softer at our larger
+ * art sizes; below ~80 ms the eye reads it as a hard pop. */
+#define DP_PREVIEW_FADE_US 120000
 
 static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L,
+      const downplay_layout_t *L, downplay_handle_t *dp,
       uintptr_t tex, unsigned texture_w, unsigned texture_h,
       enum downplay_preview_scale scale)
 {
    int pane_left   = (int)L->vid_w / 2;
    int pane_right  = (int)L->vid_w - L->margin_x;
-   int pane_top    = L->margin_y + L->row_h + (int)(16.0f * L->scale);
-   int pane_bottom = (int)L->vid_h - L->margin_y - L->row_h;
+   /* Symmetric 16*scale gap above the row 0 / status-pill band and below
+    * the footer-hint band so the art reads as floating in the middle of
+    * the chrome rather than crowding either edge. */
+   int pane_gap    = (int)(16.0f * L->scale);
+   int pane_top    = L->margin_y + L->row_h + pane_gap;
+   int pane_bottom = (int)L->vid_h - L->margin_y - L->row_h - pane_gap;
    int pane_w      = pane_right  - pane_left;
    int pane_h      = pane_bottom - pane_top;
    int img_w       = 0;
@@ -4223,52 +4271,58 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    int img_x;
    int img_y;
    bool fits_natively;
+   retro_time_t now;
+   float        t;
+   float        alpha;
+   float        color[16];
+   uintptr_t    tex_local;
+   int          i;
 
+   /* No texture → nothing to show.  We deliberately don't draw a
+    * placeholder: legitimately art-less rows (homebrew, MISSING after
+    * a probe) and rows mid-resolve all want a clean empty pane. */
+   if (!tex || !texture_w || !texture_h)
+   {
+      /* Reset fade state so the *next* texture starts fading from 0. */
+      dp->preview_last_tex = 0;
+      return;
+   }
    if (pane_w < L->row_h || pane_h < L->row_h)
       return;
 
-   if (tex && texture_w && texture_h)
-   {
-      fits_natively = (texture_w <= (unsigned)pane_w
-                   && texture_h <= (unsigned)pane_h);
+   fits_natively = (texture_w <= (unsigned)pane_w
+                && texture_h <= (unsigned)pane_h);
 
-      if (scale == DOWNPLAY_PREVIEW_SCALE_INTEGER && fits_natively)
-      {
-         /* Largest integer multiplier where both axes still fit. */
-         int mx = pane_w / (int)texture_w;
-         int my = pane_h / (int)texture_h;
-         int m  = mx < my ? mx : my;
-         if (m < 1)
-            m = 1;
-         img_w = (int)texture_w * m;
-         img_h = (int)texture_h * m;
-      }
-      else if (scale == DOWNPLAY_PREVIEW_SCALE_NATIVE && fits_natively)
-      {
-         img_w = (int)texture_w;
-         img_h = (int)texture_h;
-      }
-      else
-      {
-         /* Aspect-fit (FIT, or NATIVE/INTEGER fallback when too big).
-          * Cross-product comparison avoids float math + zero-div. */
-         if ((unsigned)pane_w * texture_h <= (unsigned)pane_h * texture_w)
-         {
-            img_w = pane_w;
-            img_h = (int)((unsigned)pane_w * texture_h / texture_w);
-         }
-         else
-         {
-            img_h = pane_h;
-            img_w = (int)((unsigned)pane_h * texture_w / texture_h);
-         }
-      }
+   if (scale == DOWNPLAY_PREVIEW_SCALE_INTEGER && fits_natively)
+   {
+      /* Largest integer multiplier where both axes still fit. */
+      int mx = pane_w / (int)texture_w;
+      int my = pane_h / (int)texture_h;
+      int m  = mx < my ? mx : my;
+      if (m < 1)
+         m = 1;
+      img_w = (int)texture_w * m;
+      img_h = (int)texture_h * m;
+   }
+   else if (scale == DOWNPLAY_PREVIEW_SCALE_NATIVE && fits_natively)
+   {
+      img_w = (int)texture_w;
+      img_h = (int)texture_h;
    }
    else
    {
-      /* Placeholder: square at min(pane_w, pane_h), gives a hint of
-       * "preview goes here" without claiming a particular aspect. */
-      img_w = img_h = (pane_w < pane_h) ? pane_w : pane_h;
+      /* Aspect-fit (FIT, or NATIVE/INTEGER fallback when too big).
+       * Cross-product comparison avoids float math + zero-div. */
+      if ((unsigned)pane_w * texture_h <= (unsigned)pane_h * texture_w)
+      {
+         img_w = pane_w;
+         img_h = (int)((unsigned)pane_w * texture_h / texture_w);
+      }
+      else
+      {
+         img_h = pane_h;
+         img_w = (int)((unsigned)pane_h * texture_w / texture_h);
+      }
    }
    if (img_w < 1 || img_h < 1)
       return;
@@ -4276,27 +4330,48 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    img_x = pane_left + (pane_w - img_w) / 2;
    img_y = pane_top  + (pane_h - img_h) / 2;
 
-   if (tex)
+   /* Restart fade whenever the texture identity changes.  Selection
+    * moves, async loads, MISSING→OK retries — all hit this branch.
+    * One timestamp read per frame: reusing `now` for the fade origin
+    * gives the first frame `t == 0` exactly, so the alpha < 1/255
+    * guard below skips its draw cleanly. */
+   now = cpu_features_get_time_usec();
+   if (tex != dp->preview_last_tex)
    {
-      /* DP_COLOR_PILL_LIGHT is pure white (1,1,1,1) — gfx_display_draw_quad
-       * multiplies the texture sample by this colour, so passing white
-       * is the no-tint identity (texture renders verbatim).  Local
-       * uintptr_t copy because the function signature is non-const. */
-      uintptr_t tex_local = tex;
-      gfx_display_draw_quad(p_disp, userdata,
-            L->vid_w, L->vid_h,
-            img_x, img_y, (unsigned)img_w, (unsigned)img_h,
-            L->vid_w, L->vid_h,
-            DP_COLOR_PILL_LIGHT, &tex_local);
+      dp->preview_last_tex        = tex;
+      dp->preview_fade_started_us = now;
    }
-   else
-      downplay_draw_rect(p_disp, userdata, L,
-            img_x, img_y, img_w, img_h, DP_COLOR_PREVIEW_PLACEHOLDER);
+   t   = (float)(now - dp->preview_fade_started_us)
+       / (float)DP_PREVIEW_FADE_US;
+   if (t < 0.0f) t = 0.0f;
+   if (t > 1.0f) t = 1.0f;
+   alpha = t * t * (3.0f - 2.0f * t);
+   /* Drop the draw at sub-pixel alpha — saves the GPU a fully-transparent
+    * quad on the very first frame after a selection change. */
+   if (alpha < (1.0f / 255.0f))
+      return;
+
+   /* Local color buffer: pure white (the no-tint identity for textured
+    * quads) with the alpha component scaled by the fade.  Can't mutate
+    * DP_COLOR_PILL_LIGHT — it's shared with the row pill draws. */
+   for (i = 0; i < 4; i++)
+   {
+      color[i * 4 + 0] = 1.0f;
+      color[i * 4 + 1] = 1.0f;
+      color[i * 4 + 2] = 1.0f;
+      color[i * 4 + 3] = alpha;
+   }
+   tex_local = tex;
+   gfx_display_draw_quad(p_disp, userdata,
+         L->vid_w, L->vid_h,
+         img_x, img_y, (unsigned)img_w, (unsigned)img_h,
+         L->vid_w, L->vid_h,
+         color, &tex_local);
 }
 
 static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       const downplay_layout_t *L, uintptr_t cap_tex,
-      const downplay_handle_t *dp)
+      downplay_handle_t *dp)
 {
    size_t   i;
    /* INGAME draws a left-anchored title pill on the top row, so the
@@ -4323,6 +4398,21 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    size_t   row_idx;
    int      row_y;
    int      row_w;
+   /* Two-pane truncation gate.  In SYSTEM and SAVE_PICKER views, an
+    * unselected row whose art we *know* is on disk reserves the right
+    * half of the screen for the preview; everything else (selected
+    * row, art-pending, art-missing, art-less view) keeps full width.
+    * Per-row decision so a homebrew ROM next to a matched ROM doesn't
+    * truncate prematurely while we're still probing the homebrew, and
+    * so the selected row visibly overlaps its own image like LessUI. */
+   bool     art_pane_active = (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+                            || dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER);
+   int      pane_left       = (int)L->vid_w / 2;
+   /* One row_text_indent of breathing room between the truncated label
+    * and the image pane.  Asymmetric vs the full-width row_max_w (which
+    * doesn't subtract this) by design: the image is drawn right next to
+    * where the truncated text ends, so we want a visible gap there. */
+   int      row_max_w_art   = pane_left - L->margin_x - L->row_text_indent;
    /* Top row shares its line with the status pill — shorten its max
     * width by the pill width plus a margin's gap so a long title
     * truncates instead of overlapping.  Skipped in INGAME because
@@ -4334,6 +4424,8 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             - L->margin_x);
    if (top_row_max_w < 0)
       top_row_max_w = 0;
+   if (row_max_w_art < 0)
+      row_max_w_art = 0;
 
    if (dp->total_rows > visible && dp->nav.selection >= visible)
    {
@@ -4342,34 +4434,23 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
          scroll = dp->total_rows - visible;
    }
 
-   for (i = 0; i < visible && scroll + i < dp->total_rows; i++)
-   {
-      row_idx = scroll + i;
-      row_y   = list_top + (int)(i * (size_t)L->row_h);
-      row_w   = (i == 0) ? top_row_max_w : row_max_w;
-      downplay_draw_list_row(p_disp, userdata, dp->font,
-            dp->font_centre_offset, L, cap_tex,
-            list_x, row_y, row_w,
-            downplay_row_label(dp, row_idx),
-            row_idx == dp->nav.selection);
-   }
-
-   /* Right-pane preview: SAVE_PICKER shows the selected save's
-    * thumbnail.  SYSTEM shows box art for the selected ROM (loaded
-    * asynchronously via gfx_thumbnail_request_stream, see
-    * downplay_drive_system_thumbnails).  Both share the same right-
-    * pane geometry.
+   /* Right-pane preview FIRST so it sits *under* the row pills/text.
+    * The selected row's full-width pill deliberately overlaps the
+    * image area (LessUI parity); for that overlap to read as the pill
+    * sitting on top of the art, the art has to be the bottom layer.
     *
-    * For SYSTEM we feed the gfx_thumbnail_t's texture/dims into
-    * downplay_draw_right_preview; if the thumbnail isn't loaded yet
-    * (status != AVAILABLE) we pass tex=0, which the helper renders as
-    * the placeholder rect.  Box art is photographic-style — FIT
-    * scaling smooths the typical mismatch with the right pane. */
+    * SAVE_PICKER shows the selected save's thumbnail.  SYSTEM shows
+    * box art for the selected ROM (loaded asynchronously via
+    * gfx_thumbnail_request_stream, see
+    * downplay_drive_system_thumbnails).  Both share the same right-
+    * pane geometry and the helper's smoothstep fade-in.  When the
+    * thumbnail isn't loaded yet (status != AVAILABLE) we pass tex=0,
+    * which the helper draws as an empty pane (no placeholder). */
    if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
          && dp->nav.selection < dp->save_picker_count)
    {
       const downplay_save_entry_t *e = &dp->save_picker[dp->nav.selection];
-      downplay_draw_right_preview(p_disp, userdata, L,
+      downplay_draw_right_preview(p_disp, userdata, L, dp,
             e->thumb_tex, e->thumb_w, e->thumb_h,
             DOWNPLAY_PREVIEW_SCALE_INTEGER);
    }
@@ -4388,8 +4469,45 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
          w   = t->width;
          h   = t->height;
       }
-      downplay_draw_right_preview(p_disp, userdata, L, tex, w, h,
+      downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
             DOWNPLAY_PREVIEW_SCALE_FIT);
+   }
+   else
+   {
+      /* Single-pane view (TOP, RECENTS, INGAME): clear the fade tracker
+       * so re-entering a two-pane view starts fresh from alpha 0. */
+      dp->preview_last_tex = 0;
+   }
+
+   /* Rows on top of the preview so the selected row's full-width pill
+    * visibly covers the art it overlaps. */
+   for (i = 0; i < visible && scroll + i < dp->total_rows; i++)
+   {
+      bool selected;
+      bool row_has_art = false;
+
+      row_idx = scroll + i;
+      row_y   = list_top + (int)(i * (size_t)L->row_h);
+      row_w   = (i == 0) ? top_row_max_w : row_max_w;
+      selected = (row_idx == dp->nav.selection);
+
+      if (art_pane_active && !selected)
+      {
+         if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+               && dp->roms && row_idx < dp->rom_count)
+            row_has_art = (dp->roms[row_idx].art_state == DP_ART_OK);
+         else if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
+               && row_idx < dp->save_picker_count)
+            row_has_art = (dp->save_picker[row_idx].thumb_tex != 0);
+      }
+      if (row_has_art && row_w > row_max_w_art)
+         row_w = row_max_w_art;
+
+      downplay_draw_list_row(p_disp, userdata, dp->font,
+            dp->font_centre_offset, L, cap_tex,
+            list_x, row_y, row_w,
+            downplay_row_label(dp, row_idx),
+            selected);
    }
 }
 
@@ -4583,7 +4701,10 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
    if (dp->current_index)
    {
       if (status == GFX_THUMBNAIL_STATUS_AVAILABLE)
+      {
          downplay_index_set_art_state(dp->current_index, base, DP_ART_OK);
+         dp->roms[sel].art_state = DP_ART_OK;
+      }
       else if (status == GFX_THUMBNAIL_STATUS_MISSING && db_name && *db_name)
       {
          downplay_index_record_t rec;
@@ -4603,6 +4724,7 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
             downplay_index_set_art_state(dp->current_index, base,
                   DP_ART_MISSING);
          }
+         dp->roms[sel].art_state = DP_ART_MISSING;
       }
    }
 }
@@ -5499,6 +5621,12 @@ static void downplay_menu_context_destroy(void *data)
    /* Picker thumbnails are GPU resources; drop them on context loss
     * so they're not dangling handles after a renderer reset. */
    downplay_save_picker_free(dp);
+   /* Right-pane fade key holds a uintptr_t the GPU may recycle on the
+    * upcoming context_reset.  Clearing it here guarantees the next
+    * texture restarts the smoothstep from alpha 0 — the dispose hooks
+    * cover the in-stack cases, but context_destroy fires regardless of
+    * whether SYSTEM/SAVE_PICKER are currently on the nav stack. */
+   dp->preview_last_tex = 0;
    /* Pop everything down to the ground TOP frame.  Settings frames
     * hold lists whose row data may include pointers into the core
     * options manager (RA-owned, possibly torn down before us); a
