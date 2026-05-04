@@ -36,6 +36,12 @@ $CC $CFLAGS $INC \
     test_metadata_disambig.c ../downplay_metadata_disambig.c \
     -o test_metadata_disambig
 
+# --- display-name cleaner ---
+echo "== building test_display_name"
+$CC $CFLAGS $INC \
+    test_display_name.c ../downplay_display_name.c \
+    -o test_display_name
+
 # --- run all built tests ---
 fail=0
 for bin in test_*; do

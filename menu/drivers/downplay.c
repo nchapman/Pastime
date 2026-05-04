@@ -54,6 +54,7 @@
 #include "../../verbosity.h"
 
 #include "../../downplay/downplay_cores.h"
+#include "../../downplay/downplay_display_name.h"
 #include "../../downplay/downplay_metadata.h"
 #include "../../downplay/downplay_nav.h"
 #include "../../downplay/downplay_setup.h"
@@ -102,7 +103,8 @@ typedef struct
  * avoid a callback racing onto freed memory. */
 typedef struct
 {
-   char            *display_name;   /* basename minus extension */
+   char            *display_name;   /* cleaned: parens/brackets stripped */
+   char            *sort_key;       /* lowercased + leading-article stripped */
    char            *full_path;
    int64_t          mtime;          /* st_mtime, 0 on stat failure */
    int64_t          size;           /* st_size,  0 on stat failure */
@@ -133,6 +135,8 @@ typedef struct
    char  *display_name;
    size_t pl_idx;
 } downplay_recent_t;
+/* No sort_key on recents — they're presented in chronological order
+ * straight from g_defaults.content_history, never alphabetized. */
 
 /* enum downplay_view, dp_nav_frame_t, dp_nav_state_t and the
  * dp_nav_* helpers all live in downplay/downplay_nav.h (included
@@ -535,26 +539,7 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
    if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
    {
       if (dp->roms && row < dp->rom_count)
-      {
-         /* Prefer the canonical label from the metadata index when the
-          * cached match is still valid (mtime/size unchanged).  Fall
-          * back to the filename-minus-extension on miss — the
-          * background pump fills it in within a few frames. */
-         if (dp->current_index)
-         {
-            downplay_index_record_t rec;
-            const char *base = path_basename(dp->roms[row].full_path);
-            if (base && *base
-                  && downplay_index_lookup(
-                        (downplay_index_t*)dp->current_index,
-                        base,
-                        (time_t)dp->roms[row].mtime,
-                        dp->roms[row].size, &rec)
-                  && rec.label)
-               return rec.label;
-         }
          return dp->roms[row].display_name;
-      }
       return "";
    }
 
@@ -699,6 +684,7 @@ static void downplay_roms_free(downplay_rom_t *roms, size_t count)
    {
       gfx_thumbnail_reset(&roms[i].thumbnail);
       free(roms[i].display_name);
+      free(roms[i].sort_key);
       free(roms[i].full_path);
    }
    free(roms);
@@ -829,7 +815,9 @@ static int downplay_rom_cmp(const void *a, const void *b)
 {
    const downplay_rom_t *ra = (const downplay_rom_t*)a;
    const downplay_rom_t *rb = (const downplay_rom_t*)b;
-   return strcasecmp(ra->display_name, rb->display_name);
+   const char *ka = ra->sort_key ? ra->sort_key : ra->display_name;
+   const char *kb = rb->sort_key ? rb->sort_key : rb->display_name;
+   return strcmp(ka, kb);
 }
 
 /* Scan one system folder for ROMs.  Top-level files only (subfolders
@@ -880,16 +868,34 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
       }
       {
          char       *path_dup;
+         char       *sort_dup;
+         char        clean[NAME_MAX_LENGTH];
+         char        sort_buf[NAME_MAX_LENGTH];
          struct stat st;
-         if (!(display = strdup(base)))
+         /* Strip No-Intro / Redump trailing tags here so the user sees
+          * "Super Mario Bros. 3" not "Super Mario Bros. 3 (USA) (Rev A)".
+          * sort_key folds case + drops a leading article so "The Legend
+          * of Zelda" sorts under L.  See downplay_display_name.h. */
+         downplay_display_name_clean(base, clean, sizeof(clean));
+         if (!*clean)
+            continue;
+         downplay_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
+         if (!(display = strdup(clean)))
             break;
-         if (!(path_dup = strdup(full)))
+         if (!(sort_dup = strdup(sort_buf)))
          {
             free(display);
             break;
          }
+         if (!(path_dup = strdup(full)))
+         {
+            free(display);
+            free(sort_dup);
+            break;
+         }
          memset(&roms[count], 0, sizeof(roms[count]));
          roms[count].display_name = display;
+         roms[count].sort_key     = sort_dup;
          roms[count].full_path    = path_dup;
          /* mtime/size pin the index entry; mismatch invalidates the
           * cached label/match.  stat failure leaves both 0 — the index
@@ -1023,8 +1029,14 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
       else
          continue;
 
-      if (!(dup = strdup(src)))
-         continue;
+      {
+         char clean[NAME_MAX_LENGTH];
+         downplay_display_name_clean(src, clean, sizeof(clean));
+         if (!*clean)
+            continue;
+         if (!(dup = strdup(clean)))
+            continue;
+      }
       out[count].display_name = dup;
       out[count].pl_idx       = i;
       count++;
