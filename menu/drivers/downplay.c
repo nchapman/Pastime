@@ -2384,16 +2384,55 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
     * outer left/right margins), not of the raw screen width.  At
     * 100% the block fills from margin_x to vid_w-margin_x — i.e.
     * full width with the same margins the launcher uses.  Smaller
-    * values let narrower lists like Options stay visually centred. */
+    * values let narrower lists like Options stay visually centred.
+    *
+    * Nav-only lists (no row carries a right-column value) ignore
+    * width_pct: with text left-aligned and nothing on the right,
+    * a fixed-width block leaves all visible text hugging its left
+    * edge.  Auto-fit the block to the longest title's natural
+    * width + indent padding, then centre — so the visible rows
+    * read as a centred block of text on the screen. */
    {
-      int avail_w;
+      int    avail_w;
+      bool   any_value = false;
+      size_t k;
+      for (k = 0; k < S->row_count; k++)
+      {
+         const downplay_settings_row_t *rr = &S->rows[k];
+         if (rr->values && rr->values_count > 0)
+         {
+            any_value = true;
+            break;
+         }
+      }
       width_pct  = S->width_pct ? S->width_pct : 60;
       if (width_pct > 100)
          width_pct = 100;
       avail_w   = (int)L->vid_w - 2 * L->margin_x;
       if (avail_w < 0)
          avail_w = 0;
-      block_w   = avail_w * (int)width_pct / 100;
+      if (any_value)
+         block_w = avail_w * (int)width_pct / 100;
+      else
+      {
+         int max_title_w = 0;
+         for (k = 0; k < S->row_count; k++)
+         {
+            const char *t = S->rows[k].title;
+            int         w;
+            if (!t || !*t)
+               continue;
+            w = font_driver_get_message_width(row_font, t,
+                  (unsigned)strlen(t), 1.0f);
+            if (w > max_title_w)
+               max_title_w = w;
+         }
+         block_w = max_title_w + 2 * L->row_text_indent;
+         if (block_w < L->settings_row_h)
+            block_w = L->settings_row_h;
+         if (block_w > avail_w)
+            block_w = avail_w;
+      }
       block_x   = ((int)L->vid_w - block_w) / 2;
    }
 
