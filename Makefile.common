@@ -1089,6 +1089,8 @@ ifeq ($(HAVE_MENU), 1)
       OBJ += downplay/downplay_defaults.o
       OBJ += downplay/downplay_bootstrap.o
       OBJ += downplay/downplay_nav.o
+      OBJ += downplay/downplay_metadata.o
+      OBJ += downplay/downplay_metadata_disambig.o
       DEFINES += -DHAVE_DOWNPLAY
    endif
 

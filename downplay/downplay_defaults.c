@@ -67,6 +67,38 @@ bool downplay_paths_get_root(char *out, size_t out_len)
 #endif
 }
 
+bool downplay_paths_get_index_root(char *out, size_t out_len)
+{
+   const char *playlists = g_defaults.dirs[DEFAULT_DIR_PLAYLIST];
+   char        ra_root[PATH_MAX_LENGTH];
+   char        downplay_dir[PATH_MAX_LENGTH];
+
+   if (!out || out_len == 0)
+      return false;
+
+   /* Anchor off the playlists dir, which every platform populates and
+    * which always sits at <ra_root>/playlists/.  path_parent_dir mutates
+    * its argument; copy first so we don't disturb g_defaults. */
+   if (!playlists || !*playlists)
+      return false;
+   strlcpy(ra_root, playlists, sizeof(ra_root));
+   path_parent_dir(ra_root, strlen(ra_root));
+   if (!*ra_root)
+      return false;
+
+   fill_pathname_join_special(downplay_dir, ra_root, "downplay",
+         sizeof(downplay_dir));
+   fill_pathname_join_special(out, downplay_dir, "index", out_len);
+
+   /* Create the parent and leaf if missing.  path_mkdir is idempotent and
+    * creates intermediate components. */
+   if (!path_is_directory(downplay_dir))
+      path_mkdir(downplay_dir);
+   if (!path_is_directory(out))
+      path_mkdir(out);
+   return true;
+}
+
 /* True iff the current setting value is "either empty, or exactly the
  * upstream default RA computed for this platform" — i.e., the user has
  * not provided their own override.  Equality with the RA default lets
@@ -129,6 +161,22 @@ void downplay_defaults_apply(void)
    settings->bools.savestate_auto_save        = true;
    settings->bools.savestate_auto_load        = true;
    settings->bools.savestate_thumbnail_enable = true;
+
+   /* Box-art on demand.  RA defaults this to false ("download manually
+    * via the in-menu task"), but Downplay's launcher fires the load on
+    * row hover — without on-demand, the resolver only checks local
+    * disk, every fresh ROM 404s into the placeholder rect, and the
+    * user has no visible affordance to fix it.  Applied unconditionally
+    * for the same reason as savestate_thumbnail_enable above: the
+    * Downplay UX depends on it being on, and we can't tell "user
+    * disabled" from "never set". */
+   settings->bools.network_on_demand_thumbnails = true;
+
+   /* Log to file by default.  On Android, post-init RARCH_LOG goes to
+    * stderr which is invisible — without this, every diagnostic we
+    * emit (and every upstream RA warning we'd want to see) just
+    * vanishes.  Cheap; the file gets rotated by RA itself. */
+   settings->bools.log_to_file = true;
 
    /* Frontend video default: Screen Scaling = Aspect (core PAR,
     * fractional fill).  Integer scaling here would leave thick borders
@@ -224,6 +272,20 @@ void downplay_defaults_apply(void)
          fill_pathname_join_special(sub, root, "States", sizeof(sub));
          dir_set(RARCH_DIR_SAVESTATE, sub);
       }
+   }
+
+   /* Box-art / thumbnails landing pad.  Lives under the user-facing
+    * Downplay/ tree because (a) PNGs are user-visible data they may want
+    * to rsync with their library, and (b) the libretro-thumbnails
+    * directory layout (<system>/Named_Boxarts/<label>.png) is portable
+    * across any RA-compatible tooling.  Stock RA defaults to
+    * <config>/thumbnails/ — overlay only when that's still the value. */
+   if (downplay_should_overlay(settings->paths.directory_thumbnails,
+            g_defaults.dirs[DEFAULT_DIR_THUMBNAILS]))
+   {
+      fill_pathname_join_special(sub, root, "Thumbnails", sizeof(sub));
+      strlcpy(settings->paths.directory_thumbnails, sub,
+            sizeof(settings->paths.directory_thumbnails));
    }
 
    /* Boot log only.  defaults_apply now runs on every cfg reload

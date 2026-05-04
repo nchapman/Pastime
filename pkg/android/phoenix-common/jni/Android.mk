@@ -68,7 +68,9 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
 							$(RARCH_DIR)/downplay/downplay_defaults.c \
 							$(RARCH_DIR)/downplay/downplay_bootstrap.c \
 							$(RARCH_DIR)/downplay/downplay_setup.c \
-							$(RARCH_DIR)/downplay/downplay_nav.c
+							$(RARCH_DIR)/downplay/downplay_nav.c \
+							$(RARCH_DIR)/downplay/downplay_metadata.c \
+							$(RARCH_DIR)/downplay/downplay_metadata_disambig.c
 endif
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)

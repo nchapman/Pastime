@@ -33,7 +33,9 @@ The build system is a hand-rolled `./configure` + GNU make (scripts in `qb/`), n
 
 ## Tests
 
-There is no unit-test suite for the main codebase. `tests-other/` contains integration-style assets (`.ratst` replay/test files, `.cfg` input fixtures) used to exercise input/replay paths — these are run by external CI infrastructure, not via a `make test` target. Don't invent a `make check` invocation; if you need to verify changes, build and run `./retroarch -v` against a core.
+**Downplay-owned code has unit tests** under `downplay/tests/`. Run them with `bash downplay/tests/run_tests.sh` — each binary builds standalone via `cc` against the real production source (no carbon copies), with a small `DOWNPLAY_*_TEST_BUILD` define swapping heavy RA dependencies (verbosity, etc.) for test stubs. Tests use a tiny in-file framework (`ASSERT_TRUE` / `ASSERT_EQ` / `RUN_TEST`); add new tests here as new Downplay-owned modules land. Coverage today: `downplay_nav.c` (full), `downplay_metadata_disambig.c` (resolver — table + fallback semantics). The heavier metadata paths (libretrodb queries, JSON I/O, HTTP downloads, gfx_thumbnail integration) are intentionally not unit-tested; they're verified end-to-end on Android via `pkg/android/build-and-install.sh`.
+
+The **upstream RA codebase** has no unit tests. `tests-other/` contains integration-style assets (`.ratst` replay/test files, `.cfg` input fixtures) used to exercise input/replay paths — those are run by external CI infrastructure, not via a `make test` target. Don't invent a `make check` invocation for upstream code; if you need to verify changes, build and run `./retroarch -v` against a core.
 
 ## Architecture overview
 

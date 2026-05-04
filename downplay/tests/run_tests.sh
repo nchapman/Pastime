@@ -30,6 +30,12 @@ $CC $CFLAGS $DEFS $INC \
     test_nav.c ../downplay_nav.c \
     -o test_nav
 
+# --- metadata disambiguation table ---
+echo "== building test_metadata_disambig"
+$CC $CFLAGS $INC \
+    test_metadata_disambig.c ../downplay_metadata_disambig.c \
+    -o test_metadata_disambig
+
 # --- run all built tests ---
 fail=0
 for bin in test_*; do

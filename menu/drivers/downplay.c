@@ -54,6 +54,7 @@
 #include "../../verbosity.h"
 
 #include "../../downplay/downplay_cores.h"
+#include "../../downplay/downplay_metadata.h"
 #include "../../downplay/downplay_nav.h"
 #include "../../downplay/downplay_setup.h"
 
@@ -74,21 +75,47 @@
 
 /* One Roms/<folder> that conformed to the "Display Name (core_ident)"
  * convention.  Folders without that suffix are dropped during scan, so
- * by the time a downplay_system_t exists, both fields are non-empty.
- * full_path is the absolute folder path (used to scan its contents on
- * drill-in). */
+ * by the time a downplay_system_t exists, display_name + core_ident +
+ * full_path are non-empty.  db_name is the resolved libretro-thumbnails
+ * system name (e.g. "Nintendo - Super Nintendo Entertainment System"),
+ * used to locate the .rdb and the thumbnails subdir.  May be NULL when
+ * the user's folder name doesn't hit the disambiguation table AND no
+ * matching core_info entry is loaded. */
 typedef struct
 {
    char *display_name;
    char *core_ident;
    char *full_path;
+   char *db_name;
 } downplay_system_t;
 
-/* One ROM file inside a system folder, expanded for the system view. */
+/* One ROM file inside a system folder, expanded for the system view.
+ *
+ * mtime / size are stat()'d once at scan time and used as the index's
+ * validity stamps — drop a different ROM at the same path and the
+ * cached label/match invalidate automatically.
+ *
+ * thumbnail is owned by this struct.  Initialized to blank in scan,
+ * loaded async on hover via gfx_thumbnail_request_stream, freed by
+ * gfx_thumbnail_reset in downplay_roms_free.  Callers MUST have
+ * called gfx_thumbnail_cancel_pending_requests() before any reset to
+ * avoid a callback racing onto freed memory. */
 typedef struct
 {
-   char *display_name;   /* basename minus extension */
-   char *full_path;
+   char            *display_name;   /* basename minus extension */
+   char            *full_path;
+   int64_t          mtime;          /* st_mtime, 0 on stat failure */
+   int64_t          size;           /* st_size,  0 on stat failure */
+   gfx_thumbnail_t  thumbnail;
+   /* Rate-limiter for the post-stream "did our HTTP boxart download
+    * land yet?" probe.  Without this we'd `path_is_valid()` twice per
+    * frame for as long as the user lingers on a missing-art row —
+    * 240 stat() calls/sec at 120Hz against FUSE-backed /sdcard.
+    * Accumulates `gfx_animation_t.delta_time`; the probe runs (and
+    * the timer resets) once it crosses ~250 ms.  Initialised at scan
+    * time to the threshold so the FIRST probe fires on the same frame
+    * the row becomes selected, not 250 ms later. */
+   float            probe_throttle_acc;
 } downplay_rom_t;
 
 /* One row in the recents view.  pl_idx is the entry's index in
@@ -337,6 +364,28 @@ struct downplay_handle_s
    downplay_save_entry_t save_picker[DOWNPLAY_MAX_SAVE_ENTRIES];
    size_t              save_picker_count;
 
+   /* Per-system metadata index.  Open while view == DOWNPLAY_VIEW_SYSTEM,
+    * NULL otherwise.  Holds an open libretrodb handle for cheap per-
+    * file matching; flushes JSON to <RA_config>/downplay/index/ on
+    * close. */
+   downplay_index_t   *current_index;
+
+   /* Path-resolution state for box-art thumbnails.  Reused across all
+    * SYSTEM-view rows (only the content label changes per row).
+    * Allocated lazily on first SYSTEM enter; never freed once
+    * allocated — its embedded buffers reset cheaply via
+    * gfx_thumbnail_path_reset. */
+   gfx_thumbnail_path_data_t *thumb_path_data;
+   /* Index of the row whose thumbnail is currently loading or loaded.
+    * On selection change we reset the previous row's thumbnail so
+    * scrolling through a 200-ROM folder never accumulates more than
+    * one resident texture.  SIZE_MAX is the explicit "no previous yet"
+    * sentinel — 0 wouldn't work because `thumb_prev_selection != 0`
+    * is a valid post-init state.  The `prev < rom_count` guard in the
+    * drive function handles the sentinel naturally (SIZE_MAX exceeds
+    * any rom_count). */
+   size_t              thumb_prev_selection;
+
    /* Cached "Resume <Game>" availability for the launcher's TOP view.
     * Refreshed on rebuild_lists; if true, a Resume row is prepended
     * above Recents.  Stores the most-recent recents playlist index so
@@ -471,7 +520,26 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
    if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
    {
       if (dp->roms && row < dp->rom_count)
+      {
+         /* Prefer the canonical label from the metadata index when the
+          * cached match is still valid (mtime/size unchanged).  Fall
+          * back to the filename-minus-extension on miss — the
+          * background pump fills it in within a few frames. */
+         if (dp->current_index)
+         {
+            downplay_index_record_t rec;
+            const char *base = path_basename(dp->roms[row].full_path);
+            if (base && *base
+                  && downplay_index_lookup(
+                        (downplay_index_t*)dp->current_index,
+                        base,
+                        (time_t)dp->roms[row].mtime,
+                        dp->roms[row].size, &rec)
+                  && rec.label)
+               return rec.label;
+         }
          return dp->roms[row].display_name;
+      }
       return "";
    }
 
@@ -597,17 +665,24 @@ static void downplay_systems_free(downplay_system_t *systems, size_t count)
       free(systems[i].display_name);
       free(systems[i].core_ident);
       free(systems[i].full_path);
+      free(systems[i].db_name);
    }
    free(systems);
 }
 
+/* Free a ROM array.  Cancels any in-flight thumbnail loads first, then
+ * resets each per-ROM gfx_thumbnail_t — both are required by
+ * gfx_thumbnail.h (cancel before any pending->reset sequence) to
+ * avoid the upload callback writing into freed memory. */
 static void downplay_roms_free(downplay_rom_t *roms, size_t count)
 {
    size_t i;
    if (!roms)
       return;
+   gfx_thumbnail_cancel_pending_requests();
    for (i = 0; i < count; i++)
    {
+      gfx_thumbnail_reset(&roms[i].thumbnail);
       free(roms[i].display_name);
       free(roms[i].full_path);
    }
@@ -704,7 +779,8 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
          cap     = new_cap;
       }
       {
-         char *full = strdup(raw->elems[i].data);
+         char       *full = strdup(raw->elems[i].data);
+         const char *db;
          if (!full)
          {
             free(display);
@@ -714,6 +790,14 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
          systems[count].display_name = display;
          systems[count].core_ident   = ident;
          systems[count].full_path    = full;
+         /* db_name resolution is best-effort: NULL means we don't have
+          * a libretro-thumbnails-canonical name for this folder, so
+          * matching + art look-up will be disabled for it.  The user
+          * either typed an unknown display name or the core's .info
+          * isn't loaded yet.  Survivable; recovers on next rebuild
+          * once core_info catches up. */
+         db = downplay_metadata_resolve_db_name(display, ident);
+         systems[count].db_name = db ? strdup(db) : NULL;
          count++;
       }
    }
@@ -780,7 +864,8 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          cap  = new_cap;
       }
       {
-         char *path_dup;
+         char       *path_dup;
+         struct stat st;
          if (!(display = strdup(base)))
             break;
          if (!(path_dup = strdup(full)))
@@ -788,8 +873,23 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
             free(display);
             break;
          }
+         memset(&roms[count], 0, sizeof(roms[count]));
          roms[count].display_name = display;
          roms[count].full_path    = path_dup;
+         /* mtime/size pin the index entry; mismatch invalidates the
+          * cached label/match.  stat failure leaves both 0 — the index
+          * treats 0/0 as "unknown" and forces a re-match each visit,
+          * which is fine for the rare case (e.g. transient FS error). */
+         if (stat(path_dup, &st) == 0)
+         {
+            roms[count].mtime = (int64_t)st.st_mtime;
+            roms[count].size  = (int64_t)st.st_size;
+         }
+         gfx_thumbnail_init_blank(&roms[count].thumbnail);
+         /* Pre-arm the post-stream probe throttle so the first
+          * MISSING frame on this row probes immediately rather than
+          * waiting for the throttle to fill up. */
+         roms[count].probe_throttle_acc = 0.25f;
          count++;
       }
    }
@@ -1313,30 +1413,94 @@ static void downplay_close_recents(downplay_handle_t *dp)
    dp_nav_pop(&dp->nav);
 }
 
-/* Dispose hook for the SYSTEM frame: free the loaded ROM list. */
+/* Dispose hook for the SYSTEM frame: free the loaded ROM list and
+ * close the per-system metadata index (which flushes its JSON). */
 static void downplay_system_dispose(void *user, void *side)
 {
    downplay_handle_t *dp = (downplay_handle_t*)user;
    (void)side;
+   /* Order matters: roms_free already cancels pending thumbnail
+    * requests and resets each thumbnail's texture (gfx_thumbnail.h
+    * requires cancel before reset for any in-flight load).  We then
+    * blank the path_data so set_system / set_content from a
+    * subsequent system enter start clean. */
    downplay_roms_free(dp->roms, dp->rom_count);
-   dp->roms      = NULL;
-   dp->rom_count = 0;
+   dp->roms                 = NULL;
+   dp->rom_count            = 0;
+   dp->thumb_prev_selection = SIZE_MAX;
+   if (dp->thumb_path_data)
+      gfx_thumbnail_path_reset(dp->thumb_path_data);
+   if (dp->current_index)
+   {
+      downplay_index_close(dp->current_index);
+      dp->current_index = NULL;
+   }
 }
 
 /* Drill into a system's ROM list.  No-op when sys_idx is out of
  * range.  Cursor restoration on close happens automatically — the
- * parent TOP frame's selection is preserved underneath us. */
+ * parent TOP frame's selection is preserved underneath us.
+ *
+ * Lifecycle:
+ *   1. Scan ROM filesystem (existing behaviour).
+ *   2. Open the metadata index for this system, reconcile against the
+ *      filesystem set (note_present each ROM, finish_scan to prune).
+ *   3. Initialize the thumbnail path resolver lazily (first system
+ *      enter only) and point it at the system's libretro-thumbnails
+ *      db_name.
+ *   4. Push the nav frame.
+ *
+ * Failures along the way are non-fatal — a NULL index just means no
+ * canonical labels and no art for this session, but the basic ROM list
+ * still works. */
 static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
 {
+   const downplay_system_t *sys;
+   size_t                   i;
+
    if (!dp->systems || sys_idx >= dp->system_count)
       return;
 
    downplay_roms_free(dp->roms, dp->rom_count);
-   dp->roms      = NULL;
-   dp->rom_count = 0;
-   dp->roms      = downplay_scan_roms(dp->systems[sys_idx].full_path,
-         &dp->rom_count);
+   dp->roms                 = NULL;
+   dp->rom_count            = 0;
+   dp->thumb_prev_selection = SIZE_MAX;
+
+   sys           = &dp->systems[sys_idx];
+   dp->roms      = downplay_scan_roms(sys->full_path, &dp->rom_count);
    dp->active_system = sys_idx;
+
+   /* Open the index AFTER the ROM scan so we can immediately reconcile
+    * (note_present + finish_scan).  Closing any prior open is a no-op
+    * since system_dispose runs on the previous SYSTEM frame's pop. */
+   if (dp->current_index)
+   {
+      downplay_index_close(dp->current_index);
+      dp->current_index = NULL;
+   }
+   dp->current_index = downplay_index_open(
+         path_basename(sys->full_path), sys->full_path, sys->db_name);
+   if (dp->current_index)
+   {
+      for (i = 0; i < dp->rom_count; i++)
+      {
+         const char *base = path_basename(dp->roms[i].full_path);
+         if (!base || !*base)
+            continue;
+         downplay_index_note_present(dp->current_index, base,
+               (time_t)dp->roms[i].mtime, dp->roms[i].size);
+      }
+      downplay_index_finish_scan(dp->current_index);
+   }
+
+   /* Thumbnail path resolver: alloc once per handle lifetime.
+    * gfx_thumbnail_path_init returns NULL on alloc failure — soldier on
+    * without art rather than dropping the user back to TOP. */
+   if (!dp->thumb_path_data)
+      dp->thumb_path_data = gfx_thumbnail_path_init();
+   if (dp->thumb_path_data && sys->db_name && *sys->db_name)
+      gfx_thumbnail_set_system(dp->thumb_path_data, sys->db_name, NULL);
+
    dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SYSTEM, NULL, downplay_system_dispose);
 }
 
@@ -4191,8 +4355,16 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    }
 
    /* Right-pane preview: SAVE_PICKER shows the selected save's
-    * thumbnail.  Easy to extend to other views later — just plumb a
-    * texture handle from whatever the selected entry refers to. */
+    * thumbnail.  SYSTEM shows box art for the selected ROM (loaded
+    * asynchronously via gfx_thumbnail_request_stream, see
+    * downplay_drive_system_thumbnails).  Both share the same right-
+    * pane geometry.
+    *
+    * For SYSTEM we feed the gfx_thumbnail_t's texture/dims into
+    * downplay_draw_right_preview; if the thumbnail isn't loaded yet
+    * (status != AVAILABLE) we pass tex=0, which the helper renders as
+    * the placeholder rect.  Box art is photographic-style — FIT
+    * scaling smooths the typical mismatch with the right pane. */
    if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
          && dp->nav.selection < dp->save_picker_count)
    {
@@ -4201,9 +4373,239 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             e->thumb_tex, e->thumb_w, e->thumb_h,
             DOWNPLAY_PREVIEW_SCALE_INTEGER);
    }
+   else if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+         && dp->roms && dp->nav.selection < dp->rom_count)
+   {
+      const gfx_thumbnail_t *t = &dp->roms[dp->nav.selection].thumbnail;
+      enum gfx_thumbnail_status st = (enum gfx_thumbnail_status)
+            retro_atomic_load_acquire_int((retro_atomic_int_t*)&t->status);
+      uintptr_t  tex = 0;
+      unsigned   w   = 0;
+      unsigned   h   = 0;
+      if (st == GFX_THUMBNAIL_STATUS_AVAILABLE)
+      {
+         tex = t->texture;
+         w   = t->width;
+         h   = t->height;
+      }
+      downplay_draw_right_preview(p_disp, userdata, L, tex, w, h,
+            DOWNPLAY_PREVIEW_SCALE_FIT);
+   }
 }
 
 /* ---------- frame ---------- */
+
+/* Drive the per-frame thumbnail state for the SYSTEM view: pump the
+ * background match queue (1-2 ops/frame budget — ~10-30 enrichments
+ * per second at 60fps) and request a thumbnail load for the selected
+ * row.  Selection-change triggers a reset of the previous row's
+ * thumbnail so we never have more than one resident texture per frame.
+ *
+ * No-op outside SYSTEM view, or when the index/path-data isn't ready
+ * (graceful degradation: rows still show filenames). */
+/* Look the row up in the index and return the canonical label, or NULL
+ * if the row is unmatched / index isn't ready.  Mutable-dp wrapper
+ * because downplay_index_lookup invalidates stale entries. */
+static const char *downplay_canonical_label(downplay_handle_t *dp,
+      const downplay_rom_t *rom, const char *basename)
+{
+   downplay_index_record_t rec;
+   if (!dp->current_index)
+      return NULL;
+   if (!downplay_index_lookup(dp->current_index, basename,
+            (time_t)rom->mtime, rom->size, &rec))
+      return NULL;
+   return rec.label;
+}
+
+/* Try to load the boxart PNG for `label` if it's on disk.  Returns true
+ * if a load was kicked (status will be PENDING / AVAILABLE on next
+ * frame).  Reuses the resolver's path-build logic via set_content +
+ * update_path, then bypasses the streaming timer with request_file
+ * since we already know the file exists. */
+static bool downplay_try_load_for_label(downplay_handle_t *dp, size_t sel,
+      const char *label, unsigned upscale_thresh)
+{
+   if (!label || !*label)
+      return false;
+   gfx_thumbnail_set_content(dp->thumb_path_data, label);
+   if (!gfx_thumbnail_update_path(dp->thumb_path_data, GFX_THUMBNAIL_RIGHT))
+      return false;
+   if (   !dp->thumb_path_data->right_path[0]
+       || !path_is_valid(dp->thumb_path_data->right_path))
+      return false;
+   gfx_thumbnail_request_file(
+         dp->thumb_path_data->right_path,
+         &dp->roms[sel].thumbnail, upscale_thresh);
+   return true;
+}
+
+static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
+{
+   const downplay_rom_t *rom;
+   const char           *base;
+   const char           *canonical;
+   const char           *filename;
+   const char           *db_name;
+   settings_t           *settings;
+   gfx_animation_t      *p_anim;
+   unsigned              upscale_thresh;
+   size_t                sel;
+   bool                  loaded;
+   enum gfx_thumbnail_status status;
+
+   if (dp->nav.view != DOWNPLAY_VIEW_SYSTEM)
+      return;
+   if (!dp->roms || dp->rom_count == 0 || !dp->thumb_path_data)
+      return;
+
+   sel = dp->nav.selection;
+   if (sel >= dp->rom_count)
+      sel = dp->rom_count - 1;
+
+   /* Pump even when path_data isn't ready — matching is independent of
+    * art, and a successful match unlocks the row's canonical label
+    * regardless of whether we ever fetch art for it. */
+   if (dp->current_index)
+      downplay_index_pump(dp->current_index, 2);
+
+   /* Selection change → reset the prior selection's thumbnail. */
+   if (   dp->thumb_prev_selection != sel
+       && dp->thumb_prev_selection < dp->rom_count)
+      gfx_thumbnail_reset(&dp->roms[dp->thumb_prev_selection].thumbnail);
+   dp->thumb_prev_selection = sel;
+
+   rom  = &dp->roms[sel];
+   base = path_basename(rom->full_path);
+   if (!base || !*base)
+      return;
+
+   /* We always have two candidate labels, and either may match the
+    * libretro-thumbnails repo independently:
+    *
+    *  - filename: rom->display_name (basename minus extension).  This
+    *    matches when the user's ROM is named per No-Intro / Redump
+    *    conventions, which is the common case.
+    *
+    *  - canonical: rom's index label (from RDB match).  This matches
+    *    for poorly-named ROMs (e.g. "smw.smc" → "Super Mario World
+    *    (USA)"), and is also what we display in the row text.
+    *
+    * The two diverge when:
+    *  - filename is short / cryptic (canonical wins for art).
+    *  - the catalog appends extra parens for compilations / Virtual
+    *    Console releases that aren't in libretro-thumbnails (filename
+    *    wins for art — this is the Sonic Compilation case).
+    *
+    * Strategy: probe both for a local file before kicking the
+    * streaming load, and on MISSING fire downloads for both so
+    * whichever lib has the canonical filename wins. */
+   filename  = rom->display_name;
+   canonical = downplay_canonical_label(dp, rom, base);
+   if (canonical && string_is_equal(canonical, filename))
+      canonical = NULL;  /* Same — collapse to the single-label case. */
+
+   settings       = config_get_ptr();
+   p_anim         = anim_get_ptr();
+   upscale_thresh = settings ?
+         settings->uints.gfx_thumbnail_upscale_threshold : 0;
+
+   /* Pre-flight: status==UNKNOWN means we haven't tried yet.  Probe
+    * disk with both labels; if either has a local PNG, hot-load and
+    * skip the streaming delay (file is already there, no point
+    * waiting). */
+   status = (enum gfx_thumbnail_status)
+         retro_atomic_load_acquire_int(&dp->roms[sel].thumbnail.status);
+   loaded = false;
+   if (status == GFX_THUMBNAIL_STATUS_UNKNOWN)
+   {
+      if (downplay_try_load_for_label(dp, sel, filename, upscale_thresh))
+         loaded = true;
+      else if (canonical
+            && downplay_try_load_for_label(dp, sel, canonical, upscale_thresh))
+         loaded = true;
+   }
+
+   /* If neither pre-flight worked, fall back to the standard streaming
+    * load against the canonical label (preferred for display because
+    * "Super Mario World (USA)" beats "smw" if the user has a
+    * cryptic-named file).  Streaming gives the 50ms debounce while
+    * the user is fast-scrolling. */
+   if (!loaded)
+   {
+      const char *display = canonical ? canonical : filename;
+      gfx_thumbnail_set_content(dp->thumb_path_data, display);
+      gfx_thumbnail_request_stream(
+            dp->thumb_path_data, p_anim, GFX_THUMBNAIL_RIGHT,
+            NULL /* playlist */, 0 /* idx */,
+            (gfx_thumbnail_t*)&dp->roms[sel].thumbnail,
+            upscale_thresh,
+            settings ? settings->bools.network_on_demand_thumbnails : false);
+   }
+
+   /* Post-streaming poll: status flipped to MISSING but our HTTP fetch
+    * may have just landed.  Probe both labels again — bypassing the
+    * sticky-MISSING block in request_stream — and hot-load.
+    *
+    * Rate-limited to ~4 Hz per row via probe_throttle_acc.  Without
+    * the limiter, every frame `path_is_valid()`s up to two missing
+    * paths against FUSE-backed /sdcard, which is wasteful (the
+    * download takes hundreds of ms; we don't need to look 240×/sec
+    * to catch it). */
+   status = (enum gfx_thumbnail_status)
+         retro_atomic_load_acquire_int(&dp->roms[sel].thumbnail.status);
+   if (status == GFX_THUMBNAIL_STATUS_MISSING)
+   {
+      dp->roms[sel].probe_throttle_acc += p_anim->delta_time;
+      if (dp->roms[sel].probe_throttle_acc >= 0.25f)
+      {
+         dp->roms[sel].probe_throttle_acc = 0.0f;
+         if (   downplay_try_load_for_label(dp, sel, filename, upscale_thresh)
+             || (canonical && downplay_try_load_for_label(
+                     dp, sel, canonical, upscale_thresh)))
+            status = (enum gfx_thumbnail_status)
+                  retro_atomic_load_acquire_int(
+                        &dp->roms[sel].thumbnail.status);
+      }
+   }
+   else
+   {
+      /* Reset the throttle so a future MISSING transition starts
+       * fresh (e.g., user came back to a previously-loaded row that
+       * lost its texture on context destroy). */
+      dp->roms[sel].probe_throttle_acc = 0.25f;
+   }
+
+   /* Update the index art state for persistence + suppression of
+    * repeat downloads. */
+   db_name = (dp->active_system < dp->system_count && dp->systems)
+         ? dp->systems[dp->active_system].db_name : NULL;
+   if (dp->current_index)
+   {
+      if (status == GFX_THUMBNAIL_STATUS_AVAILABLE)
+         downplay_index_set_art_state(dp->current_index, base, DP_ART_OK);
+      else if (status == GFX_THUMBNAIL_STATUS_MISSING && db_name && *db_name)
+      {
+         downplay_index_record_t rec;
+         bool prior_attempt = downplay_index_lookup(dp->current_index,
+               base, (time_t)rom->mtime, rom->size, &rec)
+                  && rec.art_state == DP_ART_MISSING;
+         if (!prior_attempt)
+         {
+            /* Fire downloads for *both* labels (when they differ) —
+             * libretro-thumbnails has no fixed convention as to which
+             * one will hit, so kick both and let whichever 200s
+             * succeed.  The HTTP task system de-dups in flight
+             * requests for the same URL. */
+            downplay_metadata_request_boxart(db_name, filename);
+            if (canonical)
+               downplay_metadata_request_boxart(db_name, canonical);
+            downplay_index_set_art_state(dp->current_index, base,
+                  DP_ART_MISSING);
+         }
+      }
+   }
+}
 
 /* Drive the INGAME view from the actual core-running state.  Upstream
  * menu drivers don't detect this themselves — task_content sets
@@ -4501,6 +4903,9 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     * straight into the loading screen is the desired UX. */
    downplay_drive_pending_launch(dp);
    downplay_sync_ingame(dp);
+   /* Thumbnail / index pump for the SYSTEM view.  No-op elsewhere; safe
+    * to call before layout because it doesn't touch geometry. */
+   downplay_drive_system_thumbnails(dp);
 
    /* Core flipped option visibility on the previous frame's cycle.
     * Rebuild the active core-options list in place — same stack
@@ -5049,6 +5454,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
     * on so the cached dp->nav.view + dp->nav.selection can't drift. */
    dp_nav_init(&dp->nav, DOWNPLAY_VIEW_TOP,
          downplay_after_nav_change, dp);
+   dp->thumb_prev_selection = SIZE_MAX;
    /* Upstream only fires HISTORY_INIT lazily on first content load
     * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
     * is NULL and our "Recently Played" row never appears.  Guard so menu
@@ -5108,6 +5514,19 @@ static void downplay_menu_free(void *data)
    if (!dp)
       return;
    downplay_menu_context_destroy(dp);
+   /* Index is normally closed by system_dispose on pop_to_TOP, which
+    * context_destroy triggered above; this branch only fires if the
+    * destroy path skipped it (defensive). */
+   if (dp->current_index)
+   {
+      downplay_index_close(dp->current_index);
+      dp->current_index = NULL;
+   }
+   if (dp->thumb_path_data)
+   {
+      free(dp->thumb_path_data);
+      dp->thumb_path_data = NULL;
+   }
    /* systems / roms are CPU-only state, freed here rather than in
     * context_destroy so they survive GPU context loss/reset cycles. */
    downplay_systems_free(dp->systems, dp->system_count);
