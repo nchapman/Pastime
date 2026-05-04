@@ -1207,9 +1207,13 @@ static bool dp_index_load_json(downplay_index_t *idx)
 
 static void dp_write_int64(rjsonwriter_t *w, int64_t v)
 {
-   /* rjsonwriter has no int64 path (only double); roundtripping mtime
-    * through double is fine for values < 2^53 (we're nowhere close). */
-   rjsonwriter_add_double(w, (double)v);
+   /* Don't use rjsonwriter_add_double — it formats via "%G", which
+    * switches to scientific notation past ~6 significant digits.  A
+    * 10-digit unix mtime renders as "1.77787E+09", and the reader's
+    * atoll stops at the first non-digit (the '.') and returns 1.
+    * Effect: every cold-start validity check fails and the entire
+    * folder gets re-matched.  Bypass with the raw printf path. */
+   rjsonwriter_rawf(w, "%lld", (long long)v);
 }
 
 static bool dp_index_save_json(downplay_index_t *idx)
