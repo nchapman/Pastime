@@ -2209,6 +2209,7 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
 {
    const char *content = path_get(RARCH_PATH_CONTENT);
    char        title[NAME_MAX_LENGTH];
+   char        clean[NAME_MAX_LENGTH];
    int         max_w;
 
    if (!content || !*content)
@@ -2216,6 +2217,11 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
    fill_pathname_base(title, content, sizeof(title));
    path_remove_extension(title);
    if (!*title)
+      return;
+   /* Same cleanup as the system list rows: strip "(USA) (Rev 1) [!]"
+    * tails and rotate ", The" articles to the front. */
+   downplay_display_name_clean(title, clean, sizeof(clean));
+   if (!*clean)
       return;
 
    /* Title spans from the left margin to right_limit (the caller
@@ -2228,7 +2234,7 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
 
    downplay_draw_text_pill(p_disp, userdata, font, centre_offset, height,
          L, cap_tex, L->margin_x, L->margin_y, max_w, L->row_text_indent,
-         title, sizeof(title));
+         clean, sizeof(clean));
 }
 
 /* Build the status-pill text from RA's built-in helpers: "HH:MM"
