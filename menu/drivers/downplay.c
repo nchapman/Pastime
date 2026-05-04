@@ -249,6 +249,26 @@ struct downplay_settings_list
    size_t                   scroll;      /* topmost visible row index */
 };
 
+/* Aspect-ratio breakpoints for layout decisions that should respond to
+ * screen shape, not just absolute size.  Ordered so `>=` comparisons mean
+ * "this aspect or wider", and exact matches target a single device class.
+ * Thresholds chosen to land each common handheld in its own bucket:
+ *
+ *   square handhelds (Anbernic RG CubeXX 1:1) → DP_AR_SQUARE
+ *   classic 4:3 / 5:4                          → DP_AR_CLASSIC
+ *   3:2 / 16:10                                → DP_AR_WIDE
+ *   16:9 and wider                             → DP_AR_HD
+ *
+ * Add new layout knobs by switching on this enum rather than re-deriving
+ * thresholds inline. */
+enum downplay_aspect_bp
+{
+   DP_AR_SQUARE = 0,
+   DP_AR_CLASSIC,
+   DP_AR_WIDE,
+   DP_AR_HD
+};
+
 typedef struct
 {
    /* All values in pixels, derived from scale.  Recomputed when the
@@ -271,6 +291,13 @@ typedef struct
    float scale;
    unsigned vid_w;
    unsigned vid_h;
+   enum downplay_aspect_bp aspect_bp;
+   /* Left edge of the right-pane preview area, in pixels.  Derived from
+    * aspect_bp so squarer screens give the rows more horizontal room.
+    * The pane spans [pane_left, vid_w - margin_x).  Used by the right-
+    * pane preview drawer and by the list-row truncation gate so both
+    * agree on where the image area starts. */
+   int pane_left;
 
    int margin_x;            /* outer horizontal padding */
    int margin_y;            /* outer vertical padding (top + bottom) */
@@ -1748,6 +1775,32 @@ static void downplay_layout_recompute(downplay_layout_t *L,
    L->scale            = scale;
    L->vid_w            = video_width;
    L->vid_h            = video_height;
+
+   {
+      /* Bucket the screen by aspect ratio so layout knobs can target
+       * "square / classic / wide / HD" instead of inventing thresholds
+       * inline.  Thresholds: 4:3 = 1.333, 3:2 = 1.5, 16:9 = 1.778. */
+      float ar = video_height > 0
+            ? (float)video_width / (float)video_height : 1.0f;
+      L->aspect_bp = ar >= 1.70f ? DP_AR_HD
+                   : ar >= 1.45f ? DP_AR_WIDE
+                   : ar >= 1.15f ? DP_AR_CLASSIC
+                   :               DP_AR_SQUARE;
+   }
+
+   {
+      /* Right-pane width as a fraction of vid_w, narrower on squarer
+       * screens where the rows need the room.  One arm per breakpoint
+       * even where the values currently match — the slots are here so
+       * 3:2 / 16:10 can be tuned independently of 4:3 later without
+       * touching the structure. */
+      int pct = L->aspect_bp >= DP_AR_HD      ? 42
+              : L->aspect_bp >= DP_AR_WIDE    ? 40
+              : L->aspect_bp >= DP_AR_CLASSIC ? 40
+              :                                 38;
+      int pane_w = (int)video_width * pct / 100;
+      L->pane_left = (int)video_width - pane_w;
+   }
 
    L->margin_x         = (int)(24.0f  * scale);
    L->margin_y         = (int)(24.0f  * scale);
@@ -4274,7 +4327,7 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
       uintptr_t tex, unsigned texture_w, unsigned texture_h,
       enum downplay_preview_scale scale)
 {
-   int pane_left   = (int)L->vid_w / 2;
+   int pane_left   = L->pane_left;
    int pane_right  = (int)L->vid_w - L->margin_x;
    /* Symmetric 16*scale gap above the row 0 / status-pill band and below
     * the footer-hint band so the art reads as floating in the middle of
@@ -4345,7 +4398,9 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    if (img_w < 1 || img_h < 1)
       return;
 
-   img_x = pane_left + (pane_w - img_w) / 2;
+   /* Right-anchored: hug the screen-edge margin so small art reads as
+    * pinned to the side instead of floating in the middle of the pane. */
+   img_x = pane_right - img_w;
    img_y = pane_top  + (pane_h - img_h) / 2;
 
    /* Restart fade whenever the texture identity changes.  Selection
@@ -4425,7 +4480,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
     * so the selected row visibly overlaps its own image like LessUI. */
    bool     art_pane_active = (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
                             || dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER);
-   int      pane_left       = (int)L->vid_w / 2;
+   int      pane_left       = L->pane_left;
    /* One row_text_indent of breathing room between the truncated label
     * and the image pane.  Asymmetric vs the full-width row_max_w (which
     * doesn't subtract this) by design: the image is drawn right next to
