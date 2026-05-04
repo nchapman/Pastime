@@ -1,0 +1,5 @@
+# Compiled test binaries (rebuilt by run.sh).
+test_*
+!test_*.c
+# macOS clang debug-symbol bundles.
+*.dSYM/

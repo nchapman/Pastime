@@ -54,6 +54,7 @@
 #include "../../verbosity.h"
 
 #include "../../downplay/downplay_cores.h"
+#include "../../downplay/downplay_nav.h"
 #include "../../downplay/downplay_setup.h"
 
 #include <features/features_cpu.h>
@@ -100,16 +101,18 @@ typedef struct
    size_t pl_idx;
 } downplay_recent_t;
 
-enum downplay_view
-{
-   DOWNPLAY_VIEW_TOP = 0,    /* recents header + system list */
-   DOWNPLAY_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
-   DOWNPLAY_VIEW_RECENTS,    /* drilled into recents history */
-   DOWNPLAY_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
-   DOWNPLAY_VIEW_SAVE_PICKER,/* drilled into save-state list (M7) */
-   DOWNPLAY_VIEW_SETTINGS,   /* M8 — settings-style list (Options → core opts) */
-   DOWNPLAY_VIEW_CONFIRM     /* M8 — modal confirm/ack screen (centered text) */
-};
+/* enum downplay_view, dp_nav_frame_t, dp_nav_state_t and the
+ * dp_nav_* helpers all live in downplay/downplay_nav.h (included
+ * above).  The handle below embeds a dp_nav_state_t — every screen
+ * the user navigates into is a frame on that stack, with the bottom
+ * always being TOP.  Reads of the active view + cursor go through
+ * dp->nav.view / dp->nav.selection (cached mirrors of the top
+ * frame).  Mutations all go through the dp_nav_* helpers so the
+ * cache can't drift. */
+
+/* downplay_handle_t is referenced as a forward decl in nav.h dispose
+ * hook signatures (typed via void* there), but defined below. */
+typedef struct downplay_handle_s downplay_handle_t;
 
 /* INGAME row composition is conditional: Save hidden when the core
  * doesn't support savestates; Load hidden when no manual saves exist
@@ -207,20 +210,7 @@ struct downplay_settings_list
    unsigned                 width_pct;   /* % of vid_w */
    size_t                   sel;
    size_t                   scroll;      /* topmost visible row index */
-   /* Where to put dp->view + dp->selection back when the settings
-    * stack empties.  Captured on the depth-0 push (the frame that
-    * actually transitions us into DOWNPLAY_VIEW_SETTINGS); ignored
-    * on deeper frames since pop just unstacks within SETTINGS.  Owned
-    * by the frame so settings_push/pop don't need to reuse the
-    * shared dp->prior_view slot — keeping that field clean of
-    * settings-stack pollution. */
-   enum downplay_view       pre_view;
-   size_t                   pre_selection;
 };
-
-/* Cap of 4 is plenty for the current flow (INGAME → Options →
- * Emulator → maybe a category submenu later).  Bumps cheap if needed. */
-#define DOWNPLAY_SETTINGS_STACK_MAX 4
 
 typedef struct
 {
@@ -264,8 +254,15 @@ typedef struct
    int   settings_value_gap;   /* horizontal gap between title pill and value */
 } downplay_layout_t;
 
-typedef struct
+struct downplay_handle_s
 {
+   /* Navigation stack.  nav.nav[0] is seeded with DOWNPLAY_VIEW_TOP
+    * in downplay_menu_init; nav.nav_depth >= 1 always.  Use the
+    * dp_nav_* helpers (downplay_nav.h) to push / pop / change
+    * selection.  Read nav.view / nav.selection directly — they are
+    * cached mirrors of the top frame, kept in sync by the helpers. */
+   dp_nav_state_t      nav;
+
    font_data_t        *font;
    font_data_t        *chrome_font;
    /* Per-font baseline-from-line-centre offsets, measured once at font
@@ -282,12 +279,8 @@ typedef struct
    downplay_rom_t     *roms;
    size_t              rom_count;
    size_t              active_system;     /* index into systems */
-   size_t              top_selection;     /* saved cursor for return-to-top */
    uintptr_t           pill_cap_tex;      /* RGBA circle, rounded pill ends */
    downplay_layout_t   layout;
-   /* Cursor for whichever view is active. */
-   size_t              selection;
-   enum downplay_view  view;
    /* Number of entries in g_defaults.content_history at last rebuild.
     * 0 hides the "Recently Played" row entirely. */
    size_t              recent_count;
@@ -296,12 +289,6 @@ typedef struct
     * carries its source playlist index (see downplay_recent_t). */
    downplay_recent_t  *recents;
    size_t              recent_row_count;
-   /* Saved state for INGAME entry: the view we were on when the core
-    * started running.  We restore exactly this on core unload — no
-    * heap state copied, since SYSTEM/RECENTS resources stay live in
-    * place while the game runs. */
-   enum downplay_view  prior_view;
-   size_t              prior_selection;
    /* Cached: rows in the current view (TOP: recents header + systems;
     * SYSTEM: rom_count). */
    size_t              total_rows;
@@ -324,12 +311,6 @@ typedef struct
    enum downplay_ingame_action ingame_actions[5];
    size_t              ingame_action_count;
 
-   /* Settings stack (M8).  Push when a nav row enters a child list;
-    * pop on Cancel.  Empty stack + view==SETTINGS is a transient
-    * inconsistency we never let happen (view flips to INGAME on the
-    * pop that empties the stack). */
-   downplay_settings_list_t *settings_stack[DOWNPLAY_SETTINGS_STACK_MAX];
-   size_t                    settings_depth;
    /* Dedicated font for settings-list rows (smaller than dp->font).
     * Description band reuses dp->chrome_font — its size already lives
     * close to the desc target (~18*scale). */
@@ -349,33 +330,12 @@ typedef struct
     * intended to touch. */
    bool                      frontend_effect_dirty;
 
-   /* Confirm view (DOWNPLAY_VIEW_CONFIRM).  A small modal screen
-    * driven entirely by these fields — no per-call allocation.
-    * Used for both confirm-before prompts ("Restore defaults?
-    * YES / CANCEL") and confirm-after acknowledgements ("Saved
-    * for console.  OKAY").  prior_view is restored on dismiss;
-    * the settings stack underneath is preserved unchanged. */
-   struct
-   {
-      char               message[256];
-      char               a_label[16];
-      char               b_label[16];        /* empty = no B button */
-      void             (*on_confirm)(void *dp);
-      enum downplay_view prior_view;
-   } confirm;
-
    /* Save-state picker (DOWNPLAY_VIEW_SAVE_PICKER).  Cached on view
     * enter, freed (textures unloaded) on view exit.  Sorted desc by
     * mtime; entry 0 is always the most recent.  Includes .auto if it
     * exists alongside manual slots. */
    downplay_save_entry_t save_picker[DOWNPLAY_MAX_SAVE_ENTRIES];
    size_t              save_picker_count;
-   /* Where the picker should restore view + selection to on
-    * Cancel / load.  Owned by the picker so it doesn't have to
-    * borrow dp->prior_view (which is sync_ingame's slot — sharing
-    * caused the in-game-menu-freeze-after-Quit bug). */
-   enum downplay_view  save_picker_pre_view;
-   size_t              save_picker_pre_selection;
 
    /* Cached "Resume <Game>" availability for the launcher's TOP view.
     * Refreshed on rebuild_lists; if true, a Resume row is prepended
@@ -410,7 +370,7 @@ typedef struct
       retro_time_t last_us;
       bool         was_running;
    } setup_anim;
-} downplay_handle_t;
+};
 
 /* Solid colors expressed as 4×RGBA (one vertex each, flat shaded).  Kept
  * non-const because gfx_display_draw_quad signature is non-const float*
@@ -469,12 +429,12 @@ static float DP_COLOR_PILL_BG_GRAY[16] = {
  * the Recents-row index in TOP becomes (resume_available ? 1 : 0). */
 static bool downplay_has_recents_row(const downplay_handle_t *dp)
 {
-   return dp->view == DOWNPLAY_VIEW_TOP && dp->recent_count > 0;
+   return dp->nav.view == DOWNPLAY_VIEW_TOP && dp->recent_count > 0;
 }
 
 static bool downplay_has_resume_row(const downplay_handle_t *dp)
 {
-   return dp->view == DOWNPLAY_VIEW_TOP && dp->resume_available;
+   return dp->nav.view == DOWNPLAY_VIEW_TOP && dp->resume_available;
 }
 
 static const char *downplay_ingame_label(enum downplay_ingame_action a)
@@ -494,28 +454,28 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
 {
    size_t sys_idx;
 
-   if (dp->view == DOWNPLAY_VIEW_INGAME)
+   if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
    {
       if (row < dp->ingame_action_count)
          return downplay_ingame_label(dp->ingame_actions[row]);
       return "";
    }
 
-   if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+   if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
    {
       if (row < dp->save_picker_count)
          return dp->save_picker[row].label;
       return "";
    }
 
-   if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+   if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
    {
       if (dp->roms && row < dp->rom_count)
          return dp->roms[row].display_name;
       return "";
    }
 
-   if (dp->view == DOWNPLAY_VIEW_RECENTS)
+   if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
    {
       if (dp->recents && row < dp->recent_row_count)
          return dp->recents[row].display_name;
@@ -844,22 +804,22 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
 
 static void downplay_recompute_total_rows(downplay_handle_t *dp)
 {
-   if (dp->view == DOWNPLAY_VIEW_INGAME)
+   if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
       dp->total_rows = dp->ingame_action_count;
-   else if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+   else if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
       dp->total_rows = dp->save_picker_count;
-   else if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+   else if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
       dp->total_rows = dp->rom_count;
-   else if (dp->view == DOWNPLAY_VIEW_RECENTS)
+   else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
       dp->total_rows = dp->recent_row_count;
-   else if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+   else if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
    {
       /* Settings view manages its own selection/scroll on the active
        * stack frame; the main `selection` cursor isn't meaningful
        * here.  total_rows kept at 0 keeps any stray default-list
        * input handler a no-op. */
       dp->total_rows = 0;
-      dp->selection  = 0;
+      dp_nav_set_selection(&dp->nav, 0);
       return;
    }
    else
@@ -867,10 +827,24 @@ static void downplay_recompute_total_rows(downplay_handle_t *dp)
                      + (downplay_has_recents_row(dp) ? 1 : 0)
                      + dp->system_count;
 
+   /* Selection clamp: keep dp->nav.selection in [0, total_rows).
+    * dp_nav_set_selection writes both the cache and the top frame
+    * so a future push/pop preserves the clamped value.  Safe to
+    * call from inside after_change — set_selection doesn't itself
+    * fire after_change. */
    if (dp->total_rows == 0)
-      dp->selection = 0;
-   else if (dp->selection >= dp->total_rows)
-      dp->selection = dp->total_rows - 1;
+      dp_nav_set_selection(&dp->nav, 0);
+   else if (dp->nav.selection >= dp->total_rows)
+      dp_nav_set_selection(&dp->nav, dp->total_rows - 1);
+}
+
+/* nav stack helpers (push/pop/pop_to/top/root_view/set_selection)
+ * live in downplay/downplay_nav.c — see the header included at the
+ * top of this file.  Wrapper that lets the after_change callback
+ * (dp_nav_state_t-typed) reach back into the host's recompute. */
+static void downplay_after_nav_change(void *user)
+{
+   downplay_recompute_total_rows((downplay_handle_t*)user);
 }
 
 static void downplay_recents_free(downplay_recent_t *rows, size_t count)
@@ -1232,8 +1206,8 @@ static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
    dp->ingame_actions[n++] = DP_INGAME_QUIT;
    dp->ingame_action_count = n;
 
-   if (dp->view == DOWNPLAY_VIEW_INGAME && dp->selection >= n)
-      dp->selection = n - 1;
+   if (dp->nav.view == DOWNPLAY_VIEW_INGAME && dp->nav.selection >= n)
+      dp_nav_set_selection(&dp->nav, n - 1);
 }
 
 /* Build "Resume <Game>" availability from the head of recents.  No
@@ -1289,31 +1263,69 @@ static void downplay_refresh_resume(downplay_handle_t *dp)
    dp->resume_pl_idx    = 0;
 }
 
+/* Dispose hook for the RECENTS frame: free the cached display rows.
+ * Selection is preserved by the parent TOP frame underneath us, so
+ * we don't need to do anything to restore it. */
+static void downplay_recents_dispose(void *user, void *side)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)user;
+   (void)side;
+   downplay_recents_free(dp->recents, dp->recent_row_count);
+   dp->recents          = NULL;
+   dp->recent_row_count = 0;
+}
+
+/* Dispose hook for the INGAME frame.  The action array stays on dp
+ * (next push will rebuild it via refresh_ingame_actions); we just
+ * need to refresh the launcher's Resume row availability so the new
+ * autosave RA wrote on unload shows up. */
+static void downplay_ingame_dispose(void *user, void *side)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)user;
+   (void)side;
+   downplay_refresh_resume(dp);
+}
+
+/* Dispose hook for the SAVE_PICKER frame: free thumbnail textures
+ * and refresh the underlying INGAME view's action composition (the
+ * Load row's visibility is gated on manual_count, which the user
+ * may have just changed by loading a slot — and a freshly-loaded
+ * state generates an autosave that bumps the count next time). */
+static void downplay_save_picker_dispose(void *user, void *side)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)user;
+   (void)side;
+   downplay_save_picker_free(dp);
+   downplay_refresh_ingame_actions(dp);
+}
+
 static void downplay_open_recents(downplay_handle_t *dp)
 {
    downplay_recents_free(dp->recents, dp->recent_row_count);
    dp->recents          = NULL;
    dp->recent_row_count = 0;
    dp->recents          = downplay_build_recents(&dp->recent_row_count);
-
-   dp->top_selection = dp->selection;
-   dp->view          = DOWNPLAY_VIEW_RECENTS;
-   dp->selection     = 0;
-   downplay_recompute_total_rows(dp);
+   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_RECENTS, NULL, downplay_recents_dispose);
 }
 
 static void downplay_close_recents(downplay_handle_t *dp)
 {
-   downplay_recents_free(dp->recents, dp->recent_row_count);
-   dp->recents          = NULL;
-   dp->recent_row_count = 0;
-   dp->view             = DOWNPLAY_VIEW_TOP;
-   dp->selection        = dp->top_selection;
-   downplay_recompute_total_rows(dp);
+   dp_nav_pop(&dp->nav);
 }
 
-/* Drill into a system's ROM list.  Saves the top-level cursor so we can
- * restore it on return.  No-op when sys_idx is out of range. */
+/* Dispose hook for the SYSTEM frame: free the loaded ROM list. */
+static void downplay_system_dispose(void *user, void *side)
+{
+   downplay_handle_t *dp = (downplay_handle_t*)user;
+   (void)side;
+   downplay_roms_free(dp->roms, dp->rom_count);
+   dp->roms      = NULL;
+   dp->rom_count = 0;
+}
+
+/* Drill into a system's ROM list.  No-op when sys_idx is out of
+ * range.  Cursor restoration on close happens automatically — the
+ * parent TOP frame's selection is preserved underneath us. */
 static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
 {
    if (!dp->systems || sys_idx >= dp->system_count)
@@ -1324,22 +1336,13 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
    dp->rom_count = 0;
    dp->roms      = downplay_scan_roms(dp->systems[sys_idx].full_path,
          &dp->rom_count);
-
-   dp->top_selection = dp->selection;
    dp->active_system = sys_idx;
-   dp->view          = DOWNPLAY_VIEW_SYSTEM;
-   dp->selection     = 0;
-   downplay_recompute_total_rows(dp);
+   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SYSTEM, NULL, downplay_system_dispose);
 }
 
 static void downplay_close_system(downplay_handle_t *dp)
 {
-   downplay_roms_free(dp->roms, dp->rom_count);
-   dp->roms      = NULL;
-   dp->rom_count = 0;
-   dp->view      = DOWNPLAY_VIEW_TOP;
-   dp->selection = dp->top_selection;
-   downplay_recompute_total_rows(dp);
+   dp_nav_pop(&dp->nav);
 }
 
 /* Resolve "<core_ident>_libretro" via core_info_find into a caller-owned
@@ -1475,25 +1478,13 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
    settings_t *settings   = config_get_ptr();
    const char *root       = settings ? settings->paths.directory_menu_content : NULL;
 
-   /* If a future caller triggers rebuild while drilled in, drop ROM state
-    * and snap back to TOP.  active_system would otherwise index into a
-    * stale systems array. */
-   if (dp->view == DOWNPLAY_VIEW_SYSTEM)
-   {
-      downplay_roms_free(dp->roms, dp->rom_count);
-      dp->roms      = NULL;
-      dp->rom_count = 0;
-      dp->view      = DOWNPLAY_VIEW_TOP;
-      dp->selection = 0;
-   }
-   else if (dp->view == DOWNPLAY_VIEW_RECENTS)
-   {
-      downplay_recents_free(dp->recents, dp->recent_row_count);
-      dp->recents          = NULL;
-      dp->recent_row_count = 0;
-      dp->view             = DOWNPLAY_VIEW_TOP;
-      dp->selection        = 0;
-   }
+   /* If a future caller triggers rebuild while drilled in, snap back
+    * to TOP — active_system / cached recents would otherwise index
+    * into stale arrays.  Each frame's dispose hook handles its own
+    * cleanup (roms/recents free). */
+   if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+         || dp->nav.view == DOWNPLAY_VIEW_RECENTS)
+      dp_nav_pop_to(&dp->nav, DOWNPLAY_VIEW_TOP);
 
    /* directory_menu_content is stored verbatim — RA doesn't expand "~" or
     * ":/" prefixes for this setting (see configuration.c).  Expand here so
@@ -2146,134 +2137,122 @@ static downplay_settings_list_t *downplay_settings_list_new(
    return L;
 }
 
-/* Push a fully-built list onto the stack and switch to SETTINGS view.
- * Takes ownership: a pop will free the list.  Drops the push if the
- * stack is full or the list is NULL (logs and frees the orphan). */
+/* Dispose hook for a SETTINGS frame.  Fires the list's optional
+ * on_close (Frontend submenu uses this to commit deferred shader
+ * changes) before freeing.  on_close may still inspect L->rows[]
+ * since the list isn't freed until after it returns. */
+static void downplay_settings_dispose(void *user, void *side)
+{
+   downplay_handle_t        *dp = (downplay_handle_t*)user;
+   downplay_settings_list_t *L  = (downplay_settings_list_t*)side;
+   if (L)
+   {
+      if (L->on_close)
+         L->on_close(L, L->on_close_userdata);
+      downplay_settings_list_free(L);
+   }
+   /* When the last SETTINGS frame pops (i.e. we're returning to a
+    * non-SETTINGS view such as INGAME or TOP), refresh the ingame
+    * action composition.  Mirrors the pre-extraction settings_pop
+    * behaviour: Save/Load row visibility tracks manual_count, which
+    * could have shifted while the user was inside Options.  pop's
+    * sync runs before dispose, so dp->nav.view here already
+    * reflects the parent — no SETTINGS frame remains under us. */
+   if (dp && dp->nav.view != DOWNPLAY_VIEW_SETTINGS)
+      downplay_refresh_ingame_actions(dp);
+}
+
+/* Push a fully-built list onto the nav stack as a SETTINGS frame.
+ * Takes ownership: pop will fire on_close + free.  Drops the push
+ * silently when L is NULL (the build_*_list helpers can return NULL
+ * on calloc failure or when there's nothing to show). */
 static void downplay_settings_push(downplay_handle_t *dp,
       downplay_settings_list_t *L)
 {
    if (!L)
       return;
-   if (dp->settings_depth >= DOWNPLAY_SETTINGS_STACK_MAX)
-   {
-      RARCH_WARN("[Downplay] settings stack full; dropping push\n");
-      downplay_settings_list_free(L);
-      return;
-   }
-   /* First push from a non-SETTINGS view captures where we came from
-    * so Cancel-from-root returns there.  Stored on the frame, not
-    * on dp->prior_view: that field is owned by sync_ingame's
-    * running↔INGAME transition and gets corrupted if other code
-    * paths overwrite it (the "in-game menu freezes over launcher
-    * after Quit" bug came from exactly that pollution). */
-   if (dp->settings_depth == 0)
-   {
-      L->pre_view      = dp->view;
-      L->pre_selection = dp->selection;
-      dp->view         = DOWNPLAY_VIEW_SETTINGS;
-      dp->selection    = 0;
-   }
-   dp->settings_stack[dp->settings_depth++] = L;
-   downplay_recompute_total_rows(dp);
+   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SETTINGS, L, downplay_settings_dispose);
 }
 
-/* Pop the top list.  When the stack empties, restore the view we
- * captured on the depth-0 push. */
 static void downplay_settings_pop(downplay_handle_t *dp)
 {
-   downplay_settings_list_t *L;
-   enum downplay_view        restore_view;
-   size_t                    restore_selection;
-   if (dp->settings_depth == 0)
-      return;
-   dp->settings_depth--;
-   L = dp->settings_stack[dp->settings_depth];
-   /* Capture the depth-0 frame's restore target before we free L,
-    * since the values live on the frame.  Higher frames don't have
-    * a meaningful pre_view; the dp->settings_depth check below
-    * gates the actual restore. */
-   restore_view      = L ? L->pre_view      : DOWNPLAY_VIEW_TOP;
-   restore_selection = L ? L->pre_selection : 0;
-   /* Fire the optional flush callback before disposing the list.  The
-    * callback may still inspect L->rows[] (it is not yet freed). */
-   if (L && L->on_close)
-      L->on_close(L, L->on_close_userdata);
-   downplay_settings_list_free(L);
-   dp->settings_stack[dp->settings_depth] = NULL;
-   if (dp->settings_depth == 0)
-   {
-      dp->view      = restore_view;
-      dp->selection = restore_selection;
-      downplay_refresh_ingame_actions(dp);
-      downplay_recompute_total_rows(dp);
-   }
+   if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+      dp_nav_pop(&dp->nav);
 }
 
+/* Pop every SETTINGS frame off the top.  Used when Start toggles
+ * the in-game Options menu closed (collapse the entire stack
+ * instead of one Cancel-press per level). */
 static void downplay_settings_pop_all(downplay_handle_t *dp)
 {
-   while (dp->settings_depth > 0)
-      downplay_settings_pop(dp);
+   while (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+      dp_nav_pop(&dp->nav);
 }
 
-/* Free all stack entries without the view-restore side effects of
- * pop_all.  Used at teardown when there's nowhere to restore to. */
-static void downplay_settings_clear(downplay_handle_t *dp)
-{
-   size_t i;
-   for (i = 0; i < dp->settings_depth; i++)
-   {
-      downplay_settings_list_free(dp->settings_stack[i]);
-      dp->settings_stack[i] = NULL;
-   }
-   dp->settings_depth = 0;
-}
-
-/* Top of the stack; NULL if the stack is empty. */
+/* Top settings list; NULL if the top frame isn't a SETTINGS frame. */
 static downplay_settings_list_t *downplay_settings_top(
       const downplay_handle_t *dp)
 {
-   if (dp->settings_depth == 0)
+   const dp_nav_frame_t *top = dp->nav.nav_depth > 0
+         ? &dp->nav.nav[dp->nav.nav_depth - 1] : NULL;
+   if (!top || top->view != DOWNPLAY_VIEW_SETTINGS)
       return NULL;
-   return dp->settings_stack[dp->settings_depth - 1];
+   return (downplay_settings_list_t*)top->side;
+}
+
+/* CONFIRM frame side data.  Each open_confirm allocates one of
+ * these, attached to the pushed frame; close_confirm pops and the
+ * dispose hook frees it.  Chained confirms (callback opens another
+ * confirm) genuinely stack, with each frame carrying its own payload
+ * — no in-place replacement, no shared single-slot to clobber. */
+typedef struct
+{
+   char  message[256];
+   char  a_label[16];
+   char  b_label[16];      /* empty = no B button */
+   void (*on_confirm)(void *dp);
+} dp_confirm_side_t;
+
+static void downplay_confirm_dispose(void *user, void *side)
+{
+   (void)user;
+   free(side);
 }
 
 /* Open the confirm modal.  `b_label` may be NULL/empty to suppress
  * the cancel button (acknowledgement-only screen).  `on_confirm` is
- * invoked when the user presses A, *before* the view is restored —
+ * invoked when the user presses A, *before* the frame is popped —
  * callbacks may call downplay_open_confirm again to chain screens.
- * The settings stack underneath is preserved unchanged. */
+ * Each call pushes a new CONFIRM frame; the underlying view (TOP /
+ * INGAME / SETTINGS) and any deeper SETTINGS stack are preserved. */
 static void downplay_open_confirm(downplay_handle_t *dp,
       const char *message, const char *a_label, const char *b_label,
       void (*on_confirm)(void *dp))
 {
-   if (!dp)
+   dp_confirm_side_t *side;
+   if (!dp || !(side = (dp_confirm_side_t*)calloc(1, sizeof(*side))))
       return;
-   strlcpy(dp->confirm.message, message ? message : "",
-         sizeof(dp->confirm.message));
-   strlcpy(dp->confirm.a_label, (a_label && *a_label) ? a_label : "OKAY",
-         sizeof(dp->confirm.a_label));
-   strlcpy(dp->confirm.b_label, b_label ? b_label : "",
-         sizeof(dp->confirm.b_label));
-   dp->confirm.on_confirm = on_confirm;
-   /* Don't overwrite prior_view if we're already in CONFIRM (chained
-    * confirms — keep the original return target). */
-   if (dp->view != DOWNPLAY_VIEW_CONFIRM)
-      dp->confirm.prior_view = dp->view;
-   dp->view = DOWNPLAY_VIEW_CONFIRM;
+   strlcpy(side->message, message ? message : "", sizeof(side->message));
+   strlcpy(side->a_label, (a_label && *a_label) ? a_label : "OKAY",
+         sizeof(side->a_label));
+   strlcpy(side->b_label, b_label ? b_label : "", sizeof(side->b_label));
+   side->on_confirm = on_confirm;
+   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_CONFIRM, side, downplay_confirm_dispose);
 }
 
-/* Dismiss the confirm modal.  If `fire` is true and an on_confirm
- * callback is set, it runs first — and may re-enter CONFIRM, in
- * which case we leave the new view alone. */
+/* Dismiss the confirm modal.  Capture the callback locally before
+ * the pop (the pop frees `side`), then fire it after — at which
+ * point a chained open_confirm pushes a new frame onto the now-
+ * exposed parent, not on top of the dying frame. */
 static void downplay_close_confirm(downplay_handle_t *dp, bool fire)
 {
-   void (*cb)(void *) = dp->confirm.on_confirm;
-   enum downplay_view ret = dp->confirm.prior_view;
-   dp->confirm.on_confirm = NULL;
+   dp_nav_frame_t    *top  = dp_nav_top(&dp->nav);
+   dp_confirm_side_t *side = (top && top->view == DOWNPLAY_VIEW_CONFIRM)
+                           ? (dp_confirm_side_t*)top->side : NULL;
+   void             (*cb)(void *) = side ? side->on_confirm : NULL;
+   dp_nav_pop(&dp->nav);
    if (fire && cb)
       cb(dp);
-   if (dp->view == DOWNPLAY_VIEW_CONFIRM)
-      dp->view = ret;
 }
 
 /* Fixed vertical clearance around the row block to host the up /
@@ -2709,16 +2688,21 @@ static void downplay_draw_confirm_view(void *userdata,
 {
    const downplay_layout_t *L  = &dp->layout;
    font_data_t             *f  = dp->font ? dp->font : dp->chrome_font;
+   const dp_nav_frame_t    *top = (dp->nav.nav_depth > 0)
+                                ? &dp->nav.nav[dp->nav.nav_depth - 1] : NULL;
+   const dp_confirm_side_t *side = (top
+            && top->view == DOWNPLAY_VIEW_CONFIRM)
+         ? (const dp_confirm_side_t*)top->side : NULL;
    int                      cx;
    int                      cy;
    int                      ascent;
    (void)userdata;
-   if (!f || !*dp->confirm.message)
+   if (!f || !side || !*side->message)
       return;
    cx     = (int)L->vid_w / 2;
    cy     = (int)L->vid_h / 2;
    ascent = dp->font ? dp->font_centre_offset : dp->chrome_font_centre_offset;
-   downplay_draw_text(f, dp->confirm.message,
+   downplay_draw_text(f, side->message,
          (float)cx, (float)(cy + ascent),
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
 }
@@ -4116,7 +4100,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
     * list has to start one row below.  Other views leave that row
     * to the (right-anchored, short) status pill, which sits beside
     * the left-anchored row 0. */
-   bool     has_title  = (dp->view == DOWNPLAY_VIEW_INGAME);
+   bool     has_title  = (dp->nav.view == DOWNPLAY_VIEW_INGAME);
    int      list_top   = L->margin_y
                        + (has_title ? L->row_h : 0);
    int      list_x     = L->margin_x;
@@ -4130,7 +4114,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
                        ? (size_t)(avail_h / L->row_h) : 1;
    /* Scroll offset derived from selection — keep the selected row in
     * view by sliding the window forward once selection passes the last
-    * visible index.  Source of truth is dp->selection; deriving scroll
+    * visible index.  Source of truth is dp->nav.selection; deriving scroll
     * here means input handlers don't need to track it. */
    size_t   scroll     = 0;
    size_t   row_idx;
@@ -4148,9 +4132,9 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    if (top_row_max_w < 0)
       top_row_max_w = 0;
 
-   if (dp->total_rows > visible && dp->selection >= visible)
+   if (dp->total_rows > visible && dp->nav.selection >= visible)
    {
-      scroll = dp->selection + 1 - visible;
+      scroll = dp->nav.selection + 1 - visible;
       if (scroll + visible > dp->total_rows)
          scroll = dp->total_rows - visible;
    }
@@ -4164,16 +4148,16 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             dp->font_centre_offset, L, cap_tex,
             list_x, row_y, row_w,
             downplay_row_label(dp, row_idx),
-            row_idx == dp->selection);
+            row_idx == dp->nav.selection);
    }
 
    /* Right-pane preview: SAVE_PICKER shows the selected save's
     * thumbnail.  Easy to extend to other views later — just plumb a
     * texture handle from whatever the selected entry refers to. */
-   if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER
-         && dp->selection < dp->save_picker_count)
+   if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
+         && dp->nav.selection < dp->save_picker_count)
    {
-      const downplay_save_entry_t *e = &dp->save_picker[dp->selection];
+      const downplay_save_entry_t *e = &dp->save_picker[dp->nav.selection];
       downplay_draw_right_preview(p_disp, userdata, L,
             e->thumb_tex, e->thumb_w, e->thumb_h,
             DOWNPLAY_PREVIEW_SCALE_INTEGER);
@@ -4209,75 +4193,47 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
    if (menu_st)
       menu_st->flags &= ~MENU_ST_FLAG_PENDING_QUICK_MENU;
 
-   /* SAVE_PICKER is a sub-view of INGAME (only reachable from there),
-    * so don't bounce it back — that snap was the bug where opening
-    * Load did nothing.  The picker tears itself down on Cancel /
-    * post-load, returning to INGAME via prior_view. */
+   /* SAVE_PICKER, SETTINGS, CONFIRM are all valid in-game-rooted
+    * views (already INGAME-or-deeper) — don't push another INGAME on
+    * top of them.  Each tears itself down via its own pop path. */
    if (running
-         && dp->view != DOWNPLAY_VIEW_INGAME
-         && dp->view != DOWNPLAY_VIEW_SAVE_PICKER
-         && dp->view != DOWNPLAY_VIEW_SETTINGS
-         && dp->view != DOWNPLAY_VIEW_CONFIRM)
+         && dp->nav.view != DOWNPLAY_VIEW_INGAME
+         && dp->nav.view != DOWNPLAY_VIEW_SAVE_PICKER
+         && dp->nav.view != DOWNPLAY_VIEW_SETTINGS
+         && dp->nav.view != DOWNPLAY_VIEW_CONFIRM)
    {
-      dp->prior_view      = dp->view;
-      dp->prior_selection = dp->selection;
-      dp->view            = DOWNPLAY_VIEW_INGAME;
-      dp->selection       = 0;
+      /* Refresh action composition before push so the recompute
+       * inside dp_nav_sync_top reads the right count. */
       downplay_refresh_ingame_actions(dp);
-      downplay_recompute_total_rows(dp);
+      dp_nav_push(&dp->nav, DOWNPLAY_VIEW_INGAME, NULL,
+            downplay_ingame_dispose);
    }
-   else if (!running && dp->view == DOWNPLAY_VIEW_INGAME)
+   else if (!running && dp->nav.view == DOWNPLAY_VIEW_INGAME)
    {
-      dp->view      = dp->prior_view;
-      dp->selection = dp->prior_selection;
-      /* Refresh launcher state that would have changed during play —
-       * a new autosave (set by RA on unload) should make the Resume
-       * row appear next frame. */
-      downplay_refresh_resume(dp);
-      downplay_recompute_total_rows(dp);
-   }
-   else if (!running && dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
-   {
-      /* Edge case: core unloaded while we were drilled into the
-       * picker (crashed core, external Quit).  Pop back to TOP
-       * cleanly.  Note this restores to TOP directly rather than via
-       * prior_view (which would be INGAME — invalid now that the core
-       * is gone).  prior_view is single-slot; if a future view ever
-       * stacks on top of SAVE_PICKER, that slot will need to become a
-       * small stack. */
-      downplay_save_picker_free(dp);
-      dp->view      = DOWNPLAY_VIEW_TOP;
-      dp->selection = 0;
-      downplay_refresh_resume(dp);
-      downplay_recompute_total_rows(dp);
+      /* Pop returns us to whichever view was underneath INGAME (TOP
+       * if the game was launched from there, RECENTS if from a
+       * Resume row, etc.) — naturally restored by the parent
+       * frame.  Resume-row availability is refreshed by the
+       * dispose hook so the new TOP frame's row composition is
+       * up to date on the next frame. */
+      dp_nav_pop(&dp->nav);
    }
    else if (!running
-         && ((dp->view == DOWNPLAY_VIEW_SETTINGS
-                  && dp->settings_depth > 0
-                  && dp->settings_stack[0]->pre_view
-                     == DOWNPLAY_VIEW_INGAME)
-             || (dp->view == DOWNPLAY_VIEW_CONFIRM
-                  && (dp->confirm.prior_view == DOWNPLAY_VIEW_INGAME
-                     || (dp->confirm.prior_view == DOWNPLAY_VIEW_SETTINGS
-                        && dp->settings_depth > 0
-                        && dp->settings_stack[0]->pre_view
-                           == DOWNPLAY_VIEW_INGAME)))))
+         && dp->nav.view != DOWNPLAY_VIEW_INGAME
+         && dp_nav_root_view(&dp->nav) == DOWNPLAY_VIEW_INGAME)
    {
-      /* Edge case: core died while in in-game Options (or a confirm
-       * modal opened from there).  Tear down the settings stack and
-       * snap to TOP.  "Rooted in INGAME" is determined by the depth-0
-       * settings frame's pre_view (for SETTINGS) and by
-       * confirm.prior_view (for CONFIRM); CONFIRM-over-SETTINGS
-       * requires both checks.  Launcher-rooted SETTINGS / CONFIRM
-       * views (e.g. the global Settings menu opened from the TOP
-       * launcher row) legitimately persist across "no core loaded"
-       * frames and must not be ripped down. */
-      downplay_settings_pop_all(dp);
-      dp->confirm.on_confirm = NULL;
-      dp->view      = DOWNPLAY_VIEW_TOP;
-      dp->selection = 0;
-      downplay_refresh_resume(dp);
-      downplay_recompute_total_rows(dp);
+      /* Edge case: core died (crashed, external Quit, etc.) while
+       * the user was drilled into a sub-view of INGAME — SAVE_PICKER,
+       * in-game Options (SETTINGS), a CONFIRM modal over Options, or
+       * a confirm-over-confirm chain.  All of these are rooted in
+       * INGAME (dp_nav_root_view returns INGAME), so collapse the
+       * entire stack back to TOP in one shot.  The dispose hooks on
+       * each popped frame handle their own cleanup (texture unload,
+       * list free, etc.).  Launcher-rooted SETTINGS / CONFIRM (where
+       * dp_nav_root_view returns SETTINGS / CONFIRM, never INGAME)
+       * legitimately persist across "no core loaded" frames and are
+       * not affected. */
+      dp_nav_pop_to(&dp->nav, DOWNPLAY_VIEW_TOP);
    }
 }
 
@@ -4517,21 +4473,31 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
       if (opts)
          opts->updated = false;
-      if (dp->view == DOWNPLAY_VIEW_SETTINGS && dp->settings_depth > 0)
+      if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
       {
-         downplay_settings_list_t *cur = downplay_settings_top(dp);
-         downplay_settings_list_t *neu =
+         dp_nav_frame_t           *frame = dp_nav_top(&dp->nav);
+         downplay_settings_list_t *cur   = downplay_settings_top(dp);
+         downplay_settings_list_t *neu   =
                downplay_build_core_options_list(dp);
-         if (neu)
+         if (neu && frame)
          {
             size_t saved_sel    = cur ? cur->sel    : 0;
             size_t saved_scroll = cur ? cur->scroll : 0;
-            downplay_settings_list_free(cur);
             if (saved_sel >= neu->row_count && neu->row_count > 0)
                saved_sel = neu->row_count - 1;
             neu->sel    = saved_sel;
             neu->scroll = saved_scroll;
-            dp->settings_stack[dp->settings_depth - 1] = neu;
+            /* Swap the list inside the existing nav frame.  This
+             * intentionally bypasses the SETTINGS dispose hook —
+             * the old list is being replaced because the core
+             * changed option visibility, not because the user
+             * backed out, so any on_close (used by Frontend to
+             * commit deferred shader changes) must not fire.  Today
+             * the only list reachable here (core options) has no
+             * on_close, but the explicit free guards future
+             * additions. */
+            frame->side = neu;
+            downplay_settings_list_free(cur);
             downplay_settings_snap_scroll(dp, neu);
          }
       }
@@ -4567,11 +4533,11 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     * INGAME reads as a HUD instead of hiding the frame underneath. */
    downplay_draw_rect(p_disp, userdata, &dp->layout,
          0, 0, (int)dp->layout.vid_w, (int)dp->layout.vid_h,
-         dp->view == DOWNPLAY_VIEW_INGAME ? DP_COLOR_BG_INGAME : DP_COLOR_BG);
+         dp->nav.view == DOWNPLAY_VIEW_INGAME ? DP_COLOR_BG_INGAME : DP_COLOR_BG);
 
    /* Chrome bg: gray in launcher (would vanish against pure-black
     * DP_COLOR_BG), dark in INGAME (sits on dimmed game). */
-   chrome_bg = (dp->view == DOWNPLAY_VIEW_INGAME)
+   chrome_bg = (dp->nav.view == DOWNPLAY_VIEW_INGAME)
              ? DP_COLOR_PILL_DARK : DP_COLOR_PILL_CHROME_GRAY;
 
    /* Top-right status pill */
@@ -4579,7 +4545,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          dp->chrome_font_centre_offset, &dp->layout, dp->pill_cap_tex,
          chrome_bg, dp->status_text);
 
-   if (dp->view == DOWNPLAY_VIEW_INGAME)
+   if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
    {
       /* Title may grow up to the left edge of the status pill, with
        * one margin's worth of gap between them so they read as
@@ -4604,9 +4570,9 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          downplay_draw_welcome_view(dp);
          break;
       case DOWNPLAY_RENDER_LIST:
-         if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+         if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
             downplay_draw_settings_view(p_disp, userdata, dp);
-         else if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+         else if (dp->nav.view == DOWNPLAY_VIEW_CONFIRM)
             downplay_draw_confirm_view(userdata, dp);
          else
             downplay_draw_list(p_disp, userdata,
@@ -4624,25 +4590,32 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     *
     * SETTINGS view hides the footer entirely so the row block + the
     * fixed description band can extend to the bottom margin. */
-   if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+   if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
       goto restore_viewport;
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.row_h;
 
    /* CONFIRM view: just the modal-specific buttons, no POWER hint —
     * the modal is meant to read as focused, single-decision UX. */
-   if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+   if (dp->nav.view == DOWNPLAY_VIEW_CONFIRM)
    {
+      const dp_nav_frame_t    *top  = (dp->nav.nav_depth > 0)
+                                    ? &dp->nav.nav[dp->nav.nav_depth - 1] : NULL;
+      const dp_confirm_side_t *side = (top
+               && top->view == DOWNPLAY_VIEW_CONFIRM)
+            ? (const dp_confirm_side_t*)top->side : NULL;
       downplay_hint_t right[2];
       size_t          n = 0;
       int             x = (int)dp->layout.vid_w - dp->layout.margin_x;
-      if (*dp->confirm.b_label)
+      if (!side)
+         goto restore_viewport;
+      if (*side->b_label)
       {
          right[n].glyph = "B";
-         right[n].label = dp->confirm.b_label;
+         right[n].label = side->b_label;
          n++;
       }
       right[n].glyph = "A";
-      right[n].label = dp->confirm.a_label;
+      right[n].label = side->a_label;
       n++;
       downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
             dp->chrome_font_centre_offset, &dp->layout,
@@ -4668,7 +4641,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       downplay_hint_t right[2];
       size_t          n          = 0;
       bool            show_back  = (mode == DOWNPLAY_RENDER_LIST
-                                   && dp->view != DOWNPLAY_VIEW_TOP);
+                                   && dp->nav.view != DOWNPLAY_VIEW_TOP);
       int             x          = (int)dp->layout.vid_w - dp->layout.margin_x;
 
       /* B BACK first so it sits left of A OPEN inside the pill. */
@@ -4713,7 +4686,7 @@ restore_viewport:
 
 /* M2: own the navigation entirely.  We don't have a backing menu list, so
  * generic_menu_entry_action() (which assumes file_list_t-driven entries)
- * isn't useful — we mutate dp->selection directly and consume the action.
+ * isn't useful — we mutate dp->nav.selection directly and consume the action.
  * OK/CANCEL just log for now; real navigation targets land in M3+. */
 static int downplay_entry_action(void *userdata, menu_entry_t *entry,
       size_t i, enum menu_action action)
@@ -4756,7 +4729,7 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
     * acknowledgement-only screens the B button isn't drawn, but we
     * still honour Cancel as a way out — pressing it on an ack screen
     * just dismisses, which is what the user expects. */
-   if (dp->view == DOWNPLAY_VIEW_CONFIRM)
+   if (dp->nav.view == DOWNPLAY_VIEW_CONFIRM)
    {
       if (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT)
          downplay_close_confirm(dp, true);
@@ -4766,9 +4739,9 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
    }
 
    /* SETTINGS view drives its own selection cursor on the active
-    * stack frame, not dp->selection — handled before the generic
+    * stack frame, not dp->nav.selection — handled before the generic
     * up/down code below to avoid two cursors fighting. */
-   if (dp->view == DOWNPLAY_VIEW_SETTINGS)
+   if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
    {
       downplay_settings_list_t *S = downplay_settings_top(dp);
       if (!S || S->row_count == 0)
@@ -4838,20 +4811,21 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
    switch (action)
    {
       case MENU_ACTION_UP:
-         dp->selection = (dp->selection + dp->total_rows - 1)
-                       % dp->total_rows;
+         dp_nav_set_selection(&dp->nav,
+               (dp->nav.selection + dp->total_rows - 1) % dp->total_rows);
          return 0;
       case MENU_ACTION_DOWN:
-         dp->selection = (dp->selection + 1) % dp->total_rows;
+         dp_nav_set_selection(&dp->nav,
+               (dp->nav.selection + 1) % dp->total_rows);
          return 0;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:
-         if (dp->view == DOWNPLAY_VIEW_INGAME)
+         if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
          {
             enum downplay_ingame_action act;
-            if (dp->selection >= dp->ingame_action_count)
+            if (dp->nav.selection >= dp->ingame_action_count)
                return 0;
-            act = dp->ingame_actions[dp->selection];
+            act = dp->ingame_actions[dp->nav.selection];
             switch (act)
             {
                case DP_INGAME_CONTINUE:
@@ -4898,14 +4872,15 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                   /* >1: open the picker.  Loads thumbnails synchronously
                    * (~10-50 ms one-shot hitch on view enter is fine for
                    * a deliberate user action). */
+                  /* Pre-populate the picker buffer before push so
+                   * the recompute inside dp_nav_sync_top reads the
+                   * right row count.  save_picker[] stays on dp —
+                   * only one picker exists at a time. */
                   downplay_save_picker_free(dp);
                   downplay_savestate_enumerate(dp->save_picker,
                         &dp->save_picker_count, true);
-                  dp->save_picker_pre_view      = dp->view;
-                  dp->save_picker_pre_selection = dp->selection;
-                  dp->view                      = DOWNPLAY_VIEW_SAVE_PICKER;
-                  dp->selection                 = 0;
-                  downplay_recompute_total_rows(dp);
+                  dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SAVE_PICKER, NULL,
+                        downplay_save_picker_dispose);
                   break;
                }
                case DP_INGAME_OPTIONS:
@@ -4918,43 +4893,39 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
             }
             return 0;
          }
-         if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+         if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
          {
-            if (dp->selection < dp->save_picker_count)
+            if (dp->nav.selection < dp->save_picker_count)
             {
-               int slot = dp->save_picker[dp->selection].slot;
+               int slot = dp->save_picker[dp->nav.selection].slot;
                downplay_load_from_slot(slot);
-               /* Pop back to INGAME so re-opening the menu doesn't
-                * re-enter the picker against textures we already
-                * freed.  CMD_EVENT_LOAD_STATE doesn't unload the
-                * core, so the user resumes play directly. */
-               downplay_save_picker_free(dp);
-               dp->view      = dp->save_picker_pre_view;
-               dp->selection = dp->save_picker_pre_selection;
-               downplay_refresh_ingame_actions(dp);
-               downplay_recompute_total_rows(dp);
+               /* Pop back to INGAME — dispose hook frees thumbnails
+                * and refreshes the action composition.
+                * CMD_EVENT_LOAD_STATE doesn't unload the core, so
+                * the user resumes play directly. */
+               dp_nav_pop(&dp->nav);
                command_event(CMD_EVENT_MENU_TOGGLE, NULL);
             }
             return 0;
          }
-         if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+         if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
          {
             const downplay_system_t *sys = &dp->systems[dp->active_system];
-            const downplay_rom_t    *rom = &dp->roms[dp->selection];
+            const downplay_rom_t    *rom = &dp->roms[dp->nav.selection];
             downplay_launch_rom(dp, sys->core_ident, rom->full_path);
             return 0;
          }
-         if (dp->view == DOWNPLAY_VIEW_RECENTS)
+         if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
          {
-            if (dp->recents && dp->selection < dp->recent_row_count)
-               downplay_launch_recent(dp->recents[dp->selection].pl_idx);
+            if (dp->recents && dp->nav.selection < dp->recent_row_count)
+               downplay_launch_recent(dp->recents[dp->nav.selection].pl_idx);
             return 0;
          }
          /* TOP view: Resume → recents-launch the head; Recents → open;
           * else → drill into a system.  Order mirrors row layout in
           * downplay_row_label. */
          {
-            size_t sel = dp->selection;
+            size_t sel = dp->nav.selection;
             if (downplay_has_resume_row(dp))
             {
                if (sel == 0)
@@ -4976,27 +4947,25 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          }
          return 0;
       case MENU_ACTION_CANCEL:
-         if (dp->view == DOWNPLAY_VIEW_INGAME)
+         if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
          {
             command_event(CMD_EVENT_MENU_TOGGLE, NULL);
             return 0;
          }
-         if (dp->view == DOWNPLAY_VIEW_SAVE_PICKER)
+         if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
          {
-            /* Back to INGAME: free thumbnails, restore prior cursor. */
-            downplay_save_picker_free(dp);
-            dp->view      = dp->save_picker_pre_view;
-            dp->selection = dp->save_picker_pre_selection;
-            downplay_refresh_ingame_actions(dp);
-            downplay_recompute_total_rows(dp);
+            /* Back to INGAME — dispose hook frees thumbnails and
+             * refreshes action composition; parent INGAME frame's
+             * selection is preserved underneath. */
+            dp_nav_pop(&dp->nav);
             return 0;
          }
-         if (dp->view == DOWNPLAY_VIEW_SYSTEM)
+         if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
          {
             downplay_close_system(dp);
             return 0;
          }
-         if (dp->view == DOWNPLAY_VIEW_RECENTS)
+         if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
          {
             downplay_close_recents(dp);
             return 0;
@@ -5008,7 +4977,7 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
           * Other views ignore Start (RA's default for it is "reset
           * to default" on whichever entry has focus, which we don't
           * want bleeding into our list-driven views). */
-         if (dp->view == DOWNPLAY_VIEW_TOP)
+         if (dp->nav.view == DOWNPLAY_VIEW_TOP)
             downplay_settings_push(dp,
                   downplay_build_global_settings_list(dp));
          return 0;
@@ -5035,9 +5004,12 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
       return NULL;
    }
 
-   dp->selection  = 0;
-   dp->view       = DOWNPLAY_VIEW_TOP;
-   dp->prior_view = DOWNPLAY_VIEW_TOP;
+   /* Seed the nav stack with TOP at the ground and wire the
+    * after-change callback so every push/pop refreshes total_rows
+    * for the new view.  All writes go through nav helpers from here
+    * on so the cached dp->nav.view + dp->nav.selection can't drift. */
+   dp_nav_init(&dp->nav, DOWNPLAY_VIEW_TOP,
+         downplay_after_nav_change, dp);
    /* Upstream only fires HISTORY_INIT lazily on first content load
     * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
     * is NULL and our "Recently Played" row never appears.  Guard so menu
@@ -5082,11 +5054,12 @@ static void downplay_menu_context_destroy(void *data)
    /* Picker thumbnails are GPU resources; drop them on context loss
     * so they're not dangling handles after a renderer reset. */
    downplay_save_picker_free(dp);
-   /* Settings stack is CPU-only state, but its row data may include
-    * pointers into the core options manager — which is owned by RA
-    * and may be torn down before us.  Easier to clear here than to
-    * track its lifetime. */
-   downplay_settings_clear(dp);
+   /* Pop everything down to the ground TOP frame.  Settings frames
+    * hold lists whose row data may include pointers into the core
+    * options manager (RA-owned, possibly torn down before us); a
+    * CONFIRM frame on top would leak its heap-allocated side payload
+    * if pop_all stopped at it.  pop_to(TOP) catches everything. */
+   dp_nav_pop_to(&dp->nav, DOWNPLAY_VIEW_TOP);
    gfx_display_deinit_white_texture();
 }
 
