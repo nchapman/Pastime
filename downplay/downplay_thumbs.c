@@ -58,6 +58,7 @@
 #include <formats/rjson.h>
 #include <net/net_http.h>
 #include <streams/file_stream.h>
+#include <streams/trans_stream.h>
 #include <string/stdstring.h>
 
 #include "downplay_thumbs.h"
@@ -1389,6 +1390,105 @@ static void dp_build_image_url(downplay_thumbs_t *t,
    net_http_urlencode_full(out, raw, out_size);
 }
 
+/* Hostile / misconfigured server can't blow up our cache.  Real
+ * indexes are tens-to-hundreds of KB; 1 MB leaves real headroom for
+ * the largest No-Intro systems (PSX, NDS, etc.) with their alt-name
+ * bundles, while still capping a runaway response at a safe size.
+ * Applied to the *compressed* (gzipped) payload before decompression. */
+#define DP_THUMBS_PF_INDEX_MAX_BYTES (1024u * 1024u)
+
+/* ---- internal: gzip helper ----
+ *
+ * Indexes are served as `index.json.gz`; the on-disk cache stores the
+ * decompressed JSON so the (frequently-called) parse path stays
+ * unchanged.  We decompress once at fetch-completion time.
+ *
+ * gzip wraps a deflate stream with a 10-byte header (magic 1F 8B + a
+ * tiny metadata block) and an 8-byte footer carrying CRC32 + ISIZE
+ * (uncompressed size mod 2^32).  Reading ISIZE up front lets us
+ * allocate exactly the output buffer needed and reject anything that
+ * would exceed our hard cap before we even hand bytes to zlib.
+ *
+ * Returns a malloc'd buffer (caller frees) on success; NULL on bad
+ * magic, oversize ISIZE, alloc failure, or inflate error.  The cap
+ * is the same DP_THUMBS_PF_INDEX_MAX_BYTES applied to compressed
+ * input scaled by a max ratio; tune via DP_THUMBS_INDEX_MAX_RATIO
+ * if the server ever switches to a different compressor. */
+#define DP_THUMBS_INDEX_MAX_RATIO 32  /* gzip-of-JSON typical ratio is 6-12; 32 leaves headroom */
+
+static uint8_t *dp_gunzip(const uint8_t *in, size_t in_len, size_t *out_len)
+{
+   const struct trans_stream_backend *backend;
+   void                              *stream  = NULL;
+   uint8_t                           *out     = NULL;
+   uint32_t                           isize;
+   uint32_t                           rd      = 0;
+   uint32_t                           wn      = 0;
+   enum trans_stream_error            xerr    = TRANS_STREAM_ERROR_NONE;
+   const size_t                       max_out =
+         (size_t)DP_THUMBS_PF_INDEX_MAX_BYTES * DP_THUMBS_INDEX_MAX_RATIO;
+
+   if (out_len)
+      *out_len = 0;
+   if (!in || in_len < 18) /* 10-byte header + min payload + 8-byte footer */
+      return NULL;
+   /* gzip magic: 1F 8B.  Reject anything else (CDN error pages, raw
+    * deflate, unknown compressor) before allocating. */
+   if (in[0] != 0x1F || in[1] != 0x8B)
+      return NULL;
+
+   /* ISIZE is the last 4 bytes, little-endian, mod 2^32.  For inputs
+    * >4 GiB this lies; we cap well below that elsewhere so it's fine. */
+   isize = (uint32_t)in[in_len - 4]
+         | ((uint32_t)in[in_len - 3] << 8)
+         | ((uint32_t)in[in_len - 2] << 16)
+         | ((uint32_t)in[in_len - 1] << 24);
+   if (isize == 0 || isize > max_out)
+      return NULL;
+   /* trans_stream's set_in/set_out take uint32_t lengths.  Our caps
+    * keep both sides well under 4 GiB today, but make the narrowing
+    * explicit so a future cap bump can't silently truncate. */
+   if (in_len > UINT32_MAX || (size_t)isize > UINT32_MAX)
+      return NULL;
+
+   backend = trans_stream_get_zlib_inflate_backend();
+   if (!backend)
+      return NULL;
+   stream = backend->stream_new();
+   if (!stream)
+      return NULL;
+   /* window_bits = MAX_WBITS (15) + 16 = 31 ⇒ gzip-only.  Strict on
+    * purpose: anything that isn't gzip should already have been
+    * rejected by the magic check above, but we don't want zlib to
+    * silently accept a raw-deflate stream either. */
+   if (backend->define && !backend->define(stream, "window_bits", 31))
+   {
+      backend->stream_free(stream);
+      return NULL;
+   }
+
+   out = (uint8_t*)malloc(isize);
+   if (!out)
+   {
+      backend->stream_free(stream);
+      return NULL;
+   }
+   backend->set_in (stream, in,  (uint32_t)in_len);
+   backend->set_out(stream, out, isize);
+   if (!backend->trans(stream, true /* flush */, &rd, &wn, &xerr)
+       || xerr != TRANS_STREAM_ERROR_NONE
+       || wn != isize)
+   {
+      free(out);
+      backend->stream_free(stream);
+      return NULL;
+   }
+   backend->stream_free(stream);
+   if (out_len)
+      *out_len = (size_t)wn;
+   return out;
+}
+
 /* ---- internal: HTTP callbacks (detached from manager) ----
  *
  * Both callbacks run on the main thread (RA's task system dispatches
@@ -1401,6 +1501,8 @@ static void dp_cb_index_download(retro_task_t *task, void *task_data,
 {
    http_transfer_data_t *data   = (http_transfer_data_t*)task_data;
    file_transfer_t      *transf = (file_transfer_t*)user_data;
+   uint8_t              *json   = NULL;
+   size_t                json_len = 0;
    char                  output_dir[DP_THUMBS_PATH_MAX];
    char                  tmp_path[DP_THUMBS_PATH_MAX];
    (void)task;
@@ -1414,6 +1516,22 @@ static void dp_cb_index_download(retro_task_t *task, void *task_data,
       err = "non-200";
       goto finish;
    }
+   /* Compressed-size gate: matches dp_cb_pf_index_download.  dp_gunzip
+    * also caps internally, but the early-out avoids holding a multi-MB
+    * CDN error page in memory while we look at it. */
+   if (data->len > DP_THUMBS_PF_INDEX_MAX_BYTES)
+   {
+      err = "response too large";
+      goto finish;
+   }
+   /* Server returns gzipped JSON — decompress before writing the
+    * cache so the parse path stays unchanged. */
+   json = dp_gunzip((const uint8_t*)data->data, (size_t)data->len, &json_len);
+   if (!json || json_len == 0)
+   {
+      err = "gunzip failed";
+      goto finish;
+   }
 
    strlcpy(output_dir, transf->path, sizeof(output_dir));
    path_basedir_wrapper(output_dir);
@@ -1425,7 +1543,7 @@ static void dp_cb_index_download(retro_task_t *task, void *task_data,
 
    /* Write to .tmp, rename — index parse must see all-or-nothing. */
    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", transf->path);
-   if (!filestream_write_file(tmp_path, data->data, data->len))
+   if (!filestream_write_file(tmp_path, json, json_len))
    {
       err = "write failed";
       goto finish;
@@ -1447,6 +1565,7 @@ finish:
             transf->path, err);
    else
       RARCH_LOG("[Downplay] thumbs index -> %s\n", transf->path);
+   free(json);
    free(transf);
 }
 
@@ -1670,8 +1789,11 @@ static void dp_kick_index_fetch(downplay_thumbs_t *t)
    char raw_url[2048];
    char url[2048];
 
+   /* Server hosts a gzipped index alongside the JSON; ~10x smaller
+    * over the wire.  Cache writes the decompressed JSON to disk so
+    * the parse path is unaffected. */
    snprintf(raw_url, sizeof(raw_url),
-         "%s/%s/Named_Boxarts/index.json",
+         "%s/%s/Named_Boxarts/index.json.gz",
          DP_THUMBS_BASE_URL, t->system);
    net_http_urlencode_full(url, raw_url, sizeof(url));
    if (!*url)
@@ -1874,11 +1996,9 @@ static void dp_drain_queue(downplay_thumbs_t *t)
 
 #define DP_THUMBS_PF_PENDING_CAP   128
 #define DP_THUMBS_PF_INFLIGHT_MAX  3
-/* Hostile / misconfigured server can't blow up our cache.  Real
- * indexes are tens-to-hundreds of KB; 1 MB leaves real headroom for
- * the largest No-Intro systems (PSX, NDS, etc.) with their alt-name
- * bundles, while still capping a runaway response at a safe size. */
-#define DP_THUMBS_PF_INDEX_MAX_BYTES (1024u * 1024u)
+/* DP_THUMBS_PF_INDEX_MAX_BYTES lives near the gunzip helper above
+ * (the compressed payload cap is also the input to the decompressed
+ * cap calculation).  Both callbacks gate on it. */
 
 static char g_pf_pending[DP_THUMBS_PF_PENDING_CAP][256];
 static int  g_pf_pending_count;
@@ -2018,8 +2138,10 @@ static void dp_pf_drain(void); /* fwd */
 static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
-   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
-   dp_pf_transfer_t     *pf   = (dp_pf_transfer_t*)user_data;
+   http_transfer_data_t *data     = (http_transfer_data_t*)task_data;
+   dp_pf_transfer_t     *pf       = (dp_pf_transfer_t*)user_data;
+   uint8_t              *json     = NULL;
+   size_t                json_len = 0;
    char                  output_dir[DP_THUMBS_PATH_MAX];
    char                  tmp_path[DP_THUMBS_PATH_MAX];
    (void)task;
@@ -2039,6 +2161,14 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
       err = "response too large";
       goto finish;
    }
+   /* Server returns gzipped JSON — decompress before writing the
+    * cache.  Mirrors dp_cb_index_download. */
+   json = dp_gunzip((const uint8_t*)data->data, (size_t)data->len, &json_len);
+   if (!json || json_len == 0)
+   {
+      err = "gunzip failed";
+      goto finish;
+   }
    strlcpy(output_dir, pf->base.path, sizeof(output_dir));
    path_basedir_wrapper(output_dir);
    if (!path_mkdir(output_dir))
@@ -2048,7 +2178,7 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
    }
    /* Atomic write: .tmp + rename — consistent with dp_cb_index_download. */
    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", pf->base.path);
-   if (!filestream_write_file(tmp_path, data->data, data->len))
+   if (!filestream_write_file(tmp_path, json, json_len))
    {
       err = "write failed";
       goto finish;
@@ -2069,6 +2199,7 @@ finish:
             pf->system, err);
    else
       RARCH_LOG("[Downplay] thumbs prefetch -> %s\n", pf->base.path);
+   free(json);
    dp_pf_inflight_remove(pf->system);
    free(pf);
    dp_pf_drain();
@@ -2107,7 +2238,7 @@ static void dp_pf_drain(void)
          continue;
 
       snprintf(raw_url, sizeof(raw_url),
-            "%s/%s/Named_Boxarts/index.json",
+            "%s/%s/Named_Boxarts/index.json.gz",
             DP_THUMBS_BASE_URL, system);
       net_http_urlencode_full(url, raw_url, sizeof(url));
       if (!*url)
