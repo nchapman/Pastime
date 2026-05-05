@@ -34,16 +34,6 @@ RETRO_BEGIN_DECLS
  * Other Unix: $HOME. */
 bool downplay_paths_get_root(char *out, size_t out_len);
 
-/* Resolve the directory where Downplay stores its private per-system
- * metadata index files (one .json per ROM folder).  Lives under
- * RetroArch's config root (parallel to playlists/, database/), NOT
- * under the user-facing Downplay/ tree, because these are derivative
- * machinery rather than user data.
- *
- * The directory is created on first use.  Returns false (and leaves out
- * untouched) if the parent path can't be resolved. */
-bool downplay_paths_get_index_root(char *out, size_t out_len);
-
 /* Overlay Downplay's opinionated defaults onto the loaded settings.
  * Called from retroarch_main_init after config_load() and before the
  * CLI second pass.  The menu_driver override is unconditional; path

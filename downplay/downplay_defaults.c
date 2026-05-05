@@ -67,40 +67,6 @@ bool downplay_paths_get_root(char *out, size_t out_len)
 #endif
 }
 
-bool downplay_paths_get_index_root(char *out, size_t out_len)
-{
-   const char *playlists = g_defaults.dirs[DEFAULT_DIR_PLAYLIST];
-   char        ra_root[PATH_MAX_LENGTH];
-   char        downplay_dir[PATH_MAX_LENGTH];
-
-   if (!out || out_len == 0)
-      return false;
-
-   /* Anchor off the playlists dir, which every platform populates and
-    * which always sits at <ra_root>/playlists/.  path_parent_dir mutates
-    * its argument; copy first so we don't disturb g_defaults. */
-   if (!playlists || !*playlists)
-      return false;
-   strlcpy(ra_root, playlists, sizeof(ra_root));
-   path_parent_dir(ra_root, strlen(ra_root));
-   if (!*ra_root)
-      return false;
-
-   fill_pathname_join_special(downplay_dir, ra_root, "downplay",
-         sizeof(downplay_dir));
-   fill_pathname_join_special(out, downplay_dir, "index", out_len);
-
-   /* Create the parent and leaf if missing.  path_mkdir is idempotent and
-    * creates intermediate components.  Log on failure so the inevitable
-    * downstream "can't open index" I/O error has a corresponding root
-    * cause in the log. */
-   if (!path_is_directory(downplay_dir) && !path_mkdir(downplay_dir))
-      RARCH_WARN("[Downplay] mkdir failed: %s\n", downplay_dir);
-   if (!path_is_directory(out) && !path_mkdir(out))
-      RARCH_WARN("[Downplay] mkdir failed: %s\n", out);
-   return true;
-}
-
 /* True iff the current setting value is "either empty, or exactly the
  * upstream default RA computed for this platform" — i.e., the user has
  * not provided their own override.  Equality with the RA default lets

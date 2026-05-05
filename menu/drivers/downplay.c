@@ -97,24 +97,17 @@ typedef struct
 
 /* One ROM file inside a system folder, expanded for the system view.
  *
- * mtime / size are stat()'d once at scan time and used as the index's
- * validity stamps — drop a different ROM at the same path and the
- * cached label/match invalidate automatically.
- *
  * thumbnail is owned by this struct.  Initialized to blank in scan,
  * loaded on hover (WebP via downplay_webp_load_texture, JPG/PNG via
  * gfx_thumbnail_request_file once downplay_thumbs_request returns a
  * local path), freed by gfx_thumbnail_reset in downplay_roms_free.
- * Callers MUST have
- * called gfx_thumbnail_cancel_pending_requests() before any reset to
- * avoid a callback racing onto freed memory. */
+ * Callers MUST have called gfx_thumbnail_cancel_pending_requests()
+ * before any reset to avoid a callback racing onto freed memory. */
 typedef struct
 {
    char            *display_name;   /* cleaned: parens/brackets stripped */
    char            *sort_key;       /* lowercased + leading-article stripped */
    char            *full_path;
-   int64_t          mtime;          /* st_mtime, 0 on stat failure */
-   int64_t          size;           /* st_size,  0 on stat failure */
    gfx_thumbnail_t  thumbnail;
    /* Per-row image dimensions from the thumbnail index, in pixels.
     * Both 0 means either: (a) the index isn't loaded yet (cold first
@@ -995,12 +988,6 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          roms[count].display_name = display;
          roms[count].sort_key     = sort_dup;
          roms[count].full_path    = path_dup;
-         /* mtime/size deliberately left zero — vestigial holdover from
-          * when the metadata index pinned cache validity to (basename,
-          * mtime, size).  That index has been deleted; the thumbnail
-          * index is now the single source of layout truth.  The fields
-          * are kept on the struct only to avoid touching every call
-          * site that reads them in the same commit. */
          gfx_thumbnail_init_blank(&roms[count].thumbnail);
          /* image_w/image_h left zero by the memset above — populated
           * once by the dim warm-up in downplay_open_system after the
@@ -1617,7 +1604,7 @@ static void downplay_close_recents(downplay_handle_t *dp)
 }
 
 /* Dispose hook for the SYSTEM frame: free the loaded ROM list and
- * close the per-system metadata index (which flushes its JSON). */
+ * close the per-system thumbnail manager. */
 static void downplay_system_dispose(void *user, void *side)
 {
    downplay_handle_t *dp = (downplay_handle_t*)user;
@@ -1652,16 +1639,15 @@ static void downplay_system_dispose(void *user, void *side)
  *
  * Lifecycle:
  *   1. Scan ROM filesystem (existing behaviour).
- *   2. Open the metadata index for this system, reconcile against the
- *      filesystem set (note_present each ROM, finish_scan to prune).
- *   3. Initialize the thumbnail path resolver lazily (first system
- *      enter only) and point it at the system's libretro-thumbnails
- *      db_name.
- *   4. Push the nav frame.
+ *   2. Open the pastime.gg thumbnail manager pointed at the system's
+ *      db_name (NULL db_name → no manager; rows still render labels).
+ *   3. Warm per-row image dims from the loaded index so the row
+ *      drawer's per-row text-width math has the data on frame 1.
+ *   4. Speculative prefetch of the first ~10 rows' images.
+ *   5. Push the nav frame.
  *
- * Failures along the way are non-fatal — a NULL index just means no
- * canonical labels and no art for this session, but the basic ROM list
- * still works. */
+ * Failures along the way are non-fatal — no manager just means no art
+ * for this session, but the basic ROM list still works. */
 /* Populate every row's image_w/image_h from the thumbnail index via
  * side-effect-free peek lookups.  Idempotent + cheap (~50 ns per
  * call); each peek either fills dims or leaves them at the previous
