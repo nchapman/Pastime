@@ -210,16 +210,20 @@ bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
       char *out, size_t out_size);
 
-/* Side-effect-free metadata lookup.  Returns true and fills
- * `*out_w` / `*out_h` iff the system's binary index is loaded AND
- * the cascade matches `rom_basename`.  Crucially, this succeeds even
- * when the cached image isn't on disk yet — the menu driver calls it
- * per-row to set up text-width before the image lands.  Returns
- * false on null inputs, missing slot, slot not yet loaded, or
- * cascade miss.  Does NOT trigger I/O — driver should pump first. */
+/* Side-effect-free metadata lookup.  Returns true and fills the
+ * out-params iff the system's binary index is loaded AND the cascade
+ * matches `rom_basename`.  Crucially, this succeeds even when the
+ * cached image isn't on disk yet — the menu driver calls it per-row
+ * to set up text-width before the image lands.  Returns false on
+ * null inputs, missing slot, slot not yet loaded, or cascade miss.
+ * Does NOT trigger I/O — driver should pump first.
+ *
+ * Any out-param may be NULL to skip that fetch.  Thumbhash pointer
+ * lifetime: same contract as downplay_thumb_result_t.thumbhash. */
 bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
-      uint16_t *out_w, uint16_t *out_h);
+      uint16_t *out_w, uint16_t *out_h,
+      const uint8_t **out_thumbhash, size_t *out_thumbhash_len);
 
 void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r);
 

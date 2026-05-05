@@ -59,6 +59,7 @@
 #include "../../downplay/downplay_nav.h"
 #include "../../downplay/downplay_setup.h"
 #include "../../downplay/downplay_thumbs.h"
+#include "../../downplay/downplay_thumbhash.h"
 #ifdef HAVE_DOWNPLAY_WEBP
 #include "../../downplay/downplay_webp.h"
 #endif
@@ -148,10 +149,18 @@ typedef struct
     * pixels.  0/0 means either: (a) the row's system index isn't on
     * disk yet (recents pump hasn't loaded it; populated when it does)
     * or (b) the cascade misses on this ROM.  Same semantics as
-    * downplay_rom_t.image_w/h — drives the row drawer's truncation
-    * gate so unselected rows narrow before the preview pane. */
+    * downplay_rom_t.image_w/h. */
    uint16_t        image_w;
    uint16_t        image_h;
+   /* True once the per-system resolver confirms the image file is on
+    * disk.  Recents is read-only — it never kicks HTTP fetches — so
+    * an image only appears here after the user has opened the row's
+    * system at least once.  The truncation gate keys off this so we
+    * don't narrow rows whose images won't ever show in this view;
+    * re-checked every frame until true (then sticky), so a side-trip
+    * into the system view that downloads the image self-heals the
+    * recents layout when the user comes back. */
+   bool            image_cached;
 } downplay_recent_t;
 /* No sort_key on recents — they're presented in chronological order
  * straight from g_defaults.content_history, never alphabetized. */
@@ -240,6 +249,11 @@ typedef struct
 
 /* Forward decl so on_close can name the typedef. */
 typedef struct downplay_settings_list downplay_settings_list_t;
+
+/* Forward decl: defined alongside downplay_draw_right_preview, but
+ * called from the recents/system dispose hooks much earlier in the
+ * file. */
+static void dp_free_thumbhash_placeholder(downplay_handle_t *dp);
 
 /* One settings list.  Stack-allocated when small / static (root
  * Options); heap-allocated when row count is dynamic (core options). */
@@ -469,6 +483,26 @@ struct downplay_handle_s
     * is the wall-clock origin (cpu_features_get_time_usec). */
    uintptr_t           preview_last_tex;
    retro_time_t        preview_fade_started_us;
+
+   /* Thumbhash placeholder cache.  When the selected row has dims +
+    * thumbhash but the real image isn't on disk yet, we decode the
+    * thumbhash into a small BGRA texture and draw it in the same
+    * slot the real image will eventually fill.  Single-slot — only
+    * the selected row gets a placeholder; selection change frees and
+    * redecodes.  The key is an FNV1a-32 of the thumbhash bytes; 0
+    * means "no placeholder cached".  Texture dims are deliberately
+    * tiny (~32 long edge); GPU bilinear scaling produces the soft-
+    * focus look the placeholder is supposed to have.
+    *
+    * Lifetime: textured slot survives only this frame's draw cycle
+    * by virtue of the key check — every frame, if the selected
+    * row's thumbhash hash differs from the cached key, we
+    * teardown+redecode.  On view exit, dp_free_thumbhash_placeholder
+    * is called from the dispose hooks. */
+   uintptr_t           preview_thumbhash_tex;
+   unsigned            preview_thumbhash_w;
+   unsigned            preview_thumbhash_h;
+   uint32_t            preview_thumbhash_key;
 
    /* Cached "Resume <Game>" availability for the launcher's TOP view.
     * Refreshed on rebuild_lists; if true, a Resume row is prepended
@@ -1546,6 +1580,7 @@ static void downplay_save_picker_dispose(void *user, void *side)
     * its first texture in from zero, not skip the fade because the
     * GPU happened to recycle a texture handle we still had cached. */
    dp->preview_last_tex = 0;
+   dp_free_thumbhash_placeholder(dp);
 }
 
 static void downplay_open_recents(downplay_handle_t *dp)
@@ -1606,6 +1641,9 @@ static void downplay_system_dispose(void *user, void *side)
     * next view's first texture restarts the smoothstep from alpha 0
     * even if the GPU recycles a previously-seen handle. */
    dp->preview_last_tex = 0;
+   /* Drop any cached thumbhash placeholder.  Single-slot cache —
+    * the next two-pane view's selected row will redecode lazily. */
+   dp_free_thumbhash_placeholder(dp);
 }
 
 /* Drill into a system's ROM list.  No-op when sys_idx is out of
@@ -4468,6 +4506,203 @@ enum downplay_preview_scale
  * art sizes; below ~80 ms the eye reads it as a hard pop. */
 #define DP_PREVIEW_FADE_US 120000
 
+/* Long-edge resolution for the decoded thumbhash placeholder.  The
+ * decoded buffer is uploaded as a small texture and bilinearly
+ * scaled to fill the same pane the real image will occupy when it
+ * lands.  32 px is plenty: the placeholder is intentionally
+ * low-frequency, and decoding is O(target_w * target_h * coefs).
+ * Smaller → faster decode; larger → marginally sharper edges that
+ * the user would never notice. */
+#define DP_THUMBHASH_LONG_EDGE 32u
+
+/* FNV1a-32 over the thumbhash bytes, used as a cache key for the
+ * decoded placeholder texture.  Identity-comparing against the
+ * pointer would be wrong: the thumbhash bytes' lifetime is tied to
+ * the manager's index buffer, which the manager may reload during a
+ * pump (per the public lifetime contract).  The hash, by contrast,
+ * is stable across reloads as long as the entry's bytes haven't
+ * changed.  Returns 0 only for the empty-input degenerate case;
+ * we use 0 as the "no placeholder cached" sentinel, which is fine
+ * since we never decode an empty thumbhash. */
+static uint32_t dp_thumbhash_key(const uint8_t *bytes, size_t len)
+{
+   uint32_t h = 0x811c9dc5u;
+   if (!bytes || len == 0)
+      return 0;
+   while (len--)
+   {
+      h ^= *bytes++;
+      h *= 0x01000193u;
+   }
+   /* Avoid colliding with the sentinel; flip a bit if we landed on 0. */
+   return h ? h : 1u;
+}
+
+/* Free the cached placeholder texture if any.  Idempotent — when
+ * tex is 0, the dim/key fields are already 0 by construction (every
+ * write site sets all four together). */
+static void dp_free_thumbhash_placeholder(downplay_handle_t *dp)
+{
+   if (!dp || !dp->preview_thumbhash_tex)
+      return;
+   video_driver_texture_unload(&dp->preview_thumbhash_tex);
+   dp->preview_thumbhash_tex = 0;
+   dp->preview_thumbhash_w   = 0;
+   dp->preview_thumbhash_h   = 0;
+   dp->preview_thumbhash_key = 0;
+}
+
+/* Decode `thumbhash` (already-known-non-NULL) into a small BGRA
+ * texture and stash it on dp.  Aspect-correct downscale to
+ * DP_THUMBHASH_LONG_EDGE so the placeholder's aspect matches the
+ * eventual image's; the FIT scale path in downplay_draw_right_preview
+ * then produces the same on-screen rect for both, eliminating size
+ * jank when the real image swaps in. */
+static void dp_load_thumbhash_placeholder(
+      downplay_handle_t *dp,
+      const uint8_t *thumbhash, size_t th_len,
+      uint16_t img_w, uint16_t img_h,
+      uint32_t key)
+{
+   unsigned             dec_w;
+   unsigned             dec_h;
+   uint8_t             *bgra;
+   struct texture_image ti;
+   uintptr_t            tex = 0;
+
+   /* Aspect-correct downscale.  Round-half-up; clamp short edge to 1. */
+   if (img_w >= img_h)
+   {
+      dec_w = DP_THUMBHASH_LONG_EDGE;
+      dec_h = (unsigned)(((unsigned)dec_w * img_h
+            + (img_w >> 1)) / img_w);
+      if (dec_h < 1) dec_h = 1;
+   }
+   else
+   {
+      dec_h = DP_THUMBHASH_LONG_EDGE;
+      dec_w = (unsigned)(((unsigned)dec_h * img_w
+            + (img_h >> 1)) / img_h);
+      if (dec_w < 1) dec_w = 1;
+   }
+
+   bgra = (uint8_t*)malloc((size_t)dec_w * dec_h * 4u);
+   if (!bgra)
+      return;
+   if (!downplay_thumbhash_decode(thumbhash, th_len, dec_w, dec_h, bgra))
+   {
+      free(bgra);
+      return;
+   }
+
+   /* texture_image owns its `pixels` only conceptually — driver paths
+    * memcpy out before returning, so we free immediately after. */
+   ti.pixels        = (uint32_t*)bgra;
+   ti.width         = dec_w;
+   ti.height        = dec_h;
+   ti.supports_rgba = false;
+   if (!video_driver_texture_load(&ti, TEXTURE_FILTER_LINEAR, &tex))
+   {
+      free(bgra);
+      return;
+   }
+   free(bgra);
+   dp->preview_thumbhash_tex = tex;
+   dp->preview_thumbhash_w   = dec_w;
+   dp->preview_thumbhash_h   = dec_h;
+   dp->preview_thumbhash_key = key;
+}
+
+/* Resolve the texture + dims to draw in the right-preview pane.
+ * Prefers the real image when its `gfx_thumbnail_t` has finished
+ * loading (status == AVAILABLE).  Falls back to a thumbhash-decoded
+ * placeholder when (a) we have a thumbhash + dims for the row and
+ * (b) the real isn't ready.  Returns (0, 0, 0) when neither is
+ * available — caller draws an empty pane.
+ *
+ * Side effect: may decode + upload a placeholder texture, or free
+ * a stale one.  Single-slot cache: only one placeholder lives at a
+ * time, keyed by the FNV1a hash of the row's thumbhash bytes.
+ *
+ * Fade interaction: the swap from placeholder → real triggers
+ * downplay_draw_right_preview's fade restart (texture identity
+ * changed), so the real image fades in cleanly while the
+ * placeholder vanishes the same frame.  No cross-fade — same hard-
+ * pop policy as the rest of the preview path. */
+static void dp_resolve_preview_tex(
+      downplay_handle_t     *dp,
+      const gfx_thumbnail_t *real,
+      const uint8_t         *thumbhash,
+      size_t                 th_len,
+      uint16_t               img_w,
+      uint16_t               img_h,
+      uintptr_t             *out_tex,
+      unsigned              *out_w,
+      unsigned              *out_h)
+{
+   *out_tex = 0;
+   *out_w   = 0;
+   *out_h   = 0;
+   if (real)
+   {
+      enum gfx_thumbnail_status st = (enum gfx_thumbnail_status)
+            retro_atomic_load_acquire_int(
+               (retro_atomic_int_t*)&real->status);
+      if (st == GFX_THUMBNAIL_STATUS_AVAILABLE && real->texture)
+      {
+         /* Placeholder → real swap: skip the fade-from-transparent
+          * the right-preview drawer would otherwise apply on
+          * texture identity change.  The placeholder has been
+          * showing at full alpha; the real image should inherit
+          * that, not pop in via 120 ms of see-through-the-pane
+          * fade.  Pre-update preview_last_tex so the drawer's
+          * `tex != preview_last_tex` check is false (no fade
+          * restart), and backdate fade_started_us by one full fade
+          * window so the smoothstep clamps to 1.  No cross-fade —
+          * placeholder vanishes, real takes its place at the same
+          * alpha, on the same frame. */
+         if (dp->preview_thumbhash_tex
+               && dp->preview_last_tex == dp->preview_thumbhash_tex)
+         {
+            dp->preview_last_tex        = real->texture;
+            dp->preview_fade_started_us = cpu_features_get_time_usec()
+                                        - DP_PREVIEW_FADE_US;
+         }
+         /* Real image arrived — drop any stale placeholder so the
+          * VRAM cost is bounded to one image at a time. */
+         if (dp->preview_thumbhash_tex)
+            dp_free_thumbhash_placeholder(dp);
+         *out_tex = real->texture;
+         *out_w   = real->width;
+         *out_h   = real->height;
+         return;
+      }
+   }
+
+   /* Real not ready — try thumbhash placeholder. */
+   if (thumbhash && th_len > 0 && img_w > 0 && img_h > 0)
+   {
+      uint32_t key = dp_thumbhash_key(thumbhash, th_len);
+      if (key != dp->preview_thumbhash_key)
+      {
+         dp_free_thumbhash_placeholder(dp);
+         dp_load_thumbhash_placeholder(dp, thumbhash, th_len,
+               img_w, img_h, key);
+      }
+      if (dp->preview_thumbhash_tex)
+      {
+         *out_tex = dp->preview_thumbhash_tex;
+         *out_w   = dp->preview_thumbhash_w;
+         *out_h   = dp->preview_thumbhash_h;
+         return;
+      }
+   }
+
+   /* Nothing to draw and no need to keep an old placeholder around. */
+   if (dp->preview_thumbhash_tex)
+      dp_free_thumbhash_placeholder(dp);
+}
+
 /* Aspect-fit a (src_w × src_h) image into a (pane_w × pane_h) box;
  * return the resulting on-screen width in pixels.  Cross-product
  * comparison keeps the math integer-only and matches the body of the
@@ -4568,7 +4803,16 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
     * moves, async loads, MISSING→OK retries — all hit this branch.
     * One timestamp read per frame: reusing `now` for the fade origin
     * gives the first frame `t == 0` exactly, so the alpha < 1/255
-    * guard below skips its draw cleanly. */
+    * guard below skips its draw cleanly.
+    *
+    * NOTE: dp_resolve_preview_tex (called immediately before this
+    * function on the same frame) may have pre-set preview_last_tex
+    * to the incoming `tex` and backdated preview_fade_started_us
+    * to skip the fade-from-zero on a placeholder→real swap.  When
+    * that happens, the equality check below sees no change and the
+    * existing alpha (already at 1 after the backdate) carries over,
+    * which is the intended hard-substitute behavior.  Don't refactor
+    * this block without also touching the resolver. */
    now = cpu_features_get_time_usec();
    if (tex != dp->preview_last_tex)
    {
@@ -4708,44 +4952,55 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    else if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
          && dp->roms && dp->nav.selection < dp->rom_count)
    {
-      const gfx_thumbnail_t *t = &dp->roms[dp->nav.selection].thumbnail;
-      enum gfx_thumbnail_status st = (enum gfx_thumbnail_status)
-            retro_atomic_load_acquire_int((retro_atomic_int_t*)&t->status);
-      uintptr_t  tex = 0;
-      unsigned   w   = 0;
-      unsigned   h   = 0;
-      if (st == GFX_THUMBNAIL_STATUS_AVAILABLE)
-      {
-         tex = t->texture;
-         w   = t->width;
-         h   = t->height;
-      }
+      const downplay_rom_t  *rom = &dp->roms[dp->nav.selection];
+      const gfx_thumbnail_t *t   = &rom->thumbnail;
+      const uint8_t         *th  = NULL;
+      size_t                 thlen = 0;
+      const char            *base;
+      uintptr_t              tex = 0;
+      unsigned               w   = 0;
+      unsigned               h   = 0;
+      /* Peek the thumbhash for the placeholder fallback.  Cheap; no
+       * I/O.  base_path may be NULL very early; in that case th
+       * stays NULL and dp_resolve_preview_tex returns no fallback. */
+      base = rom->full_path ? path_basename(rom->full_path) : NULL;
+      if (dp->current_thumbs && base && *base)
+         downplay_thumbs_peek(dp->current_thumbs, base,
+               NULL, NULL, &th, &thlen);
+      dp_resolve_preview_tex(dp, t, th, thlen,
+            rom->image_w, rom->image_h, &tex, &w, &h);
       downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
             DOWNPLAY_PREVIEW_SCALE_FIT);
    }
    else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS
          && dp->recents && dp->nav.selection < dp->recent_row_count)
    {
-      const gfx_thumbnail_t *t = &dp->recents[dp->nav.selection].thumbnail;
-      enum gfx_thumbnail_status st = (enum gfx_thumbnail_status)
-            retro_atomic_load_acquire_int((retro_atomic_int_t*)&t->status);
-      uintptr_t  tex = 0;
-      unsigned   w   = 0;
-      unsigned   h   = 0;
-      if (st == GFX_THUMBNAIL_STATUS_AVAILABLE)
-      {
-         tex = t->texture;
-         w   = t->width;
-         h   = t->height;
-      }
+      const downplay_recent_t *re = &dp->recents[dp->nav.selection];
+      const gfx_thumbnail_t   *t  = &re->thumbnail;
+      uintptr_t                tex = 0;
+      unsigned                 w   = 0;
+      unsigned                 h   = 0;
+      /* Recents deliberately does NOT show a thumbhash placeholder.
+       * The recents resolver is read-only — it never kicks HTTP
+       * image fetches — so on a cold cache the placeholder would
+       * sit there forever with no real image ever replacing it,
+       * which reads as broken rather than "loading".  Pass NULL
+       * thumbhash so dp_resolve_preview_tex falls through to the
+       * empty-pane path; the row's image_w/image_h still drive the
+       * per-row text-truncation gate so the layout is correct. */
+      dp_resolve_preview_tex(dp, t, NULL, 0,
+            re->image_w, re->image_h, &tex, &w, &h);
       downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
             DOWNPLAY_PREVIEW_SCALE_FIT);
    }
    else
    {
       /* Single-pane view (TOP, INGAME): clear the fade tracker so
-       * re-entering a two-pane view starts fresh from alpha 0. */
+       * re-entering a two-pane view starts fresh from alpha 0.
+       * Also drop any placeholder texture; we won't be drawing it. */
       dp->preview_last_tex = 0;
+      if (dp->preview_thumbhash_tex)
+         dp_free_thumbhash_placeholder(dp);
    }
 
    /* Rows on top of the preview so the selected row's full-width pill
@@ -4779,9 +5034,13 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
          }
          else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS
                && dp->recents && row_idx < dp->recent_row_count
+               && dp->recents[row_idx].image_cached
                && dp->recents[row_idx].image_w > 0
                && dp->recents[row_idx].image_h > 0)
          {
+            /* Recents truncates only when the image is actually on
+             * disk — recents never fetches, so a non-cached row will
+             * never show art and shouldn't sacrifice text width. */
             int img_w = downplay_image_pane_width(pane_full_w, pane_h,
                   dp->recents[row_idx].image_w,
                   dp->recents[row_idx].image_h);
@@ -4999,6 +5258,35 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * user scrolls. */
    downplay_thumbs_recents_pump(dp->recents_thumbs);
 
+   /* Probe per-row image-on-disk state.  Once true, sticky — so the
+    * cost is bounded to one stat per row per frame *only while the
+    * row's image hasn't landed*.  A side-trip into the row's system
+    * view downloads the image; coming back here, the next frame's
+    * stat flips image_cached → true and the truncation gate engages.
+    *
+    * downplay_thumbs_recents_resolve returns true iff (a) the system
+    * index is loaded, (b) the cascade matches the basename, AND (c)
+    * the resolved image file is on disk (final path_is_valid in the
+    * resolver).  All three conditions are what we want gated on,
+    * which is why the discarded `path` is the right primitive
+    * rather than a separate "is cached" check. */
+   {
+      size_t             i;
+      downplay_recent_t *re;
+      char               path[DP_THUMBS_PATH_MAX];
+      for (i = 0; i < dp->recent_row_count; i++)
+      {
+         re = &dp->recents[i];
+         if (re->image_cached)
+            continue;
+         if (!re->db_name || !re->rom_basename)
+            continue;
+         if (downplay_thumbs_recents_resolve(dp->recents_thumbs,
+                  re->db_name, re->rom_basename, path, sizeof(path)))
+            re->image_cached = true;
+      }
+   }
+
    /* Populate per-row dims for the row drawer's truncation gate.
     * Side-effect-free + cheap (~50 ns/row × ~30 rows max); each call
     * succeeds the moment the row's system index has been pumped in.
@@ -5019,7 +5307,8 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
          if (!re->db_name || !re->rom_basename)
             continue;
          if (downplay_thumbs_recents_peek(dp->recents_thumbs,
-                  re->db_name, re->rom_basename, &w, &h))
+                  re->db_name, re->rom_basename,
+                  &w, &h, NULL, NULL))
          {
             re->image_w = w;
             re->image_h = h;
@@ -6018,6 +6307,9 @@ static void downplay_menu_context_destroy(void *data)
     * cover the in-stack cases, but context_destroy fires regardless of
     * whether SYSTEM/SAVE_PICKER are currently on the nav stack. */
    dp->preview_last_tex = 0;
+   /* Same rationale for the thumbhash placeholder texture — context
+    * teardown invalidates the underlying GPU handle. */
+   dp_free_thumbhash_placeholder(dp);
    /* Pop everything down to the ground TOP frame.  Settings frames
     * hold lists whose row data may include pointers into the core
     * options manager (RA-owned, possibly torn down before us); a

@@ -1641,12 +1641,15 @@ bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r)
 
 bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
-      uint16_t *out_w, uint16_t *out_h)
+      uint16_t *out_w, uint16_t *out_h,
+      const uint8_t **out_thumbhash, size_t *out_thumbhash_len)
 {
    dp_recents_slot_t *slot;
    size_t             mi;
-   if (out_w) *out_w = 0;
-   if (out_h) *out_h = 0;
+   if (out_w)             *out_w = 0;
+   if (out_h)             *out_h = 0;
+   if (out_thumbhash)     *out_thumbhash = NULL;
+   if (out_thumbhash_len) *out_thumbhash_len = 0;
    if (!r || !rom_basename || !*rom_basename)
       return false;
    if (!dp_system_safe(system))
@@ -1663,6 +1666,14 @@ bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
       dp_idx_dims(slot->index, (uint32_t)mi, &w, &h);
       if (out_w) *out_w = w;
       if (out_h) *out_h = h;
+   }
+   if (out_thumbhash)
+   {
+      const uint8_t *p = NULL;
+      size_t         n = 0;
+      dp_idx_thumbhash(slot->index, (uint32_t)mi, &p, &n);
+      *out_thumbhash = p;
+      if (out_thumbhash_len) *out_thumbhash_len = n;
    }
    return true;
 }
