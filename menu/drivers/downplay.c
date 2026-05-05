@@ -295,6 +295,12 @@ typedef struct
     * target_h); row_h = available / n, clamped to [40,72]*scale.  Not
     * shipped yet because target devices have plenty of vertical room. */
    float scale;
+   /* Last user_scale_factor used to derive `scale`.  Tracked so the
+    * change-detector can compare the integer/source inputs that *drive*
+    * the layout (vid_w, vid_h, user_scale_factor) instead of comparing
+    * the derived `scale` float, which is unreliable across recompute
+    * paths if intermediate FPU precision differs. */
+   float scale_factor;
    unsigned vid_w;
    unsigned vid_h;
    enum downplay_aspect_bp aspect_bp;
@@ -432,8 +438,14 @@ struct downplay_handle_s
     * sentinel — 0 wouldn't work because `thumb_prev_selection != 0`
     * is a valid post-init state.  The `prev < rom_count` guard in the
     * drive function handles the sentinel naturally (SIZE_MAX exceeds
-    * any rom_count). */
-   size_t              thumb_prev_selection;
+    * any rom_count).
+    *
+    * Per-view: SYSTEM and RECENTS index into different arrays
+    * (`roms[]` vs `recents[]`), so a single shared field would alias if
+    * a future code path ever switched views without firing the dispose
+    * hook that resets it. */
+   size_t              thumb_prev_selection_sys;
+   size_t              thumb_prev_selection_rec;
 
    /* Right-pane preview fade-in.  When the texture being drawn changes
     * (selection moved, async load completed, missing→ok retry hit), we
@@ -1495,7 +1507,7 @@ static void downplay_recents_dispose(void *user, void *side)
    dp->recent_row_count    = 0;
    downplay_thumbs_recents_close(dp->recents_thumbs);
    dp->recents_thumbs      = NULL;
-   dp->thumb_prev_selection = SIZE_MAX;
+   dp->thumb_prev_selection_rec = SIZE_MAX;
    /* Reset the right-pane fade key so re-entering a two-pane view
     * starts fresh from alpha 0 even if the GPU recycled a handle. */
    dp->preview_last_tex    = 0;
@@ -1538,8 +1550,8 @@ static void downplay_open_recents(downplay_handle_t *dp)
    dp->recents          = downplay_build_recents(&dp->recent_row_count);
    /* Cheap allocation; no I/O until the per-frame pump fires. */
    downplay_thumbs_recents_close(dp->recents_thumbs);
-   dp->recents_thumbs        = downplay_thumbs_recents_open();
-   dp->thumb_prev_selection  = SIZE_MAX;
+   dp->recents_thumbs            = downplay_thumbs_recents_open();
+   dp->thumb_prev_selection_rec  = SIZE_MAX;
    /* Seed every distinct db_name across the row set so the per-frame
     * pump can pre-warm them in seed order, one .idx read per frame.
     * Without this, the first hover on each system pays a synchronous
@@ -1574,9 +1586,9 @@ static void downplay_system_dispose(void *user, void *side)
     * blank the path_data so set_system / set_content from a
     * subsequent system enter start clean. */
    downplay_roms_free(dp->roms, dp->rom_count);
-   dp->roms                 = NULL;
-   dp->rom_count            = 0;
-   dp->thumb_prev_selection = SIZE_MAX;
+   dp->roms                     = NULL;
+   dp->rom_count                = 0;
+   dp->thumb_prev_selection_sys = SIZE_MAX;
    if (dp->current_index)
    {
       downplay_index_close(dp->current_index);
@@ -1618,9 +1630,9 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
       return;
 
    downplay_roms_free(dp->roms, dp->rom_count);
-   dp->roms                 = NULL;
-   dp->rom_count            = 0;
-   dp->thumb_prev_selection = SIZE_MAX;
+   dp->roms                     = NULL;
+   dp->rom_count                = 0;
+   dp->thumb_prev_selection_sys = SIZE_MAX;
 
    sys           = &dp->systems[sys_idx];
    dp->roms      = downplay_scan_roms(sys->full_path, &dp->rom_count);
@@ -1894,6 +1906,7 @@ static void downplay_layout_recompute(downplay_layout_t *L,
       scale = 0.5f;
 
    L->scale            = scale;
+   L->scale_factor     = user_scale_factor;
    L->vid_w            = video_width;
    L->vid_h            = video_height;
 
@@ -1945,13 +1958,13 @@ static void downplay_layout_recompute(downplay_layout_t *L,
 static bool downplay_layout_changed(const downplay_layout_t *L,
       unsigned video_width, unsigned video_height, float user_scale_factor)
 {
-   float want_scale =
-      ((float)video_height / DOWNPLAY_REF_HEIGHT) * user_scale_factor;
-   if (want_scale < 0.5f)
-      want_scale = 0.5f;
-   return     L->vid_w != video_width
-           || L->vid_h != video_height
-           || L->scale != want_scale;
+   /* Compare the source inputs that drive the layout, not the derived
+    * `scale` float — float == on a re-derived value is bit-fragile if
+    * intermediate FPU precision differs across paths.  user_scale_factor
+    * is the raw user setting and is bit-stable across reads. */
+   return     L->vid_w        != video_width
+           || L->vid_h        != video_height
+           || L->scale_factor != user_scale_factor;
 }
 
 /* Forward decls for settings-list lifecycle (defined further down). */
@@ -4778,10 +4791,10 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
       downplay_thumbs_pump(dp->current_thumbs);
 
    /* Selection change → reset the prior selection's thumbnail. */
-   if (   dp->thumb_prev_selection != sel
-       && dp->thumb_prev_selection < dp->rom_count)
-      gfx_thumbnail_reset(&dp->roms[dp->thumb_prev_selection].thumbnail);
-   dp->thumb_prev_selection = sel;
+   if (   dp->thumb_prev_selection_sys != sel
+       && dp->thumb_prev_selection_sys < dp->rom_count)
+      gfx_thumbnail_reset(&dp->roms[dp->thumb_prev_selection_sys].thumbnail);
+   dp->thumb_prev_selection_sys = sel;
 
    if (!dp->current_thumbs)
       return; /* No db_name → no art for this system, ever. */
@@ -4916,13 +4929,13 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * is global (bumps RA's thumbnail list_id, dropping every
     * in-flight load), which is fine here — recents only ever has
     * one row's load in flight at a time. */
-   if (   dp->thumb_prev_selection != sel
-       && dp->thumb_prev_selection < dp->recent_row_count)
+   if (   dp->thumb_prev_selection_rec != sel
+       && dp->thumb_prev_selection_rec < dp->recent_row_count)
    {
       gfx_thumbnail_cancel_pending_requests();
-      gfx_thumbnail_reset(&dp->recents[dp->thumb_prev_selection].thumbnail);
+      gfx_thumbnail_reset(&dp->recents[dp->thumb_prev_selection_rec].thumbnail);
    }
-   dp->thumb_prev_selection = sel;
+   dp->thumb_prev_selection_rec = sel;
 
    row = &dp->recents[sel];
    if (!row->db_name || !*row->db_name)
@@ -5819,7 +5832,8 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
     * on so the cached dp->nav.view + dp->nav.selection can't drift. */
    dp_nav_init(&dp->nav, DOWNPLAY_VIEW_TOP,
          downplay_after_nav_change, dp);
-   dp->thumb_prev_selection = SIZE_MAX;
+   dp->thumb_prev_selection_sys = SIZE_MAX;
+   dp->thumb_prev_selection_rec = SIZE_MAX;
    /* Upstream only fires HISTORY_INIT lazily on first content load
     * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
     * is NULL and our "Recently Played" row never appears.  Guard so menu
@@ -5909,13 +5923,23 @@ static void downplay_menu_free(void *data)
    if (!dp)
       return;
    downplay_menu_context_destroy(dp);
-   /* Index is normally closed by system_dispose on pop_to_TOP, which
-    * context_destroy triggered above; this branch only fires if the
-    * destroy path skipped it (defensive). */
+   /* Index/thumbs are normally closed by system_dispose / recents_dispose
+    * on pop_to_TOP, which context_destroy triggered above; these branches
+    * only fire if the destroy path skipped them (defensive). */
    if (dp->current_index)
    {
       downplay_index_close(dp->current_index);
       dp->current_index = NULL;
+   }
+   if (dp->current_thumbs)
+   {
+      downplay_thumbs_close(dp->current_thumbs);
+      dp->current_thumbs = NULL;
+   }
+   if (dp->recents_thumbs)
+   {
+      downplay_thumbs_recents_close(dp->recents_thumbs);
+      dp->recents_thumbs = NULL;
    }
    /* systems / roms are CPU-only state, freed here rather than in
     * context_destroy so they survive GPU context loss/reset cycles. */

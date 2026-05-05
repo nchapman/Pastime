@@ -354,7 +354,11 @@ void downplay_cores_cancel(void)
       return;
    if (g_state.state == DOWNPLAY_CORES_AWAITING_LIST)
    {
-      g_state.state = DOWNPLAY_CORES_DONE;
+      /* The list task may have already been freed by the task scheduler;
+       * drop our pointer so a stale deref can't sneak in if the module is
+       * re-entered before the next begin_boot_setup clears the queue. */
+      g_state.list_task = NULL;
+      g_state.state     = DOWNPLAY_CORES_DONE;
       return;
    }
    /* INSTALLING: let the in-flight task finish; the callback will see

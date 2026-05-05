@@ -24,23 +24,31 @@ INC="-I${PROJECT_ROOT}/libretro-common/include"
 DEFS="-DDOWNPLAY_NAV_TEST_BUILD"
 CFLAGS="${CFLAGS:--std=c99 -Wall -Wextra -Wpedantic -Wno-unused-function -O0 -g}"
 
+# Track binaries we build this run; only those get executed below.
+# Globbing test_* would otherwise re-run stale binaries left behind
+# by a previous failed build.
+BUILT=()
+
 # --- nav stack ---
 echo "== building test_nav"
 $CC $CFLAGS $DEFS $INC \
     test_nav.c ../downplay_nav.c \
     -o test_nav
+BUILT+=(test_nav)
 
 # --- metadata disambiguation table ---
 echo "== building test_metadata_disambig"
 $CC $CFLAGS $INC \
     test_metadata_disambig.c ../downplay_metadata_disambig.c \
     -o test_metadata_disambig
+BUILT+=(test_metadata_disambig)
 
 # --- display-name cleaner ---
 echo "== building test_display_name"
 $CC $CFLAGS $INC \
     test_display_name.c ../downplay_display_name.c \
     -o test_display_name
+BUILT+=(test_display_name)
 
 # --- thumbnail match cascade ---
 echo "== building test_thumbs"
@@ -48,12 +56,11 @@ $CC $CFLAGS -DDOWNPLAY_THUMBS_TEST_BUILD $INC \
     test_thumbs.c ../downplay_thumbs.c ../downplay_display_name.c \
     "${PROJECT_ROOT}/libretro-common/formats/json/rjson.c" \
     -o test_thumbs
+BUILT+=(test_thumbs)
 
-# --- run all built tests ---
+# --- run only what we just built ---
 fail=0
-for bin in test_*; do
-   # Skip non-files (clang's debug-symbol dirs, source files).
-   [[ -f "$bin" && -x "$bin" && ! "$bin" == *.c ]] || continue
+for bin in "${BUILT[@]}"; do
    echo "== running $bin"
    ./"$bin" || fail=1
    echo

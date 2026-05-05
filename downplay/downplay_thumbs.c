@@ -1760,11 +1760,14 @@ struct downplay_thumbs
    uint8_t  queue_pri[DP_THUMBS_QUEUE_CAP]; /* 1=active, 0=prefetch */
    int      queue_head, queue_tail;
 
-   /* Bounded set of currently-fetching entry indices.  Replaces the
-    * old O(N) recount sweep — pump only stats this small set, and we
-    * compact in place when an entry lands. */
-   uint32_t fetching[DP_THUMBS_INFLIGHT_MAX];
-   int      inflight;
+   /* Bounded set of currently-fetching transfer contexts.  Each entry
+    * is a heap-allocated `dp_img_transfer_t` whose RA HTTP task is in
+    * flight; on completion the callback writes attempt[e_idx] and
+    * compacts itself out of this array.  On manager close, each ctx's
+    * mgr pointer is nulled so any not-yet-fired callback short-circuits
+    * cleanly without touching freed manager state. */
+   struct dp_img_transfer *outstanding[DP_THUMBS_INFLIGHT_MAX];
+   int                     inflight;
 
    /* Diagnostic miss log.  Appended on first definitive miss
     * (index loaded, no match) for a given basename; in-memory set
@@ -1784,6 +1787,23 @@ enum
    DP_ATT_ON_DISK,
    DP_ATT_FAILED
 };
+
+/* Subtype of file_transfer_t for per-image fetches.  Carries enough
+ * context for the HTTP completion callback to write the manager's
+ * `attempt[e_idx]` directly, instead of relying on a polling
+ * path_is_valid() sweep that never sees failed fetches.  `mgr` is
+ * nulled by downplay_thumbs_close() before the manager is freed, so
+ * a callback that fires after close drops its writes safely.
+ *
+ * Defined here (rather than alongside dp_pf_transfer_t below) so it's
+ * in scope for both dp_drain_queue and dp_cb_image_download — the
+ * struct field `outstanding[]` declared above also needs the tag. */
+typedef struct dp_img_transfer
+{
+   file_transfer_t      base;     /* must be first; .path is the on-disk dest */
+   downplay_thumbs_t   *mgr;      /* NULL after manager close — see above */
+   uint32_t             e_idx;    /* index into mgr->index entries */
+} dp_img_transfer_t;
 
 /* ---- internal: paths ---- */
 
@@ -2157,12 +2177,13 @@ static void dp_cb_image_download(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
    http_transfer_data_t *data   = (http_transfer_data_t*)task_data;
-   file_transfer_t      *transf = (file_transfer_t*)user_data;
+   dp_img_transfer_t    *ctx    = (dp_img_transfer_t*)user_data;
+   file_transfer_t      *transf = ctx ? &ctx->base : NULL;
    char                  output_dir[DP_THUMBS_PATH_MAX];
    char                  tmp_path[DP_THUMBS_PATH_MAX];
    (void)task;
 
-   if (!transf)
+   if (!ctx)
       return;
    if (!data || !data->data || !*transf->path)
       goto finish;
@@ -2231,7 +2252,31 @@ finish:
    if (err && *err)
       RARCH_WARN("[Downplay] thumbs image \"%s\" failed: %s\n",
             transf->path, err);
-   free(transf);
+   /* Settle manager state directly from the callback.  Failed fetches
+    * used to leave entries permanently pinned at DP_ATT_FETCHING — the
+    * old reaper polled path_is_valid() and never observed misses, so
+    * after DP_THUMBS_INFLIGHT_MAX failures the queue would deadlock.
+    * Now the callback writes the terminal state and frees its slot. */
+   if (ctx->mgr && ctx->mgr->index && ctx->mgr->attempt)
+   {
+      downplay_thumbs_t *t     = ctx->mgr;
+      uint32_t           e_idx = ctx->e_idx;
+      int                i;
+      /* err is set by every failure branch above (non-200, magic-byte
+       * mismatch, mkdir/write/rename failure), so an empty err here
+       * means the rename succeeded and the canonical file is on disk. */
+      if (e_idx < t->index->entry_count)
+         t->attempt[e_idx] = (err && *err) ? DP_ATT_FAILED : DP_ATT_ON_DISK;
+      for (i = 0; i < t->inflight; i++)
+      {
+         if (t->outstanding[i] == ctx)
+         {
+            t->outstanding[i] = t->outstanding[--t->inflight];
+            break;
+         }
+      }
+   }
+   free(ctx);
 }
 
 /* ---- internal: miss log ----
@@ -2470,44 +2515,21 @@ static void dp_queue_push(downplay_thumbs_t *t, uint32_t entry_idx, uint8_t pri)
    }
 }
 
-/* Stat each currently-fetching entry; if its file has landed,
- * compact the entry out of the fetching[] set and decrement inflight.
- * O(inflight) — bounded to DP_THUMBS_INFLIGHT_MAX, not O(entries). */
-static void dp_reap_inflight(downplay_thumbs_t *t)
-{
-   int  i = 0;
-   char path[DP_THUMBS_PATH_MAX];
-   while (i < t->inflight)
-   {
-      uint32_t e_idx = t->fetching[i];
-      if (e_idx >= t->index->entry_count)
-      {
-         /* Defensive: invalid entry — drop. */
-         t->fetching[i] = t->fetching[--t->inflight];
-         continue;
-      }
-      dp_build_image_path(t, dp_idx_canonical(t->index, e_idx),
-            path, sizeof(path));
-      if (path_is_valid(path))
-      {
-         t->attempt[e_idx] = DP_ATT_ON_DISK;
-         t->fetching[i]    = t->fetching[--t->inflight];
-         continue;
-      }
-      i++;
-   }
-}
-
 /* Drain one queue slot to an in-flight HTTP task if we're below the
  * concurrency cap.  Called from pump.  Caller is responsible for
- * looping (within budget) — this only dispatches at most one task. */
+ * looping (within budget) — this only dispatches at most one task.
+ *
+ * Inflight bookkeeping: on successful task push we record the heap
+ * `dp_img_transfer_t` in t->outstanding[].  The HTTP completion
+ * callback writes the terminal attempt state (ON_DISK or FAILED) and
+ * compacts itself out of that array.  No polling sweep needed. */
 static void dp_drain_queue(downplay_thumbs_t *t)
 {
    uint32_t e_idx;
    const char *canonical;
    char path[DP_THUMBS_PATH_MAX];
    char url[2048];
-   file_transfer_t *transf;
+   dp_img_transfer_t *ctx;
 
    if (t->load_state != DP_LOAD_READY)
       return;
@@ -2539,20 +2561,24 @@ static void dp_drain_queue(downplay_thumbs_t *t)
    dp_build_image_url(t, canonical, url, sizeof(url));
    if (!*url)
       return;
-   transf = (file_transfer_t*)calloc(1, sizeof(*transf));
-   if (!transf)
+   ctx = (dp_img_transfer_t*)calloc(1, sizeof(*ctx));
+   if (!ctx)
       return;
-   transf->enum_idx = MSG_UNKNOWN;
-   strlcpy(transf->path, path, sizeof(transf->path));
+   ctx->base.enum_idx = MSG_UNKNOWN;
+   strlcpy(ctx->base.path, path, sizeof(ctx->base.path));
+   ctx->mgr   = t;
+   ctx->e_idx = e_idx;
+   /* Pass &ctx->base (file_transfer_t*); the callback casts user_data
+    * back to dp_img_transfer_t* via the first-member-aliasing rule. */
    if (!task_push_http_transfer_file(url, true /* mute */, NULL,
-            dp_cb_image_download, transf))
+            dp_cb_image_download, &ctx->base))
    {
-      free(transf);
+      free(ctx);
       t->attempt[e_idx] = DP_ATT_FAILED;
       return;
    }
-   t->attempt[e_idx]      = DP_ATT_FETCHING;
-   t->fetching[t->inflight++] = e_idx;
+   t->attempt[e_idx]            = DP_ATT_FETCHING;
+   t->outstanding[t->inflight++] = ctx;
 }
 
 /* ---- index prefetch (boot-time fan-out) ---------------------------
@@ -2599,8 +2625,11 @@ typedef struct
  * obvious vector; NUL / control chars in the middle are a subtler one
  * — they'd silently truncate our `g_pf_inflight` keys (kernel terminates
  * at NUL) and let two concurrent fetches dodge dedup with different
- * effective names but the same ToS prefix. */
-static bool dp_pf_system_safe(const char *system)
+ * effective names but the same ToS prefix.  Single source of truth:
+ * downplay_thumbs_open / recents API / prefetch all funnel through
+ * this validator — they treat `system` as both a URL component and a
+ * filesystem directory name, so the rules are the same for all three. */
+static bool dp_system_safe(const char *system)
 {
    const unsigned char *p;
    if (!system || !*system)
@@ -2788,7 +2817,7 @@ static void dp_pf_drain(void)
        * the public-API path filters at enqueue, but if any future
        * code path inserts directly into g_pf_pending this stops a
        * bogus name from reaching the wire. */
-      if (!dp_pf_system_safe(system))
+      if (!dp_system_safe(system))
          continue;
       /* Re-check freshness right before issuing — the file may have
        * landed in the window between enqueue and drain (e.g. a user
@@ -2846,7 +2875,7 @@ void downplay_thumbs_prefetch_indexes(
       char idx_path[DP_THUMBS_PATH_MAX];
       int64_t age;
 
-      if (!dp_pf_system_safe(system))
+      if (!dp_system_safe(system))
          continue;
       /* Bound: must fit our fixed-size slot. */
       if (strlen(system) >= sizeof(g_pf_pending[0]))
@@ -2890,15 +2919,11 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
    char root[DP_THUMBS_PATH_MAX];
    char base[DP_THUMBS_PATH_MAX];
 
-   if (!system || !*system)
-      return NULL;
    /* `system` is used as both a URL path component AND a filesystem
     * directory name; reject anything that could escape either.  In
     * the common path it comes from the curated disambig table, but
     * the core_info `database` fallback is third-party content. */
-   if (   strstr(system, "..")
-       || strchr(system, '/')
-       || strchr(system, '\\'))
+   if (!dp_system_safe(system))
       return NULL;
    if (!downplay_paths_get_root(root, sizeof(root)))
       return NULL;
@@ -2954,11 +2979,17 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
 
 void downplay_thumbs_close(downplay_thumbs_t *t)
 {
+   int i;
    if (!t)
       return;
-   /* In-flight HTTP tasks for this manager's images have user_data
-    * that's a self-contained file_transfer_t — they don't reference
-    * the manager, so closing is safe. */
+   /* Detach in-flight HTTP tasks: they hold dp_img_transfer_t* whose
+    * `mgr` field we null here.  Any callback that fires after we
+    * return sees mgr==NULL and skips its writes to manager state
+    * (attempt[], outstanding[]) before freeing its own ctx. */
+   for (i = 0; i < t->inflight; i++)
+      if (t->outstanding[i])
+         t->outstanding[i]->mgr = NULL;
+   t->inflight = 0;
    downplay_thumbs_index_free(t->index);
    free(t->attempt);
    {
@@ -3076,8 +3107,9 @@ void downplay_thumbs_pump(downplay_thumbs_t *t)
    }
    if (t->load_state != DP_LOAD_READY)
       return;
-   /* Reap completed fetches first to free in-flight slots. */
-   dp_reap_inflight(t);
+   /* No reap step: dp_cb_image_download settles attempt[e_idx] and
+    * removes itself from t->outstanding directly, so finished/failed
+    * slots are already free by the time we get here. */
    /* Drain queued requests up to the concurrency cap. */
    for (budget = DP_THUMBS_INFLIGHT_MAX; budget > 0; budget--)
    {
@@ -3167,20 +3199,6 @@ static dp_recents_slot_t *dp_recents_get_slot(
       return NULL;
    r->count++;
    return s;
-}
-
-/* Same path-traversal guards as downplay_thumbs_open.  Inlined here
- * because the recents API is the only other consumer of `system` as
- * a filesystem path component. */
-static bool dp_system_safe(const char *system)
-{
-   if (!system || !*system)
-      return false;
-   if (strstr(system, ".."))
-      return false;
-   if (strchr(system, '/') || strchr(system, '\\'))
-      return false;
-   return true;
 }
 
 /* Lazy-load the slot's binary index from disk if not yet attempted.

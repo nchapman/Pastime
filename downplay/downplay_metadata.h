@@ -84,16 +84,19 @@ downplay_index_t *downplay_index_open(const char *system_folder_name,
  * NULL. */
 void downplay_index_close(downplay_index_t *idx);
 
-/* Look up an entry by basename.  Validates against (mtime, size); on
- * mismatch returns false (caller treats as UNKNOWN).  Pure read; no
- * I/O, no blocking. */
+/* Look up an entry by basename.  Pure read; no I/O, no blocking.
+ * `mtime`/`size` are vestigial — accepted so call sites don't have to
+ * change, but no longer drive any validity check.  See the comment
+ * above the implementation for the rationale (art_state is layout-only
+ * and self-heals; the per-file stat() it relied on cost ~150 ms per
+ * system enter on Android FUSE). */
 bool downplay_index_lookup(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size,
       downplay_index_record_t *out);
 
-/* Note that an entry exists in the filesystem.  Idempotent.  Creates
- * a stub if unknown; if (mtime, size) differs invalidates the cached
- * art_state.  Call once per ROM at scan time. */
+/* Note that an entry exists in the filesystem.  Idempotent.  Creates a
+ * stub if unknown.  Call once per ROM at scan time.  `mtime`/`size`
+ * are vestigial (see downplay_index_lookup). */
 void downplay_index_note_present(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size);
 

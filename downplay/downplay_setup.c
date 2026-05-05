@@ -299,7 +299,11 @@ static void downplay_setup_bucket_http_cb(retro_task_t *task,
    }
 
    {
-      static char dir_buf[PATH_MAX_LENGTH];
+      /* Stack-local; the RA task system is single-threaded (callbacks
+       * fire on the main thread via task_queue_check), so a static
+       * isn't load-bearing — and `dir_path` is consumed before this
+       * function returns, so the buffer doesn't need to outlive it. */
+      char dir_buf[PATH_MAX_LENGTH];
       if (!downplay_setup_resolve_dir(b, settings, dir_buf, sizeof(dir_buf)))
       {
          RARCH_WARN("[Downplay-setup] no install dir for %s\n",
