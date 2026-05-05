@@ -62,24 +62,29 @@
 
 /* On-disk binary index format.  Replaces gzipped JSON as the cached
  * representation: parse JSON once on download, emit a packed binary
- * file, then every subsequent open is a `pread` + 32-byte header
+ * file, then every subsequent open is a `pread` + 40-byte header
  * validation — no JSON, no allocations beyond the buffer itself.
  *
  * Layout (little-endian, 4-byte aligned sections):
  *
- *   [HEADER 32B]
+ *   [HEADER 40B]
  *     u32 magic           = 'DPTH'
- *     u32 version         = 1
+ *     u32 version         = 2
  *     u32 entry_count
  *     u32 strings_size
- *     u32 entries_off     -- always 32
+ *     u32 thumbhash_size  -- bytes in the thumbhash pool
+ *     u32 entries_off     -- always 40
  *     u32 by_canonical_off
  *     u32 by_heavy_off
  *     u32 strings_off
+ *     u32 thumbhash_off   -- pool sits after strings
  *
- *   [ENTRIES, 8 bytes each, original load order]
+ *   [ENTRIES, 16 bytes each, original load order]
  *     u32 canonical_off   -- offset into string pool
  *     u32 heavy_off
+ *     u16 width           -- 0 if unknown (server omitted dims)
+ *     u16 height
+ *     u32 thumbhash_off   -- 1-based pool offset; 0 == "no thumbhash"
  *
  *   [BY_CANONICAL, u32 entry indices, sorted by strcmp(canonical)]
  *
@@ -88,15 +93,27 @@
  *
  *   [STRINGS, packed NUL-terminated string pool, dedup'd]
  *
- *   [FOOTER 8B]
+ *   [THUMBHASH POOL, packed (u8 len; u8 bytes[len]) records]
+ *     Variable-length, length-prefixed.  Offsets stored in entries
+ *     are 1-based so 0 cleanly indicates "absent".  No dedup pass —
+ *     alt-name expansion (one canonical → multiple entries with the
+ *     same image) does duplicate the bytes, but the per-entry payload
+ *     is ~25 bytes and bundles are rare; not worth the dedup hash.
+ *
+ *   [FOOTER 12B]
  *     u32 magic_repeat
+ *     u32 version_repeat
  *     u32 entry_count_repeat
  *
  * Tiebreak fields (region / rev / bad_dump / disc) are NOT stored —
  * they're derived from the canonical name on demand inside the
  * cascade.  Per-query cost is bounded (cascade walks 1-5 candidates;
  * helpers are ~50 ns each).  Net win: zero per-record metadata
- * overhead, no parse-time computation, single source of truth.
+ * overhead for tiebreaks, no parse-time computation, single source of
+ * truth.  Width / height / thumbhash, by contrast, ARE stored: they
+ * can't be derived from the canonical, and the menu driver needs them
+ * synchronously at row-layout time (before any image fetch) to pick
+ * per-row text widths.
  *
  * Hash in BY_HEAVY (fnv1a-32 of the heavy string) lets bsearch
  * compare 32-bit ints on the hot path, only falling through to
@@ -107,12 +124,17 @@
  * Webp is always present on the server (we control it), so format
  * size fields are gone too — every image URL ends in `.webp`. */
 #define DP_IDX_MAGIC      0x48545044u  /* 'D','P','T','H' LE */
-#define DP_IDX_VERSION    1u
-#define DP_IDX_HEADER_SZ  32u
-#define DP_IDX_FOOTER_SZ  8u
-#define DP_IDX_REC_SZ     8u           /* canonical_off + heavy_off */
+#define DP_IDX_VERSION    2u
+#define DP_IDX_HEADER_SZ  40u
+#define DP_IDX_FOOTER_SZ  12u
+#define DP_IDX_REC_SZ     16u          /* canon_off + heavy_off + w + h + th_off */
 #define DP_IDX_BCAN_SZ    4u           /* entry_idx */
 #define DP_IDX_BHEV_SZ    8u           /* hash + entry_idx */
+/* Thumbhash bytes are the binary form (post-base64-decode).  evanw's
+ * encoder produces 5..25 bytes; pad the cap to 32 to give the format
+ * room without bumping the length-byte to u16 if they ever extend the
+ * spec. */
+#define DP_IDX_THUMBHASH_MAX 32u
 
 /* ---------------------------------------------------------------- */
 /* Section 1: parse-time entry struct + normalization + tiebreaks   */
@@ -120,14 +142,18 @@
 
 /* Transient struct used during JSON parse only.  Does NOT survive
  * past `downplay_thumbs_index_parse` — we emit a binary buffer from
- * a temp array of these and free them.  All tiebreak data is
- * derived from `canonical` on demand at cascade time, which is why
- * this struct only carries the two strings the binary format needs
- * to persist. */
+ * a temp array of these and free them.  Tiebreak data is derived
+ * from `canonical` on demand at cascade time; width / height /
+ * thumbhash, by contrast, are persisted to the binary format because
+ * the menu driver needs them at row-layout time. */
 typedef struct
 {
-   char *canonical;     /* exactly the index.json key */
-   char *heavy;         /* normalized form for the bsearch index */
+   char    *canonical;     /* exactly the index.json key */
+   char    *heavy;          /* normalized form for the bsearch index */
+   uint8_t *thumbhash;      /* binary thumbhash bytes, post-base64-decode (NULL if absent) */
+   uint16_t width;          /* 0 if absent in JSON */
+   uint16_t height;
+   uint8_t  thumbhash_len;  /* 0 if absent */
 } dp_thumb_entry_t;
 
 /* Validate the id portion of a disc/cd/side tag — i.e. the bytes
@@ -625,9 +651,15 @@ typedef struct
    dp_parse_state_t state_stack[16];
    int              depth;            /* current depth, 0 == before root */
 
-   /* Accumulator for the entry currently being parsed.  NULL between
-    * entries; strdup'd while we're inside one. */
-   char *cur_canonical;
+   /* Accumulators for the entry currently being parsed.  Reset on
+    * every new entry-key seen at DP_PS_AT_FILES depth; consumed and
+    * reset by dp_commit_entry on entry close.  cur_canonical is the
+    * sentinel — NULL between entries, strdup'd while inside one. */
+   char    *cur_canonical;
+   uint8_t *cur_thumbhash;
+   uint16_t cur_width;
+   uint16_t cur_height;
+   uint8_t  cur_thumbhash_len;
 
    /* Last seen object-member name; consumed by the next value handler. */
    char  last_member[256];
@@ -637,6 +669,21 @@ typedef struct
 
    bool  oom;
 } dp_parse_ctx_t;
+
+/* Reset the entry-scoped accumulators in the parse context so a new
+ * entry starts clean.  Leaves last_member / state stack alone — those
+ * are managed by the caller.  Defined here so dp_commit_entry can
+ * call it; the JSON value handlers further down do too. */
+static void dp_parse_ctx_reset_entry(dp_parse_ctx_t *c)
+{
+   free(c->cur_canonical);
+   free(c->cur_thumbhash);
+   c->cur_canonical     = NULL;
+   c->cur_thumbhash     = NULL;
+   c->cur_thumbhash_len = 0;
+   c->cur_width         = 0;
+   c->cur_height        = 0;
+}
 
 static bool dp_idx_grow(dp_parse_index_t *idx)
 {
@@ -664,7 +711,10 @@ static bool dp_idx_grow(dp_parse_index_t *idx)
  * without re-running it on the same canonical.  Returns false on
  * OOM (caller propagates). */
 static bool dp_append_entry(dp_parse_index_t *idx,
-      const char *canonical, const char *heavy, bool *oom)
+      const char *canonical, const char *heavy,
+      uint16_t width, uint16_t height,
+      const uint8_t *thumbhash, uint8_t thumbhash_len,
+      bool *oom)
 {
    dp_thumb_entry_t *e;
    if (idx->entries_count == idx->entries_cap && !dp_idx_grow(idx))
@@ -673,17 +723,35 @@ static bool dp_append_entry(dp_parse_index_t *idx,
       return false;
    }
    e = &idx->entries[idx->entries_count];
+   memset(e, 0, sizeof(*e));
    e->canonical = strdup(canonical);
    e->heavy     = strdup(heavy);
    if (!e->canonical || !e->heavy)
+      goto fail;
+   /* Alt-name expansion produces multiple entries that share the same
+    * canonical key (and image).  Each gets its own copy of the
+    * thumbhash bytes — no per-entry refcount; bundles are rare and the
+    * payload is ~25 bytes, not worth the ledger. */
+   if (thumbhash && thumbhash_len > 0)
    {
-      free(e->canonical);
-      free(e->heavy);
-      *oom = true;
-      return false;
+      e->thumbhash = (uint8_t*)malloc(thumbhash_len);
+      if (!e->thumbhash)
+         goto fail;
+      memcpy(e->thumbhash, thumbhash, thumbhash_len);
+      e->thumbhash_len = thumbhash_len;
    }
+   e->width  = width;
+   e->height = height;
    idx->entries_count++;
    return true;
+
+fail:
+   free(e->canonical);
+   free(e->heavy);
+   free(e->thumbhash);
+   memset(e, 0, sizeof(*e));
+   *oom = true;
+   return false;
 }
 
 /* Commit cur_canonical as one or more entries.  Most canonicals
@@ -715,7 +783,9 @@ static bool dp_commit_entry(dp_parse_ctx_t *c)
    dp_normalize_heavy(c->cur_canonical, heavy_buf, sizeof(heavy_buf));
    if (*heavy_buf)
    {
-      if (!dp_append_entry(idx, c->cur_canonical, heavy_buf, &c->oom))
+      if (!dp_append_entry(idx, c->cur_canonical, heavy_buf,
+               c->cur_width, c->cur_height,
+               c->cur_thumbhash, c->cur_thumbhash_len, &c->oom))
          goto fail;
       any_committed = true;
    }
@@ -761,7 +831,10 @@ static bool dp_commit_entry(dp_parse_ctx_t *c)
                            idx->entries_count - 1].heavy) != 0)
                {
                   if (!dp_append_entry(idx, c->cur_canonical,
-                           heavy_buf, &c->oom))
+                           heavy_buf,
+                           c->cur_width, c->cur_height,
+                           c->cur_thumbhash, c->cur_thumbhash_len,
+                           &c->oom))
                      goto fail;
                }
 seg_advance:
@@ -774,14 +847,12 @@ seg_advance:
       }
    }
 
-   free(c->cur_canonical);
-   c->cur_canonical = NULL;
+   dp_parse_ctx_reset_entry(c);
    (void)any_committed;
    return true;
 
 fail:
-   free(c->cur_canonical);
-   c->cur_canonical = NULL;
+   dp_parse_ctx_reset_entry(c);
    return false;
 }
 
@@ -822,6 +893,62 @@ static bool dp_canonical_safe(const char *s, size_t len)
    return true;
 }
 
+/* Decode standard base64 (with optional '=' padding and whitespace).
+ * Writes binary bytes to `out`; returns decoded length on success or 0
+ * on malformed input (caller treats absent thumbhash as 0-length).
+ * Used only for the per-entry "thumbhash" field — small inputs (~32
+ * b64 chars), bounded by the caller's `out_cap`. */
+static int dp_base64_byte(unsigned char c)
+{
+   if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+   if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 26;
+   if (c >= '0' && c <= '9') return (int)(c - '0') + 52;
+   if (c == '+' || c == '-') return 62;  /* '-' = url-safe alphabet */
+   if (c == '/' || c == '_') return 63;  /* '_' = url-safe alphabet */
+   return -1;
+}
+
+static size_t dp_base64_decode(const char *in, size_t in_len,
+      uint8_t *out, size_t out_cap)
+{
+   size_t i, o = 0;
+   int    quad[4];
+   size_t qi = 0;
+   for (i = 0; i < in_len; i++)
+   {
+      unsigned char ch = (unsigned char)in[i];
+      int           v;
+      if (ch == '=' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t')
+         continue;
+      v = dp_base64_byte(ch);
+      if (v < 0)
+         return 0;
+      quad[qi++] = v;
+      if (qi == 4)
+      {
+         if (o + 3 > out_cap) return 0;
+         out[o++] = (uint8_t)((quad[0] << 2) | (quad[1] >> 4));
+         out[o++] = (uint8_t)(((quad[1] & 0xf) << 4) | (quad[2] >> 2));
+         out[o++] = (uint8_t)(((quad[2] & 0x3) << 6) | quad[3]);
+         qi = 0;
+      }
+   }
+   if (qi == 1)
+      return 0;  /* trailing 6 bits is malformed */
+   if (qi == 2)
+   {
+      if (o + 1 > out_cap) return 0;
+      out[o++] = (uint8_t)((quad[0] << 2) | (quad[1] >> 4));
+   }
+   else if (qi == 3)
+   {
+      if (o + 2 > out_cap) return 0;
+      out[o++] = (uint8_t)((quad[0] << 2) | (quad[1] >> 4));
+      out[o++] = (uint8_t)(((quad[1] & 0xf) << 4) | (quad[2] >> 2));
+   }
+   return o;
+}
+
 static bool dp_h_member(void *ctx, const char *str, size_t len)
 {
    dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx;
@@ -838,8 +965,7 @@ static bool dp_h_member(void *ctx, const char *str, size_t len)
     * stay in sync with rjson's depth tracking. */
    if (c->depth >= 1 && c->state_stack[c->depth - 1] == DP_PS_AT_FILES)
    {
-      free(c->cur_canonical);
-      c->cur_canonical = NULL;
+      dp_parse_ctx_reset_entry(c);
       if (!dp_canonical_safe(str, len))
          return true;
       c->cur_canonical = (char*)malloc(len + 1);
@@ -915,15 +1041,51 @@ static bool dp_h_end_array(void *ctx)
    return true;
 }
 
+/* Parse a JSON-emitted unsigned integer string into a u16-bounded int.
+ * Returns -1 if `s` isn't a clean ASCII decimal in [0, 65535] —
+ * negative, too long, sign chars, decimals, or exponent forms all
+ * fall through to "not a width/height we can use" and are silently
+ * dropped (entry will record dims as 0 / "absent"). */
+static int dp_parse_uint_str(const char *s, size_t len)
+{
+   size_t i;
+   long   v = 0;
+   if (len == 0 || len > 5)
+      return -1;
+   for (i = 0; i < len; i++)
+   {
+      if (s[i] < '0' || s[i] > '9')
+         return -1;
+      v = v * 10 + (s[i] - '0');
+      if (v > 65535)
+         return -1;
+   }
+   return (int)v;
+}
+
 static bool dp_h_number(void *ctx, const char *str, size_t len)
 {
    dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx;
-   (void)str; (void)len;
-   /* `formats.{jpg,webp}` numbers are still emitted by the server
-    * but we no longer care: webp is always available, the URL never
-    * carries a size, and the binary format stores no per-entry size.
-    * The handler keeps consuming the value to stay in sync with
-    * rjson's depth tracking. */
+   /* `formats.{jpg,webp}` and `source.size` numbers fall through —
+    * webp is always available, sizes aren't persisted.  We capture
+    * width/height inside an entry; the binary format stores both. */
+   if (   c->depth >= 1
+       && c->state_stack[c->depth - 1] == DP_PS_IN_ENTRY
+       && c->cur_canonical)
+   {
+      if (!strcmp(c->last_member, "width"))
+      {
+         int v = dp_parse_uint_str(str, len);
+         if (v >= 0)
+            c->cur_width = (uint16_t)v;
+      }
+      else if (!strcmp(c->last_member, "height"))
+      {
+         int v = dp_parse_uint_str(str, len);
+         if (v >= 0)
+            c->cur_height = (uint16_t)v;
+      }
+   }
    c->last_member[0] = '\0';
    return true;
 }
@@ -931,7 +1093,33 @@ static bool dp_h_number(void *ctx, const char *str, size_t len)
 static bool dp_h_string(void *ctx, const char *str, size_t len)
 {
    dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx;
-   (void)str; (void)len;
+   if (   c->depth >= 1
+       && c->state_stack[c->depth - 1] == DP_PS_IN_ENTRY
+       && c->cur_canonical
+       && !strcmp(c->last_member, "thumbhash"))
+   {
+      uint8_t  scratch[DP_IDX_THUMBHASH_MAX];
+      size_t   n;
+      /* Bounded base64 input.  Conservative cap: a 32-byte binary
+       * thumbhash needs at most 44 b64 chars (with padding); accept
+       * up to 64 to tolerate whitespace, then reject if the decoded
+       * length exceeds the format cap. */
+      if (len == 0 || len > 64)
+         goto consume;
+      n = dp_base64_decode(str, len, scratch, sizeof(scratch));
+      if (n == 0 || n > DP_IDX_THUMBHASH_MAX)
+         goto consume;
+      free(c->cur_thumbhash);
+      c->cur_thumbhash = (uint8_t*)malloc(n);
+      if (!c->cur_thumbhash)
+      {
+         c->oom = true;
+         return false;
+      }
+      memcpy(c->cur_thumbhash, scratch, n);
+      c->cur_thumbhash_len = (uint8_t)n;
+   }
+consume:
    c->last_member[0] = '\0';
    return true;
 }
@@ -1122,12 +1310,14 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
    uint8_t          *buf      = NULL;
    uint32_t         *can_offs = NULL;
    uint32_t         *hev_offs = NULL;
+   uint32_t         *th_offs  = NULL;     /* 1-based pool offsets, 0 == absent */
    dp_sort_canon_t  *bcanon   = NULL;
    dp_sort_heavy_t  *bheavy   = NULL;
    dp_strpool_t      pool;
    size_t          i;
-   size_t          entries_off, bcanon_off, bheavy_off, strings_off, footer_off;
-   size_t          entries_sz, bcanon_sz, bheavy_sz, total;
+   size_t          entries_off, bcanon_off, bheavy_off, strings_off;
+   size_t          thumbhash_off, footer_off;
+   size_t          entries_sz, bcanon_sz, bheavy_sz, thumbhash_size, total;
    bool            ok = false;
 
    memset(&pool, 0, sizeof(pool));
@@ -1138,7 +1328,8 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
    {
       can_offs = (uint32_t*)malloc(n * sizeof(*can_offs));
       hev_offs = (uint32_t*)malloc(n * sizeof(*hev_offs));
-      if (!can_offs || !hev_offs)
+      th_offs  = (uint32_t*)calloc(n, sizeof(*th_offs));
+      if (!can_offs || !hev_offs || !th_offs)
          goto out;
    }
    for (i = 0; i < n; i++)
@@ -1149,15 +1340,29 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
          goto out;
    }
 
-   entries_off = DP_IDX_HEADER_SZ;
-   entries_sz  = n * DP_IDX_REC_SZ;
-   bcanon_off  = entries_off + entries_sz;
-   bcanon_sz   = n * DP_IDX_BCAN_SZ;
-   bheavy_off  = bcanon_off + bcanon_sz;
-   bheavy_sz   = n * DP_IDX_BHEV_SZ;
-   strings_off = bheavy_off + bheavy_sz;
-   footer_off  = strings_off + pool.size;
-   total       = footer_off + DP_IDX_FOOTER_SZ;
+   /* Compute thumbhash pool size and assign 1-based offsets.  No dedup
+    * pass: most canonicals produce one entry; alt-name expansion does
+    * duplicate ~25 bytes per extra segment, but bundles are rare. */
+   thumbhash_size = 0;
+   for (i = 0; i < n; i++)
+   {
+      uint8_t tlen = entries[i].thumbhash_len;
+      if (tlen == 0 || !entries[i].thumbhash)
+         continue;
+      th_offs[i] = (uint32_t)(thumbhash_size + 1);  /* 1-based */
+      thumbhash_size += 1u + (size_t)tlen;          /* len byte + bytes */
+   }
+
+   entries_off    = DP_IDX_HEADER_SZ;
+   entries_sz     = n * DP_IDX_REC_SZ;
+   bcanon_off     = entries_off + entries_sz;
+   bcanon_sz      = n * DP_IDX_BCAN_SZ;
+   bheavy_off     = bcanon_off + bcanon_sz;
+   bheavy_sz      = n * DP_IDX_BHEV_SZ;
+   strings_off    = bheavy_off + bheavy_sz;
+   thumbhash_off  = strings_off + pool.size;
+   footer_off     = thumbhash_off + thumbhash_size;
+   total          = footer_off + DP_IDX_FOOTER_SZ;
 
    /* All section offsets are written into the header as u32.  Today
     * the entry-count cap (100k) and the string-pool cap (1 GB) keep
@@ -1165,7 +1370,9 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
     * any offset past UINT32_MAX would silently produce a truncated
     * header that subsequent dp_idx_open calls would fail with no
     * useful error.  Fail loudly here instead. */
-   if (footer_off > UINT32_MAX || pool.size > UINT32_MAX)
+   if (footer_off > UINT32_MAX
+         || pool.size > UINT32_MAX
+         || thumbhash_size > UINT32_MAX)
       goto out;
 
    buf = (uint8_t*)calloc(total, 1);
@@ -1176,22 +1383,30 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
     * memcpy of host u32 — Downplay ships only on LE targets. */
    {
       uint32_t v;
-      v = DP_IDX_MAGIC;            memcpy(buf +  0, &v, 4);
-      v = DP_IDX_VERSION;          memcpy(buf +  4, &v, 4);
-      v = (uint32_t)n;             memcpy(buf +  8, &v, 4);
-      v = (uint32_t)pool.size;     memcpy(buf + 12, &v, 4);
-      v = (uint32_t)entries_off;   memcpy(buf + 16, &v, 4);
-      v = (uint32_t)bcanon_off;    memcpy(buf + 20, &v, 4);
-      v = (uint32_t)bheavy_off;    memcpy(buf + 24, &v, 4);
-      v = (uint32_t)strings_off;   memcpy(buf + 28, &v, 4);
+      v = DP_IDX_MAGIC;              memcpy(buf +  0, &v, 4);
+      v = DP_IDX_VERSION;            memcpy(buf +  4, &v, 4);
+      v = (uint32_t)n;               memcpy(buf +  8, &v, 4);
+      v = (uint32_t)pool.size;       memcpy(buf + 12, &v, 4);
+      v = (uint32_t)thumbhash_size;  memcpy(buf + 16, &v, 4);
+      v = (uint32_t)entries_off;     memcpy(buf + 20, &v, 4);
+      v = (uint32_t)bcanon_off;      memcpy(buf + 24, &v, 4);
+      v = (uint32_t)bheavy_off;      memcpy(buf + 28, &v, 4);
+      v = (uint32_t)strings_off;     memcpy(buf + 32, &v, 4);
+      v = (uint32_t)thumbhash_off;   memcpy(buf + 36, &v, 4);
    }
 
-   /* ENTRIES section: u32 canonical_off, u32 heavy_off per entry,
-    * original load order. */
+   /* ENTRIES section: u32 canonical_off, u32 heavy_off, u16 width,
+    * u16 height, u32 thumbhash_off (1-based; 0 = absent). */
    for (i = 0; i < n; i++)
    {
-      memcpy(buf + entries_off + i * DP_IDX_REC_SZ + 0, &can_offs[i], 4);
-      memcpy(buf + entries_off + i * DP_IDX_REC_SZ + 4, &hev_offs[i], 4);
+      uint8_t  *rec = buf + entries_off + i * DP_IDX_REC_SZ;
+      uint16_t  w   = entries[i].width;
+      uint16_t  h   = entries[i].height;
+      memcpy(rec +  0, &can_offs[i], 4);
+      memcpy(rec +  4, &hev_offs[i], 4);
+      memcpy(rec +  8, &w,           2);
+      memcpy(rec + 10, &h,           2);
+      memcpy(rec + 12, &th_offs[i],  4);
    }
 
    /* BY_CANONICAL: u32 entry indices sorted by strcmp(canonical).
@@ -1239,12 +1454,29 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
    if (pool.size > 0)
       memcpy(buf + strings_off, pool.data, pool.size);
 
-   /* Footer: magic + entry_count repeat.  Catches partial writes on
-    * FUSE-backed filesystems where rename(2) isn't reliably atomic. */
+   /* Thumbhash pool: walk entries in load order, writing
+    * (u8 len; u8 bytes[len]) at the offset assigned earlier.  Skip
+    * entries with no thumbhash (th_offs[i] == 0). */
+   for (i = 0; i < n; i++)
+   {
+      uint8_t tlen = entries[i].thumbhash_len;
+      uint8_t *dst;
+      if (th_offs[i] == 0)
+         continue;
+      dst = buf + thumbhash_off + (th_offs[i] - 1);
+      *dst++ = tlen;
+      memcpy(dst, entries[i].thumbhash, tlen);
+   }
+
+   /* Footer: magic + version + entry_count repeat.  Version mirror
+    * gives belt-and-braces detection of v1-binary-with-hand-edited-
+    * version-byte attacks; the layout check would already catch them
+    * on record-size mismatch, but this is one more u32 of compare. */
    {
       uint32_t v;
-      v = DP_IDX_MAGIC; memcpy(buf + footer_off + 0, &v, 4);
-      v = (uint32_t)n;  memcpy(buf + footer_off + 4, &v, 4);
+      v = DP_IDX_MAGIC;   memcpy(buf + footer_off + 0, &v, 4);
+      v = DP_IDX_VERSION; memcpy(buf + footer_off + 4, &v, 4);
+      v = (uint32_t)n;    memcpy(buf + footer_off + 8, &v, 4);
    }
 
    *out_buf = buf;
@@ -1256,6 +1488,7 @@ out:
    dp_strpool_free(&pool);
    free(can_offs);
    free(hev_offs);
+   free(th_offs);
    free(bcanon);
    free(bheavy);
    free(buf);
@@ -1281,6 +1514,8 @@ struct downplay_thumbs_index
    uint32_t  bheavy_off;
    uint32_t  strings_off;
    uint32_t  strings_size;
+   uint32_t  thumbhash_off;
+   uint32_t  thumbhash_size;
 };
 
 /* All field reads go through memcpy.  Avoids strict-aliasing UB and
@@ -1308,25 +1543,27 @@ static uint32_t dp_idx_read_u32(const uint8_t *base, size_t off)
 downplay_thumbs_index_t *dp_idx_open(uint8_t *buf, size_t buf_len)
 {
    downplay_thumbs_index_t *idx;
-   uint32_t magic, version, entry_count, strings_size;
-   uint32_t entries_off, bcanon_off, bheavy_off, strings_off;
+   uint32_t magic, version, entry_count, strings_size, thumbhash_size;
+   uint32_t entries_off, bcanon_off, bheavy_off, strings_off, thumbhash_off;
    uint64_t entries_sz, bcanon_sz, bheavy_sz, footer_off, expected;
-   uint32_t fmagic, fcount;
+   uint32_t fmagic, fversion, fcount;
 
    if (!buf || buf_len < (size_t)(DP_IDX_HEADER_SZ + DP_IDX_FOOTER_SZ))
       goto fail;
 
-   magic        = dp_idx_read_u32(buf,  0);
-   version      = dp_idx_read_u32(buf,  4);
-   entry_count  = dp_idx_read_u32(buf,  8);
-   strings_size = dp_idx_read_u32(buf, 12);
-   entries_off  = dp_idx_read_u32(buf, 16);
-   bcanon_off   = dp_idx_read_u32(buf, 20);
-   bheavy_off   = dp_idx_read_u32(buf, 24);
-   strings_off  = dp_idx_read_u32(buf, 28);
+   magic          = dp_idx_read_u32(buf,  0);
+   version        = dp_idx_read_u32(buf,  4);
+   entry_count    = dp_idx_read_u32(buf,  8);
+   strings_size   = dp_idx_read_u32(buf, 12);
+   thumbhash_size = dp_idx_read_u32(buf, 16);
+   entries_off    = dp_idx_read_u32(buf, 20);
+   bcanon_off     = dp_idx_read_u32(buf, 24);
+   bheavy_off     = dp_idx_read_u32(buf, 28);
+   strings_off    = dp_idx_read_u32(buf, 32);
+   thumbhash_off  = dp_idx_read_u32(buf, 36);
 
-   if (magic != DP_IDX_MAGIC)              goto fail;
-   if (version != DP_IDX_VERSION)          goto fail;
+   if (magic != DP_IDX_MAGIC)               goto fail;
+   if (version != DP_IDX_VERSION)           goto fail;
    if (entry_count > DP_THUMBS_MAX_ENTRIES) goto fail;
 
    /* Layout must be exact.  uint64_t math makes overflow impossible
@@ -1334,39 +1571,48 @@ downplay_thumbs_index_t *dp_idx_open(uint8_t *buf, size_t buf_len)
    entries_sz = (uint64_t)entry_count * DP_IDX_REC_SZ;
    bcanon_sz  = (uint64_t)entry_count * DP_IDX_BCAN_SZ;
    bheavy_sz  = (uint64_t)entry_count * DP_IDX_BHEV_SZ;
-   if (entries_off  != DP_IDX_HEADER_SZ)                              goto fail;
-   if ((uint64_t)bcanon_off  != (uint64_t)entries_off + entries_sz)   goto fail;
-   if ((uint64_t)bheavy_off  != (uint64_t)bcanon_off  + bcanon_sz)    goto fail;
-   if ((uint64_t)strings_off != (uint64_t)bheavy_off  + bheavy_sz)    goto fail;
+   if (entries_off    != DP_IDX_HEADER_SZ)                              goto fail;
+   if ((uint64_t)bcanon_off     != (uint64_t)entries_off + entries_sz)  goto fail;
+   if ((uint64_t)bheavy_off     != (uint64_t)bcanon_off  + bcanon_sz)   goto fail;
+   if ((uint64_t)strings_off    != (uint64_t)bheavy_off  + bheavy_sz)   goto fail;
+   if ((uint64_t)thumbhash_off  != (uint64_t)strings_off + strings_size) goto fail;
 
-   footer_off = (uint64_t)strings_off + strings_size;
+   footer_off = (uint64_t)thumbhash_off + thumbhash_size;
    expected   = footer_off + DP_IDX_FOOTER_SZ;
    if ((uint64_t)buf_len != expected)
       goto fail;
 
    /* String pool must end with NUL so strcmp inside the pool needs no
     * per-call bounds check — anything off-by-one would walk straight
-    * into the footer's magic bytes. */
-   if (strings_size > 0 && buf[footer_off - 1] != '\0')
+    * into the thumbhash pool / footer. */
+   if (strings_size > 0 && buf[strings_off + strings_size - 1] != '\0')
       goto fail;
 
-   /* Footer mirrors the header — partial-write detection. */
-   fmagic = dp_idx_read_u32(buf, (size_t)footer_off);
-   fcount = dp_idx_read_u32(buf, (size_t)footer_off + 4);
-   if (fmagic != DP_IDX_MAGIC || fcount != entry_count)
+   /* Footer mirrors the header — partial-write + version-tampering
+    * detection.  Includes the version field since the layout check
+    * above would otherwise be the only guard against a v1 binary
+    * with its version byte hand-edited to 2. */
+   fmagic   = dp_idx_read_u32(buf, (size_t)footer_off);
+   fversion = dp_idx_read_u32(buf, (size_t)footer_off + 4);
+   fcount   = dp_idx_read_u32(buf, (size_t)footer_off + 8);
+   if (   fmagic   != DP_IDX_MAGIC
+       || fversion != DP_IDX_VERSION
+       || fcount   != entry_count)
       goto fail;
 
    idx = (downplay_thumbs_index_t*)calloc(1, sizeof(*idx));
    if (!idx)
       goto fail;
-   idx->buf          = buf;
-   idx->buf_len      = buf_len;
-   idx->entry_count  = entry_count;
-   idx->entries_off  = entries_off;
-   idx->bcanon_off   = bcanon_off;
-   idx->bheavy_off   = bheavy_off;
-   idx->strings_off  = strings_off;
-   idx->strings_size = strings_size;
+   idx->buf            = buf;
+   idx->buf_len        = buf_len;
+   idx->entry_count    = entry_count;
+   idx->entries_off    = entries_off;
+   idx->bcanon_off     = bcanon_off;
+   idx->bheavy_off     = bheavy_off;
+   idx->strings_off    = strings_off;
+   idx->strings_size   = strings_size;
+   idx->thumbhash_off  = thumbhash_off;
+   idx->thumbhash_size = thumbhash_size;
    return idx;
 
 fail:
@@ -1411,6 +1657,54 @@ static const char *dp_idx_heavy(
 {
    return dp_idx_str(idx, dp_idx_read_u32(idx->buf,
          idx->entries_off + (size_t)e * DP_IDX_REC_SZ + 4));
+}
+
+void dp_idx_dims(const downplay_thumbs_index_t *idx, uint32_t e,
+      uint16_t *out_w, uint16_t *out_h)
+{
+   const uint8_t *rec;
+   if (e >= idx->entry_count)
+   {
+      *out_w = 0;
+      *out_h = 0;
+      return;
+   }
+   rec = idx->buf + idx->entries_off + (size_t)e * DP_IDX_REC_SZ;
+   memcpy(out_w, rec +  8, 2);
+   memcpy(out_h, rec + 10, 2);
+}
+
+/* Resolve an entry's thumbhash bytes.  On hit returns a pointer into
+ * the index buffer (caller must NOT free) and writes the byte length;
+ * on absence (or post-validation corruption that produces an OOB
+ * offset) returns NULL with *out_len = 0.  Centralises the 1-based
+ * offset math so call sites never open-code the `-1`. */
+void dp_idx_thumbhash(const downplay_thumbs_index_t *idx, uint32_t e,
+      const uint8_t **out_ptr, size_t *out_len)
+{
+   uint32_t       off;
+   uint8_t        len;
+   const uint8_t *base;
+   *out_ptr = NULL;
+   *out_len = 0;
+   if (e >= idx->entry_count)
+      return;
+   off = dp_idx_read_u32(idx->buf,
+         idx->entries_off + (size_t)e * DP_IDX_REC_SZ + 12);
+   if (off == 0)
+      return;
+   /* off is 1-based.  Need at least one length byte at (off - 1) plus
+    * `len` bytes of payload, all within thumbhash_size. */
+   if ((size_t)off > (size_t)idx->thumbhash_size)
+      return;
+   base = idx->buf + idx->thumbhash_off;
+   len  = base[off - 1];
+   if ((size_t)off + len > (size_t)idx->thumbhash_size)
+      return;
+   if (len == 0)
+      return;
+   *out_ptr = base + off; /* skip the length byte */
+   *out_len = len;
 }
 
 static uint32_t dp_idx_bcanon_at(
@@ -1624,6 +1918,7 @@ static void dp_parse_index_free(dp_parse_index_t *idx)
    {
       free(idx->entries[i].canonical);
       free(idx->entries[i].heavy);
+      free(idx->entries[i].thumbhash);
    }
    free(idx->entries);
    free(idx);
@@ -1661,10 +1956,10 @@ bool dp_idx_parse_json_to_buffer(const char *json, size_t json_len,
          NULL /* error_handler */
 #endif
          );
-   /* Free leftover parse-context state regardless of outcome.
-    * cur_canonical is the only ctx-side allocation that survives
-    * past handlers when parsing aborts mid-entry. */
-   free(ctx.cur_canonical);
+   /* Free leftover parse-context state regardless of outcome.  An
+    * abort mid-entry can leave cur_canonical / cur_thumbhash live;
+    * dp_parse_ctx_reset_entry covers both. */
+   dp_parse_ctx_reset_entry(&ctx);
 
    if (!ok || ctx.oom || !ctx.saw_files_obj)
    {

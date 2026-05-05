@@ -1350,6 +1350,10 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
       return;
    out->status        = DP_THUMB_UNKNOWN;
    out->local_path[0] = '\0';
+   out->image_w       = 0;
+   out->image_h       = 0;
+   out->thumbhash     = NULL;
+   out->thumbhash_len = 0;
    if (!t || !rom_basename || !*rom_basename)
       return;
 
@@ -1379,6 +1383,14 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
       }
       e_idx = (int)mi;
    }
+
+   /* Populate per-entry metadata regardless of where the function
+    * returns from below — the menu driver wants dims at layout time
+    * even before the image file lands on disk.  Thumbhash pointer
+    * lifetime is bounded by t->index (see header contract). */
+   dp_idx_dims(t->index, (uint32_t)e_idx, &out->image_w, &out->image_h);
+   dp_idx_thumbhash(t->index, (uint32_t)e_idx,
+         &out->thumbhash, &out->thumbhash_len);
 
    if (t->attempt[e_idx] == DP_ATT_ON_DISK)
    {
@@ -1411,6 +1423,44 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
    if (t->attempt[e_idx] == DP_ATT_UNTRIED)
       dp_queue_push(t, (uint32_t)e_idx, 1);
    /* status stays UNKNOWN — next frame will see ON_DISK once landed. */
+}
+
+bool downplay_thumbs_peek(downplay_thumbs_t *t,
+      const char *rom_basename,
+      uint16_t *out_w, uint16_t *out_h,
+      const uint8_t **out_thumbhash, size_t *out_thumbhash_len)
+{
+   size_t mi;
+   if (out_w)             *out_w = 0;
+   if (out_h)             *out_h = 0;
+   if (out_thumbhash)     *out_thumbhash = NULL;
+   if (out_thumbhash_len) *out_thumbhash_len = 0;
+   if (!t || !rom_basename || !*rom_basename)
+      return false;
+   /* Caller is responsible for pumping the manager — peek itself
+    * never triggers I/O.  If the index isn't loaded yet, the peek
+    * misses and the caller retries on a later frame. */
+   if (t->load_state != DP_LOAD_READY || !t->index)
+      return false;
+   mi = dp_idx_match(t->index, rom_basename);
+   if (mi == (size_t)-1)
+      return false;
+   if (out_w || out_h)
+   {
+      uint16_t w = 0, h = 0;
+      dp_idx_dims(t->index, (uint32_t)mi, &w, &h);
+      if (out_w) *out_w = w;
+      if (out_h) *out_h = h;
+   }
+   if (out_thumbhash)
+   {
+      const uint8_t *p = NULL;
+      size_t         n = 0;
+      dp_idx_thumbhash(t->index, (uint32_t)mi, &p, &n);
+      *out_thumbhash = p;
+      if (out_thumbhash_len) *out_thumbhash_len = n;
+   }
+   return true;
 }
 
 void downplay_thumbs_prefetch(downplay_thumbs_t *t,
@@ -1587,6 +1637,34 @@ bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r)
       if (dp_recents_slot_load(&r->slots[i]))
          return true;
    return false;
+}
+
+bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
+      const char *system, const char *rom_basename,
+      uint16_t *out_w, uint16_t *out_h)
+{
+   dp_recents_slot_t *slot;
+   size_t             mi;
+   if (out_w) *out_w = 0;
+   if (out_h) *out_h = 0;
+   if (!r || !rom_basename || !*rom_basename)
+      return false;
+   if (!dp_system_safe(system))
+      return false;
+   slot = dp_recents_get_slot(r, system);
+   if (!slot || !slot->index)
+      return false;  /* not yet pumped, or load failed — caller retries */
+   mi = dp_idx_match(slot->index, rom_basename);
+   if (mi == (size_t)-1)
+      return false;
+   if (out_w || out_h)
+   {
+      uint16_t w = 0, h = 0;
+      dp_idx_dims(slot->index, (uint32_t)mi, &w, &h);
+      if (out_w) *out_w = w;
+      if (out_h) *out_h = h;
+   }
+   return true;
 }
 
 bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,

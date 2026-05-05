@@ -77,10 +77,32 @@ enum downplay_thumb_status
    DP_THUMB_MISSING      /* Index loaded; title is not in it. */
 };
 
+/* Per-row lookup result.
+ *
+ * `image_w` / `image_h` / `thumbhash` are populated whenever the
+ * match cascade hits the index, regardless of whether the image
+ * file is on disk yet.  Dims=0 / thumbhash=NULL means either:
+ *   (a) status == DP_THUMB_UNKNOWN  → index not yet loaded; layout
+ *       should fall back to no-art (full-width text), and re-query
+ *       next frame.
+ *   (b) status == DP_THUMB_MISSING  → definitive miss; no art.
+ *   (c) older server build that didn't include dims/thumbhash —
+ *       treat as no-art for layout purposes.
+ *
+ * Lifetime of `thumbhash`: valid until the next downplay_thumbs_close()
+ * (or downplay_thumbs_recents_close()), OR until the next
+ * downplay_thumbs_pump() call that may swap an in-memory index (cold
+ * → loaded transition).  Callers that need to retain it across pump
+ * boundaries must copy the bytes.  Dims (`image_w` / `image_h`) are
+ * value-typed and have no lifetime concerns. */
 typedef struct
 {
    enum downplay_thumb_status status;
    char                       local_path[DP_THUMBS_PATH_MAX];
+   uint16_t                   image_w;
+   uint16_t                   image_h;
+   const uint8_t             *thumbhash;
+   size_t                     thumbhash_len;
 } downplay_thumb_result_t;
 
 /* Open the manager for a canonical system name (e.g.
@@ -124,6 +146,21 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
  * with count==0. */
 void downplay_thumbs_prefetch(downplay_thumbs_t *t,
       const char * const *basenames, size_t count);
+
+/* Side-effect-free metadata lookup.  Runs the match cascade and, on
+ * hit, fills `image_w` / `image_h` / `thumbhash` (lifetime: same as
+ * downplay_thumb_result_t.thumbhash).  Does NOT queue an HTTP fetch
+ * and does NOT stat the cache directory.  Returns true on hit, false
+ * on miss / index-not-loaded / null inputs.
+ *
+ * Used at SYSTEM-view enter to warm per-row layout dims for every
+ * ROM in the folder, before the user has hovered any of them.  Cheap
+ * enough (~50 ns/call + cache-cold memory) to call N times per system
+ * enter for N ~ 20k ROMs without producing visible jank. */
+bool downplay_thumbs_peek(downplay_thumbs_t *t,
+      const char *rom_basename,
+      uint16_t *out_w, uint16_t *out_h,
+      const uint8_t **out_thumbhash, size_t *out_thumbhash_len);
 
 /* Pump the manager.  Called from the menu driver per-frame; advances
  * post-fetch state (re-stat the index after its HTTP task finishes,
@@ -172,6 +209,17 @@ bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r);
 bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
       char *out, size_t out_size);
+
+/* Side-effect-free metadata lookup.  Returns true and fills
+ * `*out_w` / `*out_h` iff the system's binary index is loaded AND
+ * the cascade matches `rom_basename`.  Crucially, this succeeds even
+ * when the cached image isn't on disk yet — the menu driver calls it
+ * per-row to set up text-width before the image lands.  Returns
+ * false on null inputs, missing slot, slot not yet loaded, or
+ * cascade miss.  Does NOT trigger I/O — driver should pump first. */
+bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
+      const char *system, const char *rom_basename,
+      uint16_t *out_w, uint16_t *out_h);
 
 void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r);
 

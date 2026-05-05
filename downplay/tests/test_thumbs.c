@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "../downplay_thumbs.h"
+#include "../downplay_thumbs_internal.h"
 
 /* rjson.c references stream / rfile I/O symbols even on the buffer
  * code paths we use.  We only call rjson_open_buffer / rjson_parse_quick,
@@ -57,7 +58,9 @@ static int g_fail;
 
 /* Build a minimal index JSON given a list of "key" entries.  Each
  * gets a stub formats.{jpg,webp} block — content doesn't matter for
- * cascade tests. */
+ * cascade tests.  The legacy form (no per-entry width/height/
+ * thumbhash) — covers the forward-compat path where the parser
+ * accepts entries without the v2 dim fields and yields 0/NULL. */
 static char *build_idx_json(const char * const *titles, size_t n)
 {
    size_t i;
@@ -75,6 +78,50 @@ static char *build_idx_json(const char * const *titles, size_t n)
       pos += (size_t)snprintf(buf + pos, cap - pos,
             "%s\"%s\":{\"formats\":{\"jpg\":1000,\"webp\":500}}",
             i ? "," : "", titles[i]);
+   }
+   pos += (size_t)snprintf(buf + pos, cap - pos, "}}");
+   (void)pos;
+   return buf;
+}
+
+/* v2 builder: every entry carries width/height/thumbhash sourced
+ * from a parallel array.  Used to exercise the dim + thumbhash
+ * round-trip through the binary format.  Pass NULL for a per-entry
+ * thumbhash slot to omit just that field. */
+typedef struct
+{
+   const char *title;
+   uint16_t    width;
+   uint16_t    height;
+   const char *thumbhash_b64;   /* NULL → field omitted entirely */
+} v2_entry_t;
+
+static char *build_idx_json_v2(const v2_entry_t *entries, size_t n)
+{
+   size_t i;
+   size_t cap = 256;
+   size_t pos;
+   char  *buf;
+   for (i = 0; i < n; i++)
+      cap += strlen(entries[i].title) + 128
+           + (entries[i].thumbhash_b64
+                ? strlen(entries[i].thumbhash_b64) : 0);
+   buf = (char*)malloc(cap);
+   if (!buf) return NULL;
+   pos = (size_t)snprintf(buf, cap,
+         "{\"system\":\"Test\",\"image_type\":\"boxart\",\"files\":{");
+   for (i = 0; i < n; i++)
+   {
+      pos += (size_t)snprintf(buf + pos, cap - pos,
+            "%s\"%s\":{\"formats\":{\"webp\":500}"
+            ",\"width\":%u,\"height\":%u",
+            i ? "," : "", entries[i].title,
+            (unsigned)entries[i].width,
+            (unsigned)entries[i].height);
+      if (entries[i].thumbhash_b64)
+         pos += (size_t)snprintf(buf + pos, cap - pos,
+               ",\"thumbhash\":\"%s\"", entries[i].thumbhash_b64);
+      pos += (size_t)snprintf(buf + pos, cap - pos, "}");
    }
    pos += (size_t)snprintf(buf + pos, cap - pos, "}}");
    (void)pos;
@@ -655,6 +702,323 @@ static void test_filename_extension_edge_cases(void)
    downplay_thumbs_index_free(idx);
 }
 
+/* Round-trip width/height/thumbhash through the v2 binary format and
+ * confirm the cascade returns the per-entry metadata.  The
+ * "41kCFgZi..." string is a real thumbhash from the GB index (32
+ * b64 chars → 24 bytes binary). */
+static void test_v2_dims_and_thumbhash_round_trip(void)
+{
+   v2_entry_t es[] = {
+      { "Pokemon Red (USA, Europe)", 440, 512,
+            "41kCFgZiSQq2lwd3qFSXo7YrqI2P2fk=" },
+      { "Tetris (World)",            512, 512, NULL /* no thumbhash */ },
+   };
+   char *json = build_idx_json_v2(es, 2);
+   downplay_thumbs_index_t *idx;
+   ASSERT_NONNULL(json);
+   idx = downplay_thumbs_index_parse(json, strlen(json));
+   free(json);
+   ASSERT_NONNULL(idx);
+   if (idx)
+   {
+      size_t mi = dp_idx_match(idx, "Pokemon Red (USA, Europe)");
+      ASSERT_TRUE(mi != (size_t)-1);
+      if (mi != (size_t)-1)
+      {
+         uint16_t w = 0, h = 0;
+         const uint8_t *th = NULL;
+         size_t thlen = 0;
+         dp_idx_dims(idx, (uint32_t)mi, &w, &h);
+         ASSERT_TRUE(w == 440);
+         ASSERT_TRUE(h == 512);
+         dp_idx_thumbhash(idx, (uint32_t)mi, &th, &thlen);
+         ASSERT_NONNULL(th);
+         ASSERT_TRUE(thlen > 0 && thlen <= 32);
+         /* First byte of "41kCFgZi..." → b64('4')=56, b64('1')=53 →
+          * (56<<2 | 53>>4) = 224 | 3 = 0xe3.  Spot-check the bytes
+          * came back intact. */
+         ASSERT_TRUE(th && thlen > 0 && th[0] == 0xe3);
+      }
+      /* Tetris omitted thumbhash → must read back as absent. */
+      mi = dp_idx_match(idx, "Tetris (World)");
+      ASSERT_TRUE(mi != (size_t)-1);
+      if (mi != (size_t)-1)
+      {
+         uint16_t w = 0, h = 0;
+         const uint8_t *th = (const uint8_t*)0x1; /* sentinel */
+         size_t thlen = 999;
+         dp_idx_dims(idx, (uint32_t)mi, &w, &h);
+         ASSERT_TRUE(w == 512);
+         ASSERT_TRUE(h == 512);
+         dp_idx_thumbhash(idx, (uint32_t)mi, &th, &thlen);
+         ASSERT_TRUE(th == NULL);
+         ASSERT_TRUE(thlen == 0);
+      }
+      downplay_thumbs_index_free(idx);
+   }
+}
+
+/* Forward-compat: parsing legacy JSON (no width/height/thumbhash
+ * keys) succeeds and the missing fields read back as 0/NULL. */
+static void test_v2_missing_fields_default_zero(void)
+{
+   const char *titles[] = { "Tetris (World)" };
+   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_NONNULL(idx);
+   if (idx)
+   {
+      size_t mi = dp_idx_match(idx, "Tetris (World)");
+      ASSERT_TRUE(mi != (size_t)-1);
+      if (mi != (size_t)-1)
+      {
+         uint16_t w = 9, h = 9;
+         const uint8_t *th = (const uint8_t*)0x1;
+         size_t thlen = 999;
+         dp_idx_dims(idx, (uint32_t)mi, &w, &h);
+         ASSERT_TRUE(w == 0);
+         ASSERT_TRUE(h == 0);
+         dp_idx_thumbhash(idx, (uint32_t)mi, &th, &thlen);
+         ASSERT_TRUE(th == NULL);
+         ASSERT_TRUE(thlen == 0);
+      }
+      downplay_thumbs_index_free(idx);
+   }
+}
+
+/* Malformed thumbhash base64 must not abort the parse — the entry
+ * should still land in the index, with thumbhash absent. */
+static void test_v2_malformed_thumbhash_tolerated(void)
+{
+   v2_entry_t es[] = {
+      /* '!' isn't a valid b64 char → decoder returns 0, parser drops
+       * the field. */
+      { "Tetris (World)", 200, 200, "not!valid!base64!" },
+   };
+   char *json = build_idx_json_v2(es, 1);
+   downplay_thumbs_index_t *idx;
+   ASSERT_NONNULL(json);
+   idx = downplay_thumbs_index_parse(json, strlen(json));
+   free(json);
+   ASSERT_NONNULL(idx);
+   if (idx)
+   {
+      size_t mi = dp_idx_match(idx, "Tetris (World)");
+      ASSERT_TRUE(mi != (size_t)-1);
+      if (mi != (size_t)-1)
+      {
+         uint16_t w = 0, h = 0;
+         const uint8_t *th = (const uint8_t*)0x1;
+         size_t thlen = 999;
+         dp_idx_dims(idx, (uint32_t)mi, &w, &h);
+         ASSERT_TRUE(w == 200);
+         ASSERT_TRUE(h == 200);
+         dp_idx_thumbhash(idx, (uint32_t)mi, &th, &thlen);
+         ASSERT_TRUE(th == NULL);
+         ASSERT_TRUE(thlen == 0);
+      }
+      downplay_thumbs_index_free(idx);
+   }
+}
+
+/* Helpers for the format-validation tests below. */
+static void put_u32_le(uint8_t *p, uint32_t v)
+{
+   p[0] = (uint8_t)(v & 0xff);
+   p[1] = (uint8_t)((v >>  8) & 0xff);
+   p[2] = (uint8_t)((v >> 16) & 0xff);
+   p[3] = (uint8_t)((v >> 24) & 0xff);
+}
+
+/* dp_idx_open consumes its buffer regardless of outcome — frees on
+ * failure, transfers ownership on success.  Build a fresh-by-malloc
+ * buffer so the open call can take it. */
+static uint8_t *dup_buf(const uint8_t *src, size_t n)
+{
+   uint8_t *p = (uint8_t*)malloc(n);
+   if (p)
+      memcpy(p, src, n);
+   return p;
+}
+
+/* Synthesize a valid v2 binary buffer with a single dim-less +
+ * thumbhash-less entry, then perturb it for the validation tests.
+ * Returns malloc'd buffer; caller frees. */
+static uint8_t *build_minimal_v2_buffer(size_t *out_len)
+{
+   /* Layout: 40 header + 1*16 entries + 1*4 bcanon + 1*8 bheavy +
+    *         strings("a\0a\0") + 0 thumbhash + 12 footer
+    *       = 40 + 16 + 4 + 8 + 4 + 0 + 12 = 84.
+    * Strings pool must be NUL-terminated; we put a single string
+    * "a" (NUL-terminated) at offset 0 and reuse it for both
+    * canonical and heavy. */
+   const uint32_t magic = 0x48545044u;   /* DP_IDX_MAGIC */
+   const uint32_t version = 2u;
+   const uint32_t n = 1;
+   const uint32_t strings_size = 2;     /* "a" + NUL */
+   const uint32_t thumbhash_size = 0;
+   const uint32_t entries_off = 40;
+   const uint32_t bcanon_off  = entries_off + 1 * 16;
+   const uint32_t bheavy_off  = bcanon_off + 1 * 4;
+   const uint32_t strings_off = bheavy_off + 1 * 8;
+   const uint32_t thumbhash_off = strings_off + strings_size;
+   const uint32_t footer_off  = thumbhash_off + thumbhash_size;
+   const size_t   total       = footer_off + 12;
+   uint8_t       *buf = (uint8_t*)calloc(total, 1);
+   if (!buf) return NULL;
+   put_u32_le(buf +  0, magic);
+   put_u32_le(buf +  4, version);
+   put_u32_le(buf +  8, n);
+   put_u32_le(buf + 12, strings_size);
+   put_u32_le(buf + 16, thumbhash_size);
+   put_u32_le(buf + 20, entries_off);
+   put_u32_le(buf + 24, bcanon_off);
+   put_u32_le(buf + 28, bheavy_off);
+   put_u32_le(buf + 32, strings_off);
+   put_u32_le(buf + 36, thumbhash_off);
+   /* Entry 0: canon_off=0, heavy_off=0, w=0, h=0, th_off=0 */
+   put_u32_le(buf + entries_off + 0, 0);
+   put_u32_le(buf + entries_off + 4, 0);
+   /* w/h u16 already zero from calloc; th_off u32 already zero */
+   /* BY_CANONICAL[0] = 0 (already zero from calloc) */
+   /* BY_HEAVY[0] = {hash=0, idx=0} (already zero) */
+   buf[strings_off + 0] = 'a';
+   buf[strings_off + 1] = '\0';
+   /* Footer: magic + version + count */
+   put_u32_le(buf + footer_off + 0, magic);
+   put_u32_le(buf + footer_off + 4, version);
+   put_u32_le(buf + footer_off + 8, n);
+   *out_len = total;
+   return buf;
+}
+
+/* Sanity: the synthetic minimal buffer opens cleanly.  Anchor for
+ * the perturbation tests below — if THIS fails, every reject-case
+ * assertion is meaningless. */
+static void test_v2_minimal_synthetic_buffer_opens(void)
+{
+   size_t   n;
+   uint8_t *buf = build_minimal_v2_buffer(&n);
+   downplay_thumbs_index_t *idx;
+   ASSERT_NONNULL(buf);
+   if (!buf) return;
+   /* Need a malloc'd copy because dp_idx_open frees on either path. */
+   idx = dp_idx_open(dup_buf(buf, n), n);
+   ASSERT_NONNULL(idx);
+   if (idx)
+   {
+      ASSERT_TRUE(downplay_thumbs_index_count(idx) == 1);
+      downplay_thumbs_index_free(idx);
+   }
+   free(buf);
+}
+
+/* Hand-edit the version field to 1 (was-v2-buffer pretending to be
+ * v1).  Header reads version=1 → mismatch with DP_IDX_VERSION (2)
+ * → reject.  Layered defense: even if the version check were
+ * bypassed, the layout would mismatch (v1 records were 8 bytes, v2
+ * are 16) — but the explicit check fails first. */
+static void test_v2_rejects_version_mismatch(void)
+{
+   size_t   n;
+   uint8_t *buf = build_minimal_v2_buffer(&n);
+   downplay_thumbs_index_t *idx;
+   if (!buf) { ASSERT_NONNULL(buf); return; }
+   put_u32_le(buf + 4, 1u);  /* header version → 1 */
+   idx = dp_idx_open(dup_buf(buf, n), n);
+   ASSERT_NULL(idx);
+   free(buf);
+}
+
+/* Footer carries a version mirror.  If header.version is 2 but
+ * footer.version is anything else, reject — guards against partial
+ * writes mid-flush as well as hand-edited headers that left the
+ * footer stale. */
+static void test_v2_rejects_footer_version_mismatch(void)
+{
+   size_t   n;
+   uint8_t *buf = build_minimal_v2_buffer(&n);
+   downplay_thumbs_index_t *idx;
+   uint32_t footer_off;
+   if (!buf) { ASSERT_NONNULL(buf); return; }
+   /* footer_off = total - 12 */
+   footer_off = (uint32_t)(n - 12);
+   put_u32_le(buf + footer_off + 4, 99u); /* footer version */
+   idx = dp_idx_open(dup_buf(buf, n), n);
+   ASSERT_NULL(idx);
+   free(buf);
+}
+
+/* Truncate the buffer mid-thumbhash-pool.  The validator's exact-
+ * file-size check (`buf_len != expected`) must catch this — and the
+ * thumbhash accessor's bounds check is the second line of defense
+ * for the in-memory case. */
+static void test_v2_rejects_truncated_buffer(void)
+{
+   size_t   n;
+   uint8_t *buf = build_minimal_v2_buffer(&n);
+   downplay_thumbs_index_t *idx;
+   if (!buf) { ASSERT_NONNULL(buf); return; }
+   /* Pass `n - 1` for a 1-byte-short buffer — buf_len mismatch
+    * fails the layout check immediately. */
+   idx = dp_idx_open(dup_buf(buf, n - 1), n - 1);
+   ASSERT_NULL(idx);
+   free(buf);
+}
+
+/* dp_idx_thumbhash is the centralised pool accessor.  Its bounds
+ * check guarantees out-of-range thumbhash_off values can't trigger
+ * an OOB read even on a corrupted-after-validation buffer.  Confirm
+ * directly by handing it an entry whose th_off field exceeds the
+ * declared pool size. */
+static void test_v2_thumbhash_bounds_clamp(void)
+{
+   /* Build a single-entry buffer with thumbhash_size=4 (one valid
+    * entry "len=1; bytes=0xAA"), but rewrite the entry's th_off to
+    * 999 — way past the pool end.  Accessor must return NULL. */
+   const uint32_t magic = 0x48545044u, version = 2u;
+   const uint32_t n = 1, strings_size = 2, thumbhash_size = 2;
+   const uint32_t entries_off = 40;
+   const uint32_t bcanon_off  = entries_off + 16;
+   const uint32_t bheavy_off  = bcanon_off + 4;
+   const uint32_t strings_off = bheavy_off + 8;
+   const uint32_t thumbhash_off = strings_off + strings_size;
+   const uint32_t footer_off  = thumbhash_off + thumbhash_size;
+   const size_t   total       = footer_off + 12;
+   downplay_thumbs_index_t *idx;
+   uint8_t       *buf = (uint8_t*)calloc(total, 1);
+   if (!buf) { ASSERT_NONNULL(buf); return; }
+   put_u32_le(buf +  0, magic);
+   put_u32_le(buf +  4, version);
+   put_u32_le(buf +  8, n);
+   put_u32_le(buf + 12, strings_size);
+   put_u32_le(buf + 16, thumbhash_size);
+   put_u32_le(buf + 20, entries_off);
+   put_u32_le(buf + 24, bcanon_off);
+   put_u32_le(buf + 28, bheavy_off);
+   put_u32_le(buf + 32, strings_off);
+   put_u32_le(buf + 36, thumbhash_off);
+   /* Entry 0: th_off = 999 (out of range) */
+   put_u32_le(buf + entries_off + 12, 999u);
+   buf[strings_off + 0] = 'a';
+   buf[strings_off + 1] = '\0';
+   buf[thumbhash_off + 0] = 0x01;  /* one-byte payload */
+   buf[thumbhash_off + 1] = 0xAA;
+   put_u32_le(buf + footer_off + 0, magic);
+   put_u32_le(buf + footer_off + 4, version);
+   put_u32_le(buf + footer_off + 8, n);
+   idx = dp_idx_open(buf, total);
+   ASSERT_NONNULL(idx);
+   if (idx)
+   {
+      const uint8_t *th = (const uint8_t*)0x1;
+      size_t thlen = 999;
+      dp_idx_thumbhash(idx, 0, &th, &thlen);
+      ASSERT_TRUE(th == NULL);
+      ASSERT_TRUE(thlen == 0);
+      downplay_thumbs_index_free(idx);
+   }
+}
+
 int main(void)
 {
    test_parse_basic();
@@ -690,6 +1054,15 @@ int main(void)
    test_punctuation_and_spacing_irrelevant();
    test_null_and_empty_inputs();
    test_filename_extension_edge_cases();
+
+   test_v2_dims_and_thumbhash_round_trip();
+   test_v2_missing_fields_default_zero();
+   test_v2_malformed_thumbhash_tolerated();
+   test_v2_minimal_synthetic_buffer_opens();
+   test_v2_rejects_version_mismatch();
+   test_v2_rejects_footer_version_mismatch();
+   test_v2_rejects_truncated_buffer();
+   test_v2_thumbhash_bounds_clamp();
 
    printf("test_thumbs: %d passed, %d failed\n", g_pass, g_fail);
    return g_fail ? 1 : 0;

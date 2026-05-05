@@ -115,12 +115,16 @@ typedef struct
    int64_t          mtime;          /* st_mtime, 0 on stat failure */
    int64_t          size;           /* st_size,  0 on stat failure */
    gfx_thumbnail_t  thumbnail;
-   /* Cached art state for the row drawer's truncation gate.  Source of
-    * truth lives in the metadata index; this mirror is updated at scan
-    * time and at the streaming-probe transition sites in
-    * downplay_drive_system_thumbnails so the per-frame draw path
-    * doesn't have to call back into the index module per row. */
-   enum downplay_art_state art_state;
+   /* Per-row image dimensions from the thumbnail index, in pixels.
+    * Both 0 means either: (a) the index isn't loaded yet (cold first
+    * visit to this system; populated later when the pump flips
+    * load_state to READY) or (b) this ROM has no match in the index.
+    * The row drawer treats (a) and (b) identically — full-width text,
+    * no art slot reserved.  Non-zero pair → row narrows the text by
+    * the actual image width derived from its aspect ratio against
+    * the right-pane height budget (see downplay_image_pane_width). */
+   uint16_t         image_w;
+   uint16_t         image_h;
 } downplay_rom_t;
 
 /* One row in the recents view.  pl_idx is the entry's index in
@@ -140,6 +144,14 @@ typedef struct
    char           *rom_basename;  /* basename of the ROM file path; may be NULL */
    gfx_thumbnail_t thumbnail;     /* loaded on hover when a cached image exists */
    size_t          pl_idx;
+   /* Per-row image dimensions from the per-system thumbnail index, in
+    * pixels.  0/0 means either: (a) the row's system index isn't on
+    * disk yet (recents pump hasn't loaded it; populated when it does)
+    * or (b) the cascade misses on this ROM.  Same semantics as
+    * downplay_rom_t.image_w/h — drives the row drawer's truncation
+    * gate so unselected rows narrow before the preview pane. */
+   uint16_t        image_w;
+   uint16_t        image_h;
 } downplay_recent_t;
 /* No sort_key on recents — they're presented in chronological order
  * straight from g_defaults.content_history, never alphabetized. */
@@ -413,12 +425,6 @@ struct downplay_handle_s
    downplay_save_entry_t save_picker[DOWNPLAY_MAX_SAVE_ENTRIES];
    size_t              save_picker_count;
 
-   /* Per-system metadata index.  Open while view == DOWNPLAY_VIEW_SYSTEM,
-    * NULL otherwise.  Holds an open libretrodb handle for cheap per-
-    * file matching; flushes JSON to <RA_config>/downplay/index/ on
-    * close. */
-   downplay_index_t   *current_index;
-
    /* Per-system thumbnail manager (pastime.gg-backed).  Owns the
     * canonical-key index, on-disk image cache, and the lookahead
     * fetch queue.  Open on system enter, close on system exit. */
@@ -446,6 +452,14 @@ struct downplay_handle_s
     * hook that resets it. */
    size_t              thumb_prev_selection_sys;
    size_t              thumb_prev_selection_rec;
+
+   /* Set true after the SYSTEM-view dim warm-up has succeeded (at
+    * least one ROM matched the thumbnail index, populating image_w/h
+    * for every row in dp->roms).  Reset on system enter; checked each
+    * frame in downplay_drive_system_thumbnails to know whether to
+    * retry the warm-up (cold first-visit case where the index hadn't
+    * landed yet at open_system time). */
+   bool                roms_dims_warmed;
 
    /* Right-pane preview fade-in.  When the texture being drawn changes
     * (selection moved, async load completed, missing→ok retry hit), we
@@ -947,24 +961,17 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          roms[count].display_name = display;
          roms[count].sort_key     = sort_dup;
          roms[count].full_path    = path_dup;
-         /* mtime/size deliberately left zero.  The metadata index keys
-          * cache validity by basename only — we used to stat() every
-          * ROM here for a strict (basename, mtime, size) pin, which
-          * cost ~150ms on a 1500-ROM folder over Android FUSE just to
-          * detect the rare case where a user replaces a ROM file in
-          * place.  art_state is layout-only (truncation gate) and
-          * self-heals on first hover via downplay_drive_system_thumbnails,
-          * so a stale entry is at worst a one-frame layout miss, never
-          * a wrong launch.  Saved indexes from older code keep their
-          * mtime/size fields; the lookup compares against zero now and
-          * forces a re-match the first time, which heals naturally. */
+         /* mtime/size deliberately left zero — vestigial holdover from
+          * when the metadata index pinned cache validity to (basename,
+          * mtime, size).  That index has been deleted; the thumbnail
+          * index is now the single source of layout truth.  The fields
+          * are kept on the struct only to avoid touching every call
+          * site that reads them in the same commit. */
          gfx_thumbnail_init_blank(&roms[count].thumbnail);
-         /* art_state is seeded from the persisted index after
-          * downplay_index_finish_scan in downplay_open_system, and
-          * advanced at the AVAILABLE/MISSING transition sites in
-          * downplay_drive_system_thumbnails.  UNKNOWN here keeps the
-          * row at full width until one of those paths runs. */
-         roms[count].art_state = DP_ART_UNKNOWN;
+         /* image_w/image_h left zero by the memset above — populated
+          * once by the dim warm-up in downplay_open_system after the
+          * thumbnail manager is opened, and (in the cold-fetch case)
+          * re-populated by the per-frame drive once the index lands. */
          count++;
       }
    }
@@ -1589,11 +1596,7 @@ static void downplay_system_dispose(void *user, void *side)
    dp->roms                     = NULL;
    dp->rom_count                = 0;
    dp->thumb_prev_selection_sys = SIZE_MAX;
-   if (dp->current_index)
-   {
-      downplay_index_close(dp->current_index);
-      dp->current_index = NULL;
-   }
+   dp->roms_dims_warmed         = false;
    if (dp->current_thumbs)
    {
       downplay_thumbs_close(dp->current_thumbs);
@@ -1621,6 +1624,51 @@ static void downplay_system_dispose(void *user, void *side)
  * Failures along the way are non-fatal — a NULL index just means no
  * canonical labels and no art for this session, but the basic ROM list
  * still works. */
+/* Populate every row's image_w/image_h from the thumbnail index via
+ * side-effect-free peek lookups.  Idempotent + cheap (~50 ns per
+ * call); each peek either fills dims or leaves them at the previous
+ * value (typically 0, until the index lands).
+ *
+ * Sets dp->roms_dims_warmed = true on the first run that produces at
+ * least one hit — once an index is loaded, it stays loaded for the
+ * lifetime of the manager, so subsequent hits add nothing.  Caller
+ * checks the flag to decide whether to retry on later frames.
+ *
+ * Cold-fetch case (no on-disk index yet at open_system time): every
+ * peek misses and the flag stays false; downplay_drive_system_thumbnails
+ * re-runs this each frame until the pump lands the index, at which
+ * point all rows reflow in one frame.  That single reflow is the
+ * unavoidable consequence of not having the data — far better than
+ * the previous behavior where each row's text width depended on
+ * whether the user had hovered onto it. */
+static void dp_warm_roms_dims(downplay_handle_t *dp)
+{
+   size_t      i;
+   const char *base;
+   uint16_t    w;
+   uint16_t    h;
+   bool        any_hit = false;
+   if (!dp || !dp->current_thumbs || !dp->roms || dp->rom_count == 0)
+      return;
+   for (i = 0; i < dp->rom_count; i++)
+   {
+      base = path_basename(dp->roms[i].full_path);
+      w    = 0;
+      h    = 0;
+      if (!base || !*base)
+         continue;
+      if (downplay_thumbs_peek(dp->current_thumbs, base,
+               &w, &h, NULL, NULL))
+      {
+         dp->roms[i].image_w = w;
+         dp->roms[i].image_h = h;
+         any_hit = true;
+      }
+   }
+   if (any_hit)
+      dp->roms_dims_warmed = true;
+}
+
 static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
 {
    const downplay_system_t *sys;
@@ -1638,47 +1686,6 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
    dp->roms      = downplay_scan_roms(sys->full_path, &dp->rom_count);
    dp->active_system = sys_idx;
 
-   /* Open the index AFTER the ROM scan so we can immediately reconcile
-    * (note_present + finish_scan).  Closing any prior open is a no-op
-    * since system_dispose runs on the previous SYSTEM frame's pop. */
-   if (dp->current_index)
-   {
-      downplay_index_close(dp->current_index);
-      dp->current_index = NULL;
-   }
-   dp->current_index = downplay_index_open(
-         path_basename(sys->full_path), sys->full_path, sys->db_name);
-   if (dp->current_index)
-   {
-      for (i = 0; i < dp->rom_count; i++)
-      {
-         const char *base = path_basename(dp->roms[i].full_path);
-         if (!base || !*base)
-            continue;
-         downplay_index_note_present(dp->current_index, base,
-               (time_t)dp->roms[i].mtime, dp->roms[i].size);
-      }
-      downplay_index_finish_scan(dp->current_index);
-
-      /* Seed each row's cached art_state from the persisted index so the
-       * row drawer's truncation gate has something to go on before any
-       * row has been hovered.  Rows whose entries aren't yet matched
-       * stay UNKNOWN (the default), which keeps them at full width. */
-      for (i = 0; i < dp->rom_count; i++)
-      {
-         const char *base = path_basename(dp->roms[i].full_path);
-         downplay_index_record_t rec;
-         if (!base || !*base)
-            continue;
-         if (downplay_index_lookup(dp->current_index, base,
-                  (time_t)dp->roms[i].mtime, dp->roms[i].size, &rec))
-            dp->roms[i].art_state = rec.art_state;
-      }
-   }
-
-   /* Thumbnail path resolver: alloc once per handle lifetime.
-    * gfx_thumbnail_path_init returns NULL on alloc failure — soldier on
-    * without art rather than dropping the user back to TOP. */
    /* Open the pastime.gg-backed thumbnail manager.  Closes the prior
     * one (no-op normally, since system_dispose already did).  NULL
     * db_name → manager is skipped; rows still render labels. */
@@ -1689,6 +1696,11 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
    }
    if (sys->db_name && *sys->db_name)
       dp->current_thumbs = downplay_thumbs_open(sys->db_name);
+
+   /* Reset and try the per-row dim warm-up.  See dp_warm_roms_dims
+    * for the cold-vs-warm cache rationale. */
+   dp->roms_dims_warmed = false;
+   dp_warm_roms_dims(dp);
 
    /* Speculative prefetch: kick off image fetches for the first ~10
     * rows immediately on system enter, before the user hovers.  By
@@ -4456,6 +4468,25 @@ enum downplay_preview_scale
  * art sizes; below ~80 ms the eye reads it as a hard pop. */
 #define DP_PREVIEW_FADE_US 120000
 
+/* Aspect-fit a (src_w × src_h) image into a (pane_w × pane_h) box;
+ * return the resulting on-screen width in pixels.  Cross-product
+ * comparison keeps the math integer-only and matches the body of the
+ * FIT branch in downplay_draw_right_preview — same answer at the
+ * preview draw and at the row-text gate, so the image's left edge
+ * agrees in both places.  Returns 0 on degenerate inputs (caller
+ * treats as "no art slot to reserve"). */
+static int downplay_image_pane_width(int pane_w, int pane_h,
+      unsigned src_w, unsigned src_h)
+{
+   if (pane_w <= 0 || pane_h <= 0 || src_w == 0 || src_h == 0)
+      return 0;
+   /* pane_w/pane_h <= src_w/src_h  →  fit by width (img_w == pane_w).
+    * Otherwise fit by height (img_w shrinks below pane_w). */
+   if ((unsigned)pane_w * src_h <= (unsigned)pane_h * src_w)
+      return pane_w;
+   return (int)((unsigned)pane_h * src_w / src_h);
+}
+
 static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
       const downplay_layout_t *L, downplay_handle_t *dp,
       uintptr_t tex, unsigned texture_w, unsigned texture_h,
@@ -4517,17 +4548,13 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    else
    {
       /* Aspect-fit (FIT, or NATIVE/INTEGER fallback when too big).
-       * Cross-product comparison avoids float math + zero-div. */
-      if ((unsigned)pane_w * texture_h <= (unsigned)pane_h * texture_w)
-      {
-         img_w = pane_w;
+       * Helper keeps the same math used by the per-row text gate so
+       * the image's left edge agrees at both sites. */
+      img_w = downplay_image_pane_width(pane_w, pane_h, texture_w, texture_h);
+      if (img_w == pane_w)
          img_h = (int)((unsigned)pane_w * texture_h / texture_w);
-      }
       else
-      {
          img_h = pane_h;
-         img_w = (int)((unsigned)pane_h * texture_w / texture_h);
-      }
    }
    if (img_w < 1 || img_h < 1)
       return;
@@ -4606,20 +4633,35 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    int      row_y;
    int      row_w;
    /* Two-pane truncation gate.  In SYSTEM and SAVE_PICKER views, an
-    * unselected row whose art we *know* is on disk reserves the right
-    * half of the screen for the preview; everything else (selected
-    * row, art-pending, art-missing, art-less view) keeps full width.
-    * Per-row decision so a homebrew ROM next to a matched ROM doesn't
-    * truncate prematurely while we're still probing the homebrew, and
-    * so the selected row visibly overlaps its own image like LessUI. */
+    * unselected row whose art we *know* is on disk reserves space for
+    * the preview pane.  In SYSTEM view the reservation is per-row,
+    * derived from the entry's actual image dimensions in the
+    * thumbnail index — portrait box-art leaves more text room than
+    * square box-art, and the row never reflows when the image lands
+    * (its width was set up-front from the index, not measured after
+    * decode).  In SAVE_PICKER, dims aren't known until the texture
+    * loads, so the gate is binary on `thumb_tex != 0` and uses the
+    * full-pane fallback width.  The selected row keeps full width
+    * unconditionally — its pill deliberately overlaps its image. */
    bool     art_pane_active = (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+                            || dp->nav.view == DOWNPLAY_VIEW_RECENTS
                             || dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER);
-   int      pane_left       = L->pane_left;
-   /* One row_text_indent of breathing room between the truncated label
-    * and the image pane.  Asymmetric vs the full-width row_max_w (which
-    * doesn't subtract this) by design: the image is drawn right next to
-    * where the truncated text ends, so we want a visible gap there. */
-   int      row_max_w_art   = pane_left - L->margin_x - L->row_text_indent;
+   int      pane_right      = (int)L->vid_w - L->margin_x;
+   int      pane_full_w     = pane_right - L->pane_left;
+   /* Pane height matches the right-preview drawer (margin_y +/- a row
+    * + a 16*scale gap top/bottom).  Kept in sync there; this mirror
+    * is what determines the per-row reservation for SYSTEM. */
+   int      pane_gap        = (int)(16.0f * L->scale);
+   int      pane_h          = (int)L->vid_h - 2 * (L->margin_y + L->row_h)
+                            - 2 * pane_gap;
+   /* SAVE_PICKER fallback width: image fills the full pane (square-ish
+    * thumbnails — INTEGER-scale path in draw_right_preview).  One
+    * row_text_indent of breathing room between the truncated label and
+    * the image pane.  Asymmetric vs full-width row_max_w (which
+    * doesn't subtract this) by design — the image sits right next to
+    * where the truncated text ends; we want a visible gap there. */
+   int      row_max_w_full_pane = L->pane_left - L->margin_x
+                                - L->row_text_indent;
    /* Top row shares its line with the status pill — shorten its max
     * width by the pill width plus a margin's gap so a long title
     * truncates instead of overlapping.  Skipped in INGAME because
@@ -4631,8 +4673,10 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             - L->margin_x);
    if (top_row_max_w < 0)
       top_row_max_w = 0;
-   if (row_max_w_art < 0)
-      row_max_w_art = 0;
+   if (row_max_w_full_pane < 0)
+      row_max_w_full_pane = 0;
+   if (pane_h < 1)
+      pane_h = 1;
 
    if (dp->total_rows > visible && dp->nav.selection >= visible)
    {
@@ -4709,7 +4753,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
    for (i = 0; i < visible && scroll + i < dp->total_rows; i++)
    {
       bool selected;
-      bool row_has_art = false;
+      int  row_max_w_art = 0;  /* >0 means "this row has art; clamp here" */
 
       row_idx = scroll + i;
       row_y   = list_top + (int)(i * (size_t)L->row_h);
@@ -4719,13 +4763,38 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       if (art_pane_active && !selected)
       {
          if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
-               && dp->roms && row_idx < dp->rom_count)
-            row_has_art = (dp->roms[row_idx].art_state == DP_ART_OK);
+               && dp->roms && row_idx < dp->rom_count
+               && dp->roms[row_idx].image_w > 0
+               && dp->roms[row_idx].image_h > 0)
+         {
+            /* Per-row width: aspect-fit the index-known dims into the
+             * preview pane to find the image's left edge, then clamp
+             * the row's text to leave breathing room before it. */
+            int img_w = downplay_image_pane_width(pane_full_w, pane_h,
+                  dp->roms[row_idx].image_w,
+                  dp->roms[row_idx].image_h);
+            if (img_w > 0)
+               row_max_w_art = (pane_right - img_w) - L->margin_x
+                             - L->row_text_indent;
+         }
+         else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS
+               && dp->recents && row_idx < dp->recent_row_count
+               && dp->recents[row_idx].image_w > 0
+               && dp->recents[row_idx].image_h > 0)
+         {
+            int img_w = downplay_image_pane_width(pane_full_w, pane_h,
+                  dp->recents[row_idx].image_w,
+                  dp->recents[row_idx].image_h);
+            if (img_w > 0)
+               row_max_w_art = (pane_right - img_w) - L->margin_x
+                             - L->row_text_indent;
+         }
          else if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
-               && row_idx < dp->save_picker_count)
-            row_has_art = (dp->save_picker[row_idx].thumb_tex != 0);
+               && row_idx < dp->save_picker_count
+               && dp->save_picker[row_idx].thumb_tex != 0)
+            row_max_w_art = row_max_w_full_pane;
       }
-      if (row_has_art && row_w > row_max_w_art)
+      if (row_max_w_art > 0 && row_w > row_max_w_art)
          row_w = row_max_w_art;
 
       downplay_draw_list_row(p_disp, userdata, dp->font,
@@ -4738,14 +4807,6 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
 
 /* ---------- frame ---------- */
 
-/* Drive the per-frame thumbnail state for the SYSTEM view: pump the
- * background match queue (1-2 ops/frame budget — ~10-30 enrichments
- * per second at 60fps) and request a thumbnail load for the selected
- * row.  Selection-change triggers a reset of the previous row's
- * thumbnail so we never have more than one resident texture per frame.
- *
- * No-op outside SYSTEM view, or when the index/path-data isn't ready
- * (graceful degradation: rows still show filenames). */
 /* Drive per-frame thumbnail loading for the SYSTEM view.
  *
  * The pastime.gg-backed manager owns the lookup logic (per-system
@@ -4754,19 +4815,24 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
  * renderer reads from.
  *
  * Per-frame steps:
- *   1. Pump the canonical-label resolver (downplay_index) so display
- *      labels for poorly-named ROMs settle within a few frames.
- *   2. Pump the thumbnail manager (drains image-fetch queue,
+ *   1. Pump the thumbnail manager (drains image-fetch queue,
  *      reconciles in-flight count).
+ *   2. If the index just landed (warm-up at system enter saw it
+ *      mid-fetch and left every row's image_w/h at 0), iterate rows
+ *      once and re-warm — the row drawer keys off image_w/h, so this
+ *      is what makes the cold-fetch reflow happen.
  *   3. Reset the prior selection's gfx_thumbnail_t (one resident
  *      texture at a time).
  *   4. Look up the active row's basename via the manager:
- *        - OK     → request_file on local cache path.
+ *        - OK      → request_file on local cache path; capture dims
+ *          (handles the rare case where a row was added after the
+ *          warm-up — e.g. ROM dropped into the folder mid-session).
  *        - MISSING → mark row's gfx_thumbnail status MISSING.
  *        - UNKNOWN → leave PENDING, retry next frame.
- *   5. Mirror the result onto roms[sel].art_state (the row drawer's
- *      truncation gate keys off this).
- *   6. Lookahead-prefetch the ±5 surrounding rows. */
+ *   5. Lookahead-prefetch the ±5 surrounding rows.
+ *
+ * No-op outside SYSTEM view, or when the path-data isn't ready
+ * (graceful degradation: rows still show filenames). */
 static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
 {
    const downplay_rom_t *rom;
@@ -4789,6 +4855,13 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
    /* Pump the thumbnail manager (drains image queue, reconciles). */
    if (dp->current_thumbs)
       downplay_thumbs_pump(dp->current_thumbs);
+
+   /* Cold-fetch warm-up retry.  open_system tried this once with the
+    * manager freshly opened; if the on-disk index wasn't there yet,
+    * peek returned false for every row and the flag is still unset.
+    * The retry costs nothing once the flag flips. */
+   if (!dp->roms_dims_warmed)
+      dp_warm_roms_dims(dp);
 
    /* Selection change → reset the prior selection's thumbnail. */
    if (   dp->thumb_prev_selection_sys != sel
@@ -4855,7 +4928,16 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
             gfx_thumbnail_request_file(result.local_path,
                   &dp->roms[sel].thumbnail, upscale_thresh);
       }
-      dp->roms[sel].art_state = DP_ART_OK;
+      /* Late-bind dims if the warm-up missed this row (e.g. ROM
+       * dropped into the folder mid-session, or peek raced against
+       * an index reload).  Cheap; idempotent. */
+      if (   dp->roms[sel].image_w == 0
+          && dp->roms[sel].image_h == 0
+          && (result.image_w | result.image_h))
+      {
+         dp->roms[sel].image_w = result.image_w;
+         dp->roms[sel].image_h = result.image_h;
+      }
    }
    else if (result.status == DP_THUMB_MISSING)
    {
@@ -4865,7 +4947,6 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
       if (status != GFX_THUMBNAIL_STATUS_MISSING)
          retro_atomic_store_release_int(&dp->roms[sel].thumbnail.status,
                GFX_THUMBNAIL_STATUS_MISSING);
-      dp->roms[sel].art_state = DP_ART_MISSING;
    }
    /* DP_THUMB_UNKNOWN → leave status as-is; next frame will retry. */
 
@@ -4917,6 +4998,34 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * blocking I/O to one .idx read per frame regardless of how the
     * user scrolls. */
    downplay_thumbs_recents_pump(dp->recents_thumbs);
+
+   /* Populate per-row dims for the row drawer's truncation gate.
+    * Side-effect-free + cheap (~50 ns/row × ~30 rows max); each call
+    * succeeds the moment the row's system index has been pumped in.
+    * Skip rows whose dims already settled — the index doesn't change
+    * between frames so once a row hits, it stays hit. */
+   {
+      size_t             i;
+      downplay_recent_t *re;
+      uint16_t           w;
+      uint16_t           h;
+      for (i = 0; i < dp->recent_row_count; i++)
+      {
+         re = &dp->recents[i];
+         w  = 0;
+         h  = 0;
+         if (re->image_w || re->image_h)
+            continue;
+         if (!re->db_name || !re->rom_basename)
+            continue;
+         if (downplay_thumbs_recents_peek(dp->recents_thumbs,
+                  re->db_name, re->rom_basename, &w, &h))
+         {
+            re->image_w = w;
+            re->image_h = h;
+         }
+      }
+   }
 
    sel = dp->nav.selection;
    if (sel >= dp->recent_row_count)
@@ -5834,6 +5943,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
          downplay_after_nav_change, dp);
    dp->thumb_prev_selection_sys = SIZE_MAX;
    dp->thumb_prev_selection_rec = SIZE_MAX;
+   dp->roms_dims_warmed         = false;
    /* Upstream only fires HISTORY_INIT lazily on first content load
     * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
     * is NULL and our "Recently Played" row never appears.  Guard so menu
@@ -5923,14 +6033,9 @@ static void downplay_menu_free(void *data)
    if (!dp)
       return;
    downplay_menu_context_destroy(dp);
-   /* Index/thumbs are normally closed by system_dispose / recents_dispose
-    * on pop_to_TOP, which context_destroy triggered above; these branches
+   /* Thumbs are normally closed by system_dispose / recents_dispose on
+    * pop_to_TOP, which context_destroy triggered above; these branches
     * only fire if the destroy path skipped them (defensive). */
-   if (dp->current_index)
-   {
-      downplay_index_close(dp->current_index);
-      dp->current_index = NULL;
-   }
    if (dp->current_thumbs)
    {
       downplay_thumbs_close(dp->current_thumbs);
