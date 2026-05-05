@@ -1345,6 +1345,40 @@ static void dp_build_image_path(downplay_thumbs_t *t,
    snprintf(out, out_size, "%s%s", tmp, dp_pick_ext(e));
 }
 
+/* Resolve the on-disk path for an entry, applying the webp→jpg
+ * sibling fallback lazily.  When an entry prefers .webp but only the
+ * .jpg sibling is on disk (typical right after a Downplay upgrade
+ * where the previous version cached jpg only), clear the entry's
+ * webp_size so subsequent path/URL builds for this entry stay on
+ * .jpg.  Replaces the old upfront stat sweep in dp_try_load_local_index
+ * — we only stat entries that the user (or a prefetch) actually asks
+ * about, instead of every entry in a 5k–20k-row index at open time. */
+static bool dp_resolve_local_image(downplay_thumbs_t *t,
+      uint32_t e_idx, char *out, size_t out_size)
+{
+   dp_thumb_entry_t *e = &t->index->entries[e_idx];
+   dp_build_image_path(t, e, out, out_size);
+   if (path_is_valid(out))
+      return true;
+#ifdef HAVE_DOWNPLAY_WEBP
+   if (e->webp_size > 0)
+   {
+      char tmp[DP_THUMBS_PATH_MAX];
+      char jpg[DP_THUMBS_PATH_MAX];
+      fill_pathname_join_special(tmp, t->cache_dir, e->canonical,
+            sizeof(tmp));
+      snprintf(jpg, sizeof(jpg), "%s.jpg", tmp);
+      if (path_is_valid(jpg))
+      {
+         e->webp_size = 0;
+         strlcpy(out, jpg, out_size);
+         return true;
+      }
+   }
+#endif
+   return false;
+}
+
 /* Build the remote URL for an image. */
 static void dp_build_image_url(downplay_thumbs_t *t,
       const dp_thumb_entry_t *e, char *out, size_t out_size)
@@ -1618,40 +1652,12 @@ static bool dp_try_load_local_index(downplay_thumbs_t *t)
       t->index = NULL;
       return false;
    }
-   /* Pre-mark on-disk images so we don't spuriously refetch.  Cheap:
-    * a stat() per cached file at open time, not per frame.  When an
-    * entry has webp_size>0 (preferred) but only the .jpg sibling is
-    * on disk — typical after a Downplay upgrade where the previous
-    * version cached jpg only — clear webp_size so the entry stays
-    * on the cached jpg until natural TTL refresh.  Avoids a forced
-    * full re-download on every existing user's first launch. */
-   {
-      size_t i;
-      char img_path[DP_THUMBS_PATH_MAX];
-      char jpg_path[DP_THUMBS_PATH_MAX];
-      for (i = 0; i < t->index->entries_count; i++)
-      {
-         dp_thumb_entry_t *e = &t->index->entries[i];
-         dp_build_image_path(t, e, img_path, sizeof(img_path));
-         if (path_is_valid(img_path))
-         {
-            t->attempt[i] = DP_ATT_ON_DISK;
-            continue;
-         }
-         if (e->webp_size > 0)
-         {
-            char tmp[DP_THUMBS_PATH_MAX];
-            fill_pathname_join_special(tmp, t->cache_dir,
-                  e->canonical, sizeof(tmp));
-            snprintf(jpg_path, sizeof(jpg_path), "%s.jpg", tmp);
-            if (path_is_valid(jpg_path))
-            {
-               e->webp_size = 0; /* fall through to .jpg in dp_pick_ext */
-               t->attempt[i] = DP_ATT_ON_DISK;
-            }
-         }
-      }
-   }
+   /* On-disk pre-mark + webp→jpg sibling fallback are now lazy: see
+    * dp_resolve_local_image.  Doing the stat sweep up front cost an
+    * O(entries) syscall walk on system-enter — 5k–20k stats per open
+    * on Android sdcard fuse, bad enough to hitch the menu transition.
+    * Lazy resolution pays the same stats only for the (small) set of
+    * rows actually queried. */
    t->load_state = DP_LOAD_READY;
    ok = true;
    return ok;
@@ -1820,13 +1826,16 @@ static void dp_drain_queue(downplay_thumbs_t *t)
        && t->attempt[e_idx] != DP_ATT_FETCHING)
       return;
 
-   e = &t->index->entries[e_idx];
-   dp_build_image_path(t, e, path, sizeof(path));
-   if (path_is_valid(path))
+   /* Lazy on-disk check + webp→jpg sibling fallback.  This entry was
+    * queued without the old upfront sweep proving it was missing, so
+    * recheck now (and possibly switch to .jpg if a sibling is cached
+    * from a pre-WebP build). */
+   if (dp_resolve_local_image(t, e_idx, path, sizeof(path)))
    {
       t->attempt[e_idx] = DP_ATT_ON_DISK;
       return;
    }
+   e = &t->index->entries[e_idx];
    dp_build_image_url(t, e, url, sizeof(url));
    if (!*url)
       return;
@@ -1963,6 +1972,31 @@ static void dp_pf_inflight_remove(const char *system)
          return;
       }
    }
+}
+
+/* Remove `system` from pending if present.  Used when a user-initiated
+ * `_open` arrives for a system that was queued but not yet started:
+ * we pull it out of pending and kick the fetch directly so the user
+ * doesn't wait behind unrelated systems already inflight.  Returns
+ * true if the entry was found and removed. */
+static bool dp_pf_pending_remove(const char *system)
+{
+   int i;
+   int j;
+   if (!system)
+      return false;
+   for (i = 0; i < g_pf_pending_count; i++)
+   {
+      if (!string_is_equal(g_pf_pending[i], system))
+         continue;
+      for (j = i + 1; j < g_pf_pending_count; j++)
+         strlcpy(g_pf_pending[j - 1], g_pf_pending[j],
+               sizeof(g_pf_pending[0]));
+      g_pf_pending_count--;
+      g_pf_pending[g_pf_pending_count][0] = '\0';
+      return true;
+   }
+   return false;
 }
 
 static bool dp_pf_pending_pop(char *out_system, size_t out_size)
@@ -2211,12 +2245,16 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
       }
    }
    t->load_state = DP_LOAD_FETCHING;
-   /* Suppress duplicate HTTP work if a boot-time prefetch is already
-    * in flight OR queued for this system; the per-frame pump in
-    * _request / _pump will pick up the file when it lands.  Pending
-    * matters here because the user can navigate before dp_pf_drain
-    * has had a chance to promote the entry to inflight. */
-   if (!dp_pf_inflight_contains(system) && !dp_pf_pending_contains(system))
+   /* Priority promotion: if this system is queued in the boot-time
+    * prefetch but hasn't started yet, the user shouldn't wait behind
+    * unrelated systems already in flight.  Pull it out of pending and
+    * kick the fetch ourselves — the prefetch pool's concurrency cap
+    * doesn't apply to user-initiated fetches.  If it's already in
+    * flight (callback will land soon) we suppress to avoid a duplicate
+    * HTTP transfer; both prefetch and direct callbacks atomic-rename
+    * to the same `idx_path`, so racing them is correct but wasteful. */
+   dp_pf_pending_remove(system);
+   if (!dp_pf_inflight_contains(system))
       dp_kick_index_fetch(t);
    return t;
 }
@@ -2243,8 +2281,7 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
       const char *rom_basename,
       downplay_thumb_result_t *out)
 {
-   const dp_thumb_entry_t *e;
-   int                     e_idx;
+   int e_idx;
 
    if (!out)
       return;
@@ -2279,12 +2316,16 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
       }
       e_idx = (int)mi;
    }
-   e = &t->index->entries[e_idx];
 
-   dp_build_image_path(t, e, out->local_path, sizeof(out->local_path));
-
-   if (t->attempt[e_idx] == DP_ATT_ON_DISK
-       || path_is_valid(out->local_path))
+   if (t->attempt[e_idx] == DP_ATT_ON_DISK)
+   {
+      dp_build_image_path(t, &t->index->entries[e_idx],
+            out->local_path, sizeof(out->local_path));
+      out->status = DP_THUMB_OK;
+      return;
+   }
+   if (dp_resolve_local_image(t, (uint32_t)e_idx,
+            out->local_path, sizeof(out->local_path)))
    {
       t->attempt[e_idx] = DP_ATT_ON_DISK;
       out->status = DP_THUMB_OK;
