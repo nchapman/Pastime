@@ -81,9 +81,9 @@
 /* One Roms/<folder> that conformed to the "Display Name (core_ident)"
  * convention.  Folders without that suffix are dropped during scan, so
  * by the time a downplay_system_t exists, display_name + core_ident +
- * full_path are non-empty.  db_name is the resolved libretro-thumbnails
- * system name (e.g. "Nintendo - Super Nintendo Entertainment System"),
- * used to locate the .rdb and the thumbnails subdir.  May be NULL when
+ * full_path are non-empty.  db_name is the canonical system name (e.g.
+ * "Nintendo - Super Nintendo Entertainment System"), used to key the
+ * Downplay thumbnail index + cache subdir.  May be NULL when
  * the user's folder name doesn't hit the disambiguation table AND no
  * matching core_info entry is loaded. */
 typedef struct
@@ -101,8 +101,10 @@ typedef struct
  * cached label/match invalidate automatically.
  *
  * thumbnail is owned by this struct.  Initialized to blank in scan,
- * loaded async on hover via gfx_thumbnail_request_stream, freed by
- * gfx_thumbnail_reset in downplay_roms_free.  Callers MUST have
+ * loaded on hover (WebP via downplay_webp_load_texture, JPG/PNG via
+ * gfx_thumbnail_request_file once downplay_thumbs_request returns a
+ * local path), freed by gfx_thumbnail_reset in downplay_roms_free.
+ * Callers MUST have
  * called gfx_thumbnail_cancel_pending_requests() before any reset to
  * avoid a callback racing onto freed memory. */
 typedef struct
