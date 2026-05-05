@@ -1591,9 +1591,11 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
       /* names[] borrows pointers into dp->roms[].full_path; valid
        * because _prefetch consumes them synchronously and does not
        * retain references after returning. */
-      const char *names[10];
+      #define DP_SPECULATIVE_PREFETCH_ROWS 10
+      const char *names[DP_SPECULATIVE_PREFETCH_ROWS];
       size_t      n   = 0;
-      size_t      cap = dp->rom_count < 10 ? dp->rom_count : 10;
+      size_t      cap = dp->rom_count < DP_SPECULATIVE_PREFETCH_ROWS
+            ? dp->rom_count : DP_SPECULATIVE_PREFETCH_ROWS;
       for (i = 0; i < cap; i++)
       {
          const char *b = path_basename(dp->roms[i].full_path);
@@ -1602,6 +1604,7 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
       }
       if (n > 0)
          downplay_thumbs_prefetch(dp->current_thumbs, names, n);
+      #undef DP_SPECULATIVE_PREFETCH_ROWS
    }
 
    dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SYSTEM, NULL, downplay_system_dispose);

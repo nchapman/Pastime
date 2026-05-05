@@ -64,7 +64,9 @@
 #include "downplay_display_name.h"
 
 #ifndef DOWNPLAY_THUMBS_TEST_BUILD
+#include <retro_assert.h>
 #include <retro_miscellaneous.h>
+#include <queues/task_queue.h>
 #include "../verbosity.h"
 #include "../msg_hash.h"
 #include "../tasks/task_file_transfer.h"
@@ -1796,6 +1798,11 @@ static void dp_drain_queue(downplay_thumbs_t *t)
 
 #define DP_THUMBS_PF_PENDING_CAP   128
 #define DP_THUMBS_PF_INFLIGHT_MAX  3
+/* Hostile / misconfigured server can't blow up our cache.  Real
+ * indexes are tens-to-hundreds of KB; 1 MB leaves real headroom for
+ * the largest No-Intro systems (PSX, NDS, etc.) with their alt-name
+ * bundles, while still capping a runaway response at a safe size. */
+#define DP_THUMBS_PF_INDEX_MAX_BYTES (1024u * 1024u)
 
 static char g_pf_pending[DP_THUMBS_PF_PENDING_CAP][256];
 static int  g_pf_pending_count;
@@ -1813,6 +1820,26 @@ typedef struct
    file_transfer_t base;          /* must be first; .path is the on-disk dest */
    char            system[256];   /* canonical name; key for inflight set */
 } dp_pf_transfer_t;
+
+/* Reject malformed system strings.  Path-escape (..  /  \) was the
+ * obvious vector; NUL / control chars in the middle are a subtler one
+ * — they'd silently truncate our `g_pf_inflight` keys (kernel terminates
+ * at NUL) and let two concurrent fetches dodge dedup with different
+ * effective names but the same ToS prefix. */
+static bool dp_pf_system_safe(const char *system)
+{
+   const unsigned char *p;
+   if (!system || !*system)
+      return false;
+   if (   strstr(system, "..")
+       || strchr(system, '/')
+       || strchr(system, '\\'))
+      return false;
+   for (p = (const unsigned char*)system; *p; p++)
+      if (*p < 0x20 || *p == 0x7F)
+         return false;
+   return true;
+}
 
 static bool dp_pf_inflight_contains(const char *system)
 {
@@ -1896,6 +1923,7 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
    char                  tmp_path[DP_THUMBS_PATH_MAX];
    (void)task;
 
+   retro_assert(task_is_on_main_thread());
    if (!pf)
       return;
    if (!data || !data->data || !*pf->base.path)
@@ -1903,6 +1931,11 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
    if (data->status != 200)
    {
       err = "non-200";
+      goto finish;
+   }
+   if (data->len > DP_THUMBS_PF_INDEX_MAX_BYTES)
+   {
+      err = "response too large";
       goto finish;
    }
    strlcpy(output_dir, pf->base.path, sizeof(output_dir));
@@ -1943,6 +1976,7 @@ finish:
 /* Drain the pending queue up to the concurrency cap. */
 static void dp_pf_drain(void)
 {
+   retro_assert(task_is_on_main_thread());
    while (g_pf_inflight_count < DP_THUMBS_PF_INFLIGHT_MAX
          && g_pf_pending_count > 0)
    {
@@ -1956,6 +1990,12 @@ static void dp_pf_drain(void)
       if (!dp_pf_pending_pop(system, sizeof(system)))
          break;
 
+      /* Re-validate before constructing the URL.  Defence-in-depth:
+       * the public-API path filters at enqueue, but if any future
+       * code path inserts directly into g_pf_pending this stops a
+       * bogus name from reaching the wire. */
+      if (!dp_pf_system_safe(system))
+         continue;
       /* Re-check freshness right before issuing — the file may have
        * landed in the window between enqueue and drain (e.g. a user
        * `_open` raced ahead of us and won). */
@@ -1963,8 +2003,6 @@ static void dp_pf_drain(void)
          continue;
       age = dp_index_age_seconds(idx_path);
       if (age >= 0 && age < DP_THUMBS_INDEX_TTL_SEC)
-         continue;
-      if (dp_pf_inflight_contains(system))
          continue;
 
       snprintf(raw_url, sizeof(raw_url),
@@ -2002,20 +2040,19 @@ void downplay_thumbs_prefetch_indexes(
       const char * const *systems, size_t count)
 {
    size_t i;
+   retro_assert(task_is_on_main_thread());
    if (!systems || !count)
       return;
+   /* Reset the one-shot overflow log: callers are entitled to know
+    * about a fresh-call overflow even if a prior call hit the cap. */
+   g_pf_overflow_warned = false;
    for (i = 0; i < count; i++)
    {
       const char *system = systems[i];
       char idx_path[DP_THUMBS_PATH_MAX];
       int64_t age;
 
-      if (!system || !*system)
-         continue;
-      /* Path-escape: same rules as downplay_thumbs_open. */
-      if (   strstr(system, "..")
-          || strchr(system, '/')
-          || strchr(system, '\\'))
+      if (!dp_pf_system_safe(system))
          continue;
       /* Bound: must fit our fixed-size slot. */
       if (strlen(system) >= sizeof(g_pf_pending[0]))
