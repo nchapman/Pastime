@@ -71,7 +71,8 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
 							$(RARCH_DIR)/downplay/downplay_nav.c \
 							$(RARCH_DIR)/downplay/downplay_metadata.c \
 							$(RARCH_DIR)/downplay/downplay_metadata_disambig.c \
-							$(RARCH_DIR)/downplay/downplay_display_name.c
+							$(RARCH_DIR)/downplay/downplay_display_name.c \
+							$(RARCH_DIR)/downplay/downplay_thumbs.c
 endif
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)
@@ -132,6 +133,7 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_RJPEG \
 	   -DHAVE_RBMP \
 	   -DHAVE_RTGA \
+	   -DHAVE_RWEBP \
 	   -DINLINE=inline \
 	   -DHAVE_THREADS \
 	   -D__LIBRETRO__ \

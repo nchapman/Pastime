@@ -42,6 +42,13 @@ $CC $CFLAGS $INC \
     test_display_name.c ../downplay_display_name.c \
     -o test_display_name
 
+# --- thumbnail match cascade ---
+echo "== building test_thumbs"
+$CC $CFLAGS -DDOWNPLAY_THUMBS_TEST_BUILD $INC \
+    test_thumbs.c ../downplay_thumbs.c ../downplay_display_name.c \
+    "${PROJECT_ROOT}/libretro-common/formats/json/rjson.c" \
+    -o test_thumbs
+
 # --- run all built tests ---
 fail=0
 for bin in test_*; do

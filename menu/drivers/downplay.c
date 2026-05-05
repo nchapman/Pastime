@@ -58,6 +58,7 @@
 #include "../../downplay/downplay_metadata.h"
 #include "../../downplay/downplay_nav.h"
 #include "../../downplay/downplay_setup.h"
+#include "../../downplay/downplay_thumbs.h"
 
 #include <features/features_cpu.h>
 
@@ -109,15 +110,6 @@ typedef struct
    int64_t          mtime;          /* st_mtime, 0 on stat failure */
    int64_t          size;           /* st_size,  0 on stat failure */
    gfx_thumbnail_t  thumbnail;
-   /* Rate-limiter for the post-stream "did our HTTP boxart download
-    * land yet?" probe.  Without this we'd `path_is_valid()` twice per
-    * frame for as long as the user lingers on a missing-art row —
-    * 240 stat() calls/sec at 120Hz against FUSE-backed /sdcard.
-    * Accumulates `gfx_animation_t.delta_time`; the probe runs (and
-    * the timer resets) once it crosses ~250 ms.  Initialised at scan
-    * time to the threshold so the FIRST probe fires on the same frame
-    * the row becomes selected, not 250 ms later. */
-   float            probe_throttle_acc;
    /* Cached art state for the row drawer's truncation gate.  Source of
     * truth lives in the metadata index; this mirror is updated at scan
     * time and at the streaming-probe transition sites in
@@ -407,12 +399,11 @@ struct downplay_handle_s
     * close. */
    downplay_index_t   *current_index;
 
-   /* Path-resolution state for box-art thumbnails.  Reused across all
-    * SYSTEM-view rows (only the content label changes per row).
-    * Allocated lazily on first SYSTEM enter; never freed once
-    * allocated — its embedded buffers reset cheaply via
-    * gfx_thumbnail_path_reset. */
-   gfx_thumbnail_path_data_t *thumb_path_data;
+   /* Per-system thumbnail manager (pastime.gg-backed).  Owns the
+    * canonical-key index, on-disk image cache, and the lookahead
+    * fetch queue.  Open on system enter, close on system exit. */
+   downplay_thumbs_t  *current_thumbs;
+
    /* Index of the row whose thumbnail is currently loading or loaded.
     * On selection change we reset the previous row's thumbnail so
     * scrolling through a 200-ROM folder never accumulates more than
@@ -934,10 +925,6 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
             roms[count].size  = (int64_t)st.st_size;
          }
          gfx_thumbnail_init_blank(&roms[count].thumbnail);
-         /* Pre-arm the post-stream probe throttle so the first
-          * MISSING frame on this row probes immediately rather than
-          * waiting for the throttle to fill up. */
-         roms[count].probe_throttle_acc = 0.25f;
          /* art_state is seeded from the persisted index after
           * downplay_index_finish_scan in downplay_open_system, and
           * advanced at the AVAILABLE/MISSING transition sites in
@@ -1492,12 +1479,15 @@ static void downplay_system_dispose(void *user, void *side)
    dp->roms                 = NULL;
    dp->rom_count            = 0;
    dp->thumb_prev_selection = SIZE_MAX;
-   if (dp->thumb_path_data)
-      gfx_thumbnail_path_reset(dp->thumb_path_data);
    if (dp->current_index)
    {
       downplay_index_close(dp->current_index);
       dp->current_index = NULL;
+   }
+   if (dp->current_thumbs)
+   {
+      downplay_thumbs_close(dp->current_thumbs);
+      dp->current_thumbs = NULL;
    }
    /* See save_picker_dispose: clear the right-pane fade key so the
     * next view's first texture restarts the smoothstep from alpha 0
@@ -1579,10 +1569,16 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
    /* Thumbnail path resolver: alloc once per handle lifetime.
     * gfx_thumbnail_path_init returns NULL on alloc failure — soldier on
     * without art rather than dropping the user back to TOP. */
-   if (!dp->thumb_path_data)
-      dp->thumb_path_data = gfx_thumbnail_path_init();
-   if (dp->thumb_path_data && sys->db_name && *sys->db_name)
-      gfx_thumbnail_set_system(dp->thumb_path_data, sys->db_name, NULL);
+   /* Open the pastime.gg-backed thumbnail manager.  Closes the prior
+    * one (no-op normally, since system_dispose already did).  NULL
+    * db_name → manager is skipped; rows still render labels. */
+   if (dp->current_thumbs)
+   {
+      downplay_thumbs_close(dp->current_thumbs);
+      dp->current_thumbs = NULL;
+   }
+   if (sys->db_name && *sys->db_name)
+      dp->current_thumbs = downplay_thumbs_open(sys->db_name);
 
    dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SYSTEM, NULL, downplay_system_dispose);
 }
@@ -4594,71 +4590,52 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
  *
  * No-op outside SYSTEM view, or when the index/path-data isn't ready
  * (graceful degradation: rows still show filenames). */
-/* Look the row up in the index and return the canonical label, or NULL
- * if the row is unmatched / index isn't ready.  Mutable-dp wrapper
- * because downplay_index_lookup invalidates stale entries. */
-static const char *downplay_canonical_label(downplay_handle_t *dp,
-      const downplay_rom_t *rom, const char *basename)
-{
-   downplay_index_record_t rec;
-   if (!dp->current_index)
-      return NULL;
-   if (!downplay_index_lookup(dp->current_index, basename,
-            (time_t)rom->mtime, rom->size, &rec))
-      return NULL;
-   return rec.label;
-}
-
-/* Try to load the boxart PNG for `label` if it's on disk.  Returns true
- * if a load was kicked (status will be PENDING / AVAILABLE on next
- * frame).  Reuses the resolver's path-build logic via set_content +
- * update_path, then bypasses the streaming timer with request_file
- * since we already know the file exists. */
-static bool downplay_try_load_for_label(downplay_handle_t *dp, size_t sel,
-      const char *label, unsigned upscale_thresh)
-{
-   if (!label || !*label)
-      return false;
-   gfx_thumbnail_set_content(dp->thumb_path_data, label);
-   if (!gfx_thumbnail_update_path(dp->thumb_path_data, GFX_THUMBNAIL_RIGHT))
-      return false;
-   if (   !dp->thumb_path_data->right_path[0]
-       || !path_is_valid(dp->thumb_path_data->right_path))
-      return false;
-   gfx_thumbnail_request_file(
-         dp->thumb_path_data->right_path,
-         &dp->roms[sel].thumbnail, upscale_thresh);
-   return true;
-}
-
+/* Drive per-frame thumbnail loading for the SYSTEM view.
+ *
+ * The pastime.gg-backed manager owns the lookup logic (per-system
+ * index + filename-match cascade); this function is just the bridge
+ * between the manager's status output and the gfx_thumbnail_t the
+ * renderer reads from.
+ *
+ * Per-frame steps:
+ *   1. Pump the canonical-label resolver (downplay_index) so display
+ *      labels for poorly-named ROMs settle within a few frames.
+ *   2. Pump the thumbnail manager (drains image-fetch queue,
+ *      reconciles in-flight count).
+ *   3. Reset the prior selection's gfx_thumbnail_t (one resident
+ *      texture at a time).
+ *   4. Look up the active row's basename via the manager:
+ *        - OK     → request_file on local cache path.
+ *        - MISSING → mark row's gfx_thumbnail status MISSING.
+ *        - UNKNOWN → leave PENDING, retry next frame.
+ *   5. Mirror the result onto roms[sel].art_state (the row drawer's
+ *      truncation gate keys off this).
+ *   6. Lookahead-prefetch the ±5 surrounding rows. */
 static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
 {
    const downplay_rom_t *rom;
    const char           *base;
-   const char           *canonical;
-   const char           *filename;
-   const char           *db_name;
+   downplay_thumb_result_t result;
    settings_t           *settings;
-   gfx_animation_t      *p_anim;
    unsigned              upscale_thresh;
    size_t                sel;
-   bool                  loaded;
    enum gfx_thumbnail_status status;
 
    if (dp->nav.view != DOWNPLAY_VIEW_SYSTEM)
       return;
-   if (!dp->roms || dp->rom_count == 0 || !dp->thumb_path_data)
+   if (!dp->roms || dp->rom_count == 0)
       return;
 
    sel = dp->nav.selection;
    if (sel >= dp->rom_count)
       sel = dp->rom_count - 1;
 
-   /* Pump even when path_data isn't ready — matching is independent of
-    * art, and a successful match unlocks the row's canonical label
-    * regardless of whether we ever fetch art for it. */
+   /* Pump the canonical-label resolver (independent of art). */
    if (dp->current_index)
       downplay_index_pump(dp->current_index, 2);
+   /* Pump the thumbnail manager (drains image queue, reconciles). */
+   if (dp->current_thumbs)
+      downplay_thumbs_pump(dp->current_thumbs);
 
    /* Selection change → reset the prior selection's thumbnail. */
    if (   dp->thumb_prev_selection != sel
@@ -4666,139 +4643,64 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
       gfx_thumbnail_reset(&dp->roms[dp->thumb_prev_selection].thumbnail);
    dp->thumb_prev_selection = sel;
 
+   if (!dp->current_thumbs)
+      return; /* No db_name → no art for this system, ever. */
+
    rom  = &dp->roms[sel];
    base = path_basename(rom->full_path);
    if (!base || !*base)
       return;
 
-   /* We always have two candidate labels, and either may match the
-    * libretro-thumbnails repo independently:
-    *
-    *  - filename: rom->display_name (basename minus extension).  This
-    *    matches when the user's ROM is named per No-Intro / Redump
-    *    conventions, which is the common case.
-    *
-    *  - canonical: rom's index label (from RDB match).  This matches
-    *    for poorly-named ROMs (e.g. "smw.smc" → "Super Mario World
-    *    (USA)"), and is also what we display in the row text.
-    *
-    * The two diverge when:
-    *  - filename is short / cryptic (canonical wins for art).
-    *  - the catalog appends extra parens for compilations / Virtual
-    *    Console releases that aren't in libretro-thumbnails (filename
-    *    wins for art — this is the Sonic Compilation case).
-    *
-    * Strategy: probe both for a local file before kicking the
-    * streaming load, and on MISSING fire downloads for both so
-    * whichever lib has the canonical filename wins. */
-   filename  = rom->display_name;
-   canonical = downplay_canonical_label(dp, rom, base);
-   if (canonical && string_is_equal(canonical, filename))
-      canonical = NULL;  /* Same — collapse to the single-label case. */
-
    settings       = config_get_ptr();
-   p_anim         = anim_get_ptr();
-   upscale_thresh = settings ?
-         settings->uints.gfx_thumbnail_upscale_threshold : 0;
+   upscale_thresh = settings
+         ? settings->uints.gfx_thumbnail_upscale_threshold : 0;
 
-   /* Pre-flight: status==UNKNOWN means we haven't tried yet.  Probe
-    * disk with both labels; if either has a local PNG, hot-load and
-    * skip the streaming delay (file is already there, no point
-    * waiting). */
+   downplay_thumbs_request(dp->current_thumbs, base, &result);
+
    status = (enum gfx_thumbnail_status)
          retro_atomic_load_acquire_int(&dp->roms[sel].thumbnail.status);
-   loaded = false;
-   if (status == GFX_THUMBNAIL_STATUS_UNKNOWN)
-   {
-      if (downplay_try_load_for_label(dp, sel, filename, upscale_thresh))
-         loaded = true;
-      else if (canonical
-            && downplay_try_load_for_label(dp, sel, canonical, upscale_thresh))
-         loaded = true;
-   }
 
-   /* If neither pre-flight worked, fall back to the standard streaming
-    * load against the canonical label (preferred for display because
-    * "Super Mario World (USA)" beats "smw" if the user has a
-    * cryptic-named file).  Streaming gives the 50ms debounce while
-    * the user is fast-scrolling. */
-   if (!loaded)
+   if (result.status == DP_THUMB_OK)
    {
-      const char *display = canonical ? canonical : filename;
-      gfx_thumbnail_set_content(dp->thumb_path_data, display);
-      gfx_thumbnail_request_stream(
-            dp->thumb_path_data, p_anim, GFX_THUMBNAIL_RIGHT,
-            NULL /* playlist */, 0 /* idx */,
-            (gfx_thumbnail_t*)&dp->roms[sel].thumbnail,
-            upscale_thresh,
-            settings ? settings->bools.network_on_demand_thumbnails : false);
+      /* File on disk → kick a (synchronous-on-disk) load if we haven't
+       * already.  request_file is idempotent vs PENDING/AVAILABLE: it
+       * checks status internally and bails. */
+      if (status == GFX_THUMBNAIL_STATUS_UNKNOWN
+          || status == GFX_THUMBNAIL_STATUS_MISSING)
+         gfx_thumbnail_request_file(result.local_path,
+               &dp->roms[sel].thumbnail, upscale_thresh);
+      dp->roms[sel].art_state = DP_ART_OK;
    }
+   else if (result.status == DP_THUMB_MISSING)
+   {
+      /* Definitive miss — index is loaded and the title isn't in it.
+       * Park the gfx status at MISSING so the renderer doesn't keep
+       * the placeholder up. */
+      if (status != GFX_THUMBNAIL_STATUS_MISSING)
+         retro_atomic_store_release_int(&dp->roms[sel].thumbnail.status,
+               GFX_THUMBNAIL_STATUS_MISSING);
+      dp->roms[sel].art_state = DP_ART_MISSING;
+   }
+   /* DP_THUMB_UNKNOWN → leave status as-is; next frame will retry. */
 
-   /* Post-streaming poll: status flipped to MISSING but our HTTP fetch
-    * may have just landed.  Probe both labels again — bypassing the
-    * sticky-MISSING block in request_stream — and hot-load.
-    *
-    * Rate-limited to ~4 Hz per row via probe_throttle_acc.  Without
-    * the limiter, every frame `path_is_valid()`s up to two missing
-    * paths against FUSE-backed /sdcard, which is wasteful (the
-    * download takes hundreds of ms; we don't need to look 240×/sec
-    * to catch it). */
-   status = (enum gfx_thumbnail_status)
-         retro_atomic_load_acquire_int(&dp->roms[sel].thumbnail.status);
-   if (status == GFX_THUMBNAIL_STATUS_MISSING)
+   /* Lookahead prefetch: rows ±5 from selection.  Each is at most one
+    * HTTP fetch queued per call; the manager de-dups.  The loop's
+    * delta range produces at most 10 entries by construction, which
+    * matches the array size. */
    {
-      dp->roms[sel].probe_throttle_acc += p_anim->delta_time;
-      if (dp->roms[sel].probe_throttle_acc >= 0.25f)
+      const char *names[10];
+      size_t      n = 0;
+      int         delta;
+      for (delta = -5; delta <= 5; delta++)
       {
-         dp->roms[sel].probe_throttle_acc = 0.0f;
-         if (   downplay_try_load_for_label(dp, sel, filename, upscale_thresh)
-             || (canonical && downplay_try_load_for_label(
-                     dp, sel, canonical, upscale_thresh)))
-            status = (enum gfx_thumbnail_status)
-                  retro_atomic_load_acquire_int(
-                        &dp->roms[sel].thumbnail.status);
+         long idx;
+         if (delta == 0) continue;
+         idx = (long)sel + delta;
+         if (idx < 0 || idx >= (long)dp->rom_count) continue;
+         names[n++] = path_basename(dp->roms[idx].full_path);
       }
-   }
-   else
-   {
-      /* Reset the throttle so a future MISSING transition starts
-       * fresh (e.g., user came back to a previously-loaded row that
-       * lost its texture on context destroy). */
-      dp->roms[sel].probe_throttle_acc = 0.25f;
-   }
-
-   /* Update the index art state for persistence + suppression of
-    * repeat downloads. */
-   db_name = (dp->active_system < dp->system_count && dp->systems)
-         ? dp->systems[dp->active_system].db_name : NULL;
-   if (dp->current_index)
-   {
-      if (status == GFX_THUMBNAIL_STATUS_AVAILABLE)
-      {
-         downplay_index_set_art_state(dp->current_index, base, DP_ART_OK);
-         dp->roms[sel].art_state = DP_ART_OK;
-      }
-      else if (status == GFX_THUMBNAIL_STATUS_MISSING && db_name && *db_name)
-      {
-         downplay_index_record_t rec;
-         bool prior_attempt = downplay_index_lookup(dp->current_index,
-               base, (time_t)rom->mtime, rom->size, &rec)
-                  && rec.art_state == DP_ART_MISSING;
-         if (!prior_attempt)
-         {
-            /* Fire downloads for *both* labels (when they differ) —
-             * libretro-thumbnails has no fixed convention as to which
-             * one will hit, so kick both and let whichever 200s
-             * succeed.  The HTTP task system de-dups in flight
-             * requests for the same URL. */
-            downplay_metadata_request_boxart(db_name, filename);
-            if (canonical)
-               downplay_metadata_request_boxart(db_name, canonical);
-            downplay_index_set_art_state(dp->current_index, base,
-                  DP_ART_MISSING);
-         }
-         dp->roms[sel].art_state = DP_ART_MISSING;
-      }
+      if (n > 0)
+         downplay_thumbs_prefetch(dp->current_thumbs, names, n);
    }
 }
 
@@ -5722,11 +5624,6 @@ static void downplay_menu_free(void *data)
    {
       downplay_index_close(dp->current_index);
       dp->current_index = NULL;
-   }
-   if (dp->thumb_path_data)
-   {
-      free(dp->thumb_path_data);
-      dp->thumb_path_data = NULL;
    }
    /* systems / roms are CPU-only state, freed here rather than in
     * context_destroy so they survive GPU context loss/reset cycles. */
