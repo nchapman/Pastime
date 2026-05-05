@@ -131,6 +131,35 @@ void downplay_thumbs_prefetch(downplay_thumbs_t *t,
  * when steady-state. */
 void downplay_thumbs_pump(downplay_thumbs_t *t);
 
+/* ---------- recents resolver (read-only, multi-system) ----------
+ *
+ * The recents view spans whatever systems the user has launched
+ * games from.  We deliberately do not kick HTTP fetches here — if a
+ * system's index isn't on disk yet, the row simply shows no art
+ * until the user opens that system view (which populates the cache
+ * via the manager).  Self-heals on first run; no extra work in the
+ * recents code path.
+ *
+ * Designed for the recents view's lifecycle:
+ *   - `_open` once on view enter (cheap; no I/O)
+ *   - `_resolve` per row per frame (lazy-loads each system's index
+ *     once on first request, caches the result)
+ *   - `_close` on view exit (frees all cached indexes) */
+
+typedef struct downplay_thumbs_recents downplay_thumbs_recents_t;
+
+downplay_thumbs_recents_t *downplay_thumbs_recents_open(void);
+
+/* Resolve one row.  Returns true and writes the on-disk image path
+ * into `out` iff the system's binary index is on disk, the cascade
+ * matches `rom_basename`, AND the resolved image is cached.  No HTTP
+ * is kicked; a NULL return means "no art for this row right now". */
+bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
+      const char *system, const char *rom_basename,
+      char *out, size_t out_size);
+
+void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r);
+
 /* ---------- match cascade (public for unit tests) ---------- */
 
 /* Opaque test-friendly index loaded from a JSON buffer.  Owns its

@@ -51,6 +51,10 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <boolean.h>
 #include <compat/strl.h>
@@ -83,23 +87,78 @@
 /* Hard upper bound on parsed entries.  Real No-Intro / Redump
  * indexes are 5k–20k entries per system; 100k gives generous
  * headroom while preventing a hostile 256 MB index from OOM-killing
- * the launcher (each entry costs ~500 B of heap once strdup'd). */
+ * the launcher.  Also caps the binary-format `entry_count` field at
+ * open time before we multiply it out — see dp_idx_open. */
 #define DP_THUMBS_MAX_ENTRIES 100000u
 
+/* On-disk binary index format.  Replaces gzipped JSON as the cached
+ * representation: parse JSON once on download, emit a packed binary
+ * file, then every subsequent open is a `pread` + 32-byte header
+ * validation — no JSON, no allocations beyond the buffer itself.
+ *
+ * Layout (little-endian, 4-byte aligned sections):
+ *
+ *   [HEADER 32B]
+ *     u32 magic           = 'DPTH'
+ *     u32 version         = 1
+ *     u32 entry_count
+ *     u32 strings_size
+ *     u32 entries_off     -- always 32
+ *     u32 by_canonical_off
+ *     u32 by_heavy_off
+ *     u32 strings_off
+ *
+ *   [ENTRIES, 8 bytes each, original load order]
+ *     u32 canonical_off   -- offset into string pool
+ *     u32 heavy_off
+ *
+ *   [BY_CANONICAL, u32 entry indices, sorted by strcmp(canonical)]
+ *
+ *   [BY_HEAVY, {u32 hash, u32 entry_idx} pairs, sorted by
+ *    (hash, then strcmp(heavy) for stability across collisions)]
+ *
+ *   [STRINGS, packed NUL-terminated string pool, dedup'd]
+ *
+ *   [FOOTER 8B]
+ *     u32 magic_repeat
+ *     u32 entry_count_repeat
+ *
+ * Tiebreak fields (region / rev / bad_dump / disc) are NOT stored —
+ * they're derived from the canonical name on demand inside the
+ * cascade.  Per-query cost is bounded (cascade walks 1-5 candidates;
+ * helpers are ~50 ns each).  Net win: zero per-record metadata
+ * overhead, no parse-time computation, single source of truth.
+ *
+ * Hash in BY_HEAVY (fnv1a-32 of the heavy string) lets bsearch
+ * compare 32-bit ints on the hot path, only falling through to
+ * strcmp on hash hits — collisions for 20k entries in 2^32 space
+ * are statistically negligible but handled correctly via the
+ * secondary strcmp key.
+ *
+ * Webp is always present on the server (we control it), so format
+ * size fields are gone too — every image URL ends in `.webp`. */
+#define DP_IDX_MAGIC      0x48545044u  /* 'D','P','T','H' LE */
+#define DP_IDX_VERSION    1u
+#define DP_IDX_HEADER_SZ  32u
+#define DP_IDX_FOOTER_SZ  8u
+#define DP_IDX_REC_SZ     8u           /* canonical_off + heavy_off */
+#define DP_IDX_BCAN_SZ    4u           /* entry_idx */
+#define DP_IDX_BHEV_SZ    8u           /* hash + entry_idx */
+
 /* ---------------------------------------------------------------- */
-/* Section 1: entry struct + normalization + tiebreak metadata      */
+/* Section 1: parse-time entry struct + normalization + tiebreaks   */
 /* ---------------------------------------------------------------- */
 
+/* Transient struct used during JSON parse only.  Does NOT survive
+ * past `downplay_thumbs_index_parse` — we emit a binary buffer from
+ * a temp array of these and free them.  All tiebreak data is
+ * derived from `canonical` on demand at cascade time, which is why
+ * this struct only carries the two strings the binary format needs
+ * to persist. */
 typedef struct
 {
-   char *canonical;     /* heap, exactly the index.json key */
-   char *heavy;         /* aggressively-normalized, parens stripped */
-   char  disc_token[16];/* "Disc 2" / "CD 1" / "Side B" / "" */
-   int   jpg_size;      /* bytes; 0 if .jpg absent in formats */
-   int   webp_size;     /* bytes; 0 if .webp absent in formats */
-   int   region_score;  /* lower = better; only used on multi-candidate */
-   int   rev_num;       /* (Rev N) parsed; 0 if absent */
-   bool  bad_dump;      /* (Beta|Proto|Demo|Sample|Pirate|Unl|Hack|...) */
+   char *canonical;     /* exactly the index.json key */
+   char *heavy;         /* normalized form for the bsearch index */
 } dp_thumb_entry_t;
 
 /* Validate the id portion of a disc/cd/side tag — i.e. the bytes
@@ -554,58 +613,33 @@ static int dp_score_region(const char *canonical)
    return score;
 }
 
-/* Comparator for the single (heavy, canonical) sort.  qsort isn't
- * stable; chaining canonical as a secondary key makes the order
- * fully determined by data, so identical inputs always produce the
- * same lookup result across runs and platforms. */
-static const dp_thumb_entry_t *g_dp_cmp_base;
-
-static int dp_cmp_heavy(const void *a, const void *b)
-{
-   uint32_t ia = *(const uint32_t*)a, ib = *(const uint32_t*)b;
-   int rv = strcmp(g_dp_cmp_base[ia].heavy, g_dp_cmp_base[ib].heavy);
-   if (rv != 0)
-      return rv;
-   return strcmp(g_dp_cmp_base[ia].canonical, g_dp_cmp_base[ib].canonical);
-}
-
-static int dp_cmp_canonical(const void *a, const void *b)
-{
-   uint32_t ia = *(const uint32_t*)a, ib = *(const uint32_t*)b;
-   return strcmp(g_dp_cmp_base[ia].canonical, g_dp_cmp_base[ib].canonical);
-}
-
 /* ---------------------------------------------------------------- */
-/* Section 2: JSON parse → downplay_thumbs_index_t                  */
+/* Section 2: JSON parse → temp dp_parse_index_t                    */
 /* ---------------------------------------------------------------- */
 
-struct downplay_thumbs_index
+/* Parse-time temporary index.  Lives only across one
+ * `downplay_thumbs_index_parse` call: rjson handlers populate it,
+ * then dp_idx_emit_buffer serialises it to the on-disk binary
+ * format and frees it.  The public-API `downplay_thumbs_index_t`
+ * (defined later) wraps the resulting binary buffer. */
+typedef struct
 {
    dp_thumb_entry_t *entries;
    size_t            entries_count;
    size_t            entries_cap;
-
-   /* Permutation arrays: entries[] indices sorted by the named key.
-    * `by_heavy` is the primary lookup index; `by_canonical` lets us
-    * answer the exact-canonical fast path in O(log N).  Both use
-    * `canonical` as a stable secondary sort for full determinism. */
-   uint32_t *by_heavy;
-   uint32_t *by_canonical;
-};
+} dp_parse_index_t;
 
 /* JSON parse state machine.  The input shape:
  *   { "system": "...", "image_type": "...", "files": {
- *       "Title (Region)": { "formats": { "jpg": N, "webp": N }, ... },
+ *       "Title (Region)": { "formats": { ... }, ... },
  *       ...
  *     }
  *   }
  *
- * We only care about: each key inside "files" (= entry canonical), and
- * its inner formats.jpg number.  Everything else is skipped.
- *
- * State machine markers track depth so we know whether the current
- * member belongs to top-level, "files", an entry object, or its
- * "formats" sub-object. */
+ * We only care about each key inside "files" (= entry canonical).
+ * The legacy "formats.{jpg,webp}" sub-objects are still parsed past
+ * — to stay in sync with rjson's depth tracking — but their values
+ * are discarded since the binary format always assumes webp. */
 typedef enum
 {
    DP_PS_TOPLEVEL = 0, /* inside outer { ... } */
@@ -617,16 +651,14 @@ typedef enum
 
 typedef struct
 {
-   downplay_thumbs_index_t *idx;
+   dp_parse_index_t *idx;
 
    dp_parse_state_t state_stack[16];
    int              depth;            /* current depth, 0 == before root */
 
-   /* Accumulator for the entry currently being parsed (in DP_PS_IN_ENTRY
-    * or DP_PS_IN_FORMATS).  Strings strdup'd, NULL when no entry. */
+   /* Accumulator for the entry currently being parsed.  NULL between
+    * entries; strdup'd while we're inside one. */
    char *cur_canonical;
-   int   cur_jpg_size;
-   int   cur_webp_size;
 
    /* Last seen object-member name; consumed by the next value handler. */
    char  last_member[256];
@@ -637,7 +669,7 @@ typedef struct
    bool  oom;
 } dp_parse_ctx_t;
 
-static bool dp_idx_grow(downplay_thumbs_index_t *idx)
+static bool dp_idx_grow(dp_parse_index_t *idx)
 {
    size_t new_cap;
    dp_thumb_entry_t *e;
@@ -655,14 +687,15 @@ static bool dp_idx_grow(downplay_thumbs_index_t *idx)
    return true;
 }
 
-/* Append one entry to entries[].  `canonical` is strdup'd; metadata
- * (region/rev/bad_dump/disc) is computed from it.  `heavy` is taken
- * from the supplied buffer so callers can synthesise alt-name keys
- * without re-running normalize on the same canonical.  Returns
- * false on OOM (caller propagates). */
-static bool dp_append_entry(downplay_thumbs_index_t *idx,
-      const char *canonical, const char *heavy,
-      int jpg_size, int webp_size, bool *oom)
+/* Append one entry to the parse-time temp array.  `canonical` and
+ * `heavy` are strdup'd.  Tiebreak metadata (region/rev/bad_dump/disc)
+ * is NOT pre-computed — the binary format doesn't store it and the
+ * cascade derives it on demand at query time.  `heavy` is supplied
+ * by the caller so alt-name segments can reuse the normalize buffer
+ * without re-running it on the same canonical.  Returns false on
+ * OOM (caller propagates). */
+static bool dp_append_entry(dp_parse_index_t *idx,
+      const char *canonical, const char *heavy, bool *oom)
 {
    dp_thumb_entry_t *e;
    if (idx->entries_count == idx->entries_cap && !dp_idx_grow(idx))
@@ -680,30 +713,24 @@ static bool dp_append_entry(downplay_thumbs_index_t *idx,
       *oom = true;
       return false;
    }
-   e->jpg_size     = jpg_size;
-   e->webp_size    = webp_size;
-   e->region_score = dp_score_region(canonical);
-   e->rev_num      = dp_extract_rev(canonical);
-   e->bad_dump     = dp_detect_bad_dump(canonical);
-   dp_extract_disc_token(canonical, e->disc_token, sizeof(e->disc_token));
    idx->entries_count++;
    return true;
 }
 
-/* Commit cur_canonical / cur_jpg_size as one or more entries.  Most
- * canonicals produce a single entry.  Canonicals that contain ` _ `
- * (libretro's alt-name separator after & or `/` sanitization) are
- * recognised as multi-name bundles like
+/* Commit cur_canonical as one or more entries.  Most canonicals
+ * produce a single entry.  Canonicals that contain ` _ ` (libretro's
+ * alt-name separator after & or `/` sanitization) are recognised as
+ * multi-name bundles like
  *
  *   "F-16 Fighting Falcon _ F-16 Fighter _ F16 Falcon Fighter (USA)"
  *
  * and produce one entry per segment, all pointing at the same
- * canonical key (and therefore the same on-disk JPG path).  This
+ * canonical key (and therefore the same on-disk image path).  This
  * lets a user filename like "F-16 Fighter (USA).zip" match the
  * bundle via its second alt name. */
 static bool dp_commit_entry(dp_parse_ctx_t *c)
 {
-   downplay_thumbs_index_t *idx = c->idx;
+   dp_parse_index_t *idx = c->idx;
    char  paren_strip[768];
    char  heavy_buf[512];
    const char *p;
@@ -719,8 +746,7 @@ static bool dp_commit_entry(dp_parse_ctx_t *c)
    dp_normalize_heavy(c->cur_canonical, heavy_buf, sizeof(heavy_buf));
    if (*heavy_buf)
    {
-      if (!dp_append_entry(idx, c->cur_canonical, heavy_buf,
-               c->cur_jpg_size, c->cur_webp_size, &c->oom))
+      if (!dp_append_entry(idx, c->cur_canonical, heavy_buf, &c->oom))
          goto fail;
       any_committed = true;
    }
@@ -766,8 +792,7 @@ static bool dp_commit_entry(dp_parse_ctx_t *c)
                            idx->entries_count - 1].heavy) != 0)
                {
                   if (!dp_append_entry(idx, c->cur_canonical,
-                           heavy_buf, c->cur_jpg_size,
-                           c->cur_webp_size, &c->oom))
+                           heavy_buf, &c->oom))
                      goto fail;
                }
 seg_advance:
@@ -782,16 +807,12 @@ seg_advance:
 
    free(c->cur_canonical);
    c->cur_canonical = NULL;
-   c->cur_jpg_size  = 0;
-   c->cur_webp_size = 0;
    (void)any_committed;
    return true;
 
 fail:
    free(c->cur_canonical);
    c->cur_canonical = NULL;
-   c->cur_jpg_size  = 0;
-   c->cur_webp_size = 0;
    return false;
 }
 
@@ -850,8 +871,6 @@ static bool dp_h_member(void *ctx, const char *str, size_t len)
    {
       free(c->cur_canonical);
       c->cur_canonical = NULL;
-      c->cur_jpg_size  = 0;
-      c->cur_webp_size = 0;
       if (!dp_canonical_safe(str, len))
          return true;
       c->cur_canonical = (char*)malloc(len + 1);
@@ -930,21 +949,12 @@ static bool dp_h_end_array(void *ctx)
 static bool dp_h_number(void *ctx, const char *str, size_t len)
 {
    dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx;
-   (void)len;
-   if (c->depth > 0
-       && c->state_stack[c->depth - 1] == DP_PS_IN_FORMATS)
-   {
-      /* Clamp negatives — atoi("-1") would otherwise survive into
-       * dp_pick_ext's `> 0` test as a falsy value but propagate as a
-       * weird int elsewhere.  Hostile or malformed indexes only. */
-      int n = atoi(str);
-      if (n < 0)
-         n = 0;
-      if (!strcmp(c->last_member, "jpg"))
-         c->cur_jpg_size = n;
-      else if (!strcmp(c->last_member, "webp"))
-         c->cur_webp_size = n;
-   }
+   (void)str; (void)len;
+   /* `formats.{jpg,webp}` numbers are still emitted by the server
+    * but we no longer care: webp is always available, the URL never
+    * carries a size, and the binary format stores no per-entry size.
+    * The handler keeps consuming the value to stay in sync with
+    * rjson's depth tracking. */
    c->last_member[0] = '\0';
    return true;
 }
@@ -968,110 +978,479 @@ static void dp_h_error(void *ctx, int line, int col, const char *err)
 }
 #endif
 
-/* Build the (heavy, canonical) and (canonical) permutation arrays. */
-static bool dp_idx_finalize_sort(downplay_thumbs_index_t *idx)
+/* ---------------------------------------------------------------- */
+/* Section 2.5: binary format writer (parse temp → packed buffer)   */
+/* ---------------------------------------------------------------- */
+
+/* fnv1a-32: small, no table, no allocation.  Used both at write time
+ * (BY_HEAVY index keys) and at query time (cascade bsearch needle).
+ * Both sites must produce identical bytes — keep the constants and
+ * the iteration order locked. */
+static uint32_t dp_fnv1a32(const char *s)
 {
-   size_t    i;
-   uint32_t *a;
-   uint32_t *b;
-   if (idx->entries_count == 0)
-      return true;
-   a = (uint32_t*)malloc(idx->entries_count * sizeof(*a));
-   b = (uint32_t*)malloc(idx->entries_count * sizeof(*b));
-   if (!a || !b)
+   uint32_t h = 0x811c9dc5u;
+   while (*s)
    {
-      free(a);
-      free(b);
-      return false;
+      h ^= (unsigned char)*s++;
+      h *= 0x01000193u;
    }
-   for (i = 0; i < idx->entries_count; i++)
-      a[i] = b[i] = (uint32_t)i;
-   /* g_dp_cmp_base: file-static used by the qsort comparator since
-    * qsort takes no user-data param.  Single-threaded by construction
-    * — only set during this finalize call, on the single UI thread. */
-   g_dp_cmp_base = idx->entries;
-   qsort(a, idx->entries_count, sizeof(*a), dp_cmp_heavy);
-   qsort(b, idx->entries_count, sizeof(*b), dp_cmp_canonical);
-   g_dp_cmp_base = NULL;
-   idx->by_heavy     = a;
-   idx->by_canonical = b;
+   return h;
+}
+
+/* Build-time string interning pool with open-addressing hash dedup.
+ * Lives only across one dp_idx_emit_buffer call.  Hash table stores
+ * (offset+1) values so 0 is a sentinel for "empty slot". */
+typedef struct
+{
+   char     *data;
+   size_t    size;
+   size_t    cap;
+   uint32_t *ht;
+   size_t    htmask;        /* (htsize - 1); htsize is power of two */
+   size_t    htcount;
+} dp_strpool_t;
+
+static bool dp_strpool_grow_ht(dp_strpool_t *p)
+{
+   size_t    new_size = p->htmask ? (p->htmask + 1) * 2 : 256;
+   uint32_t *nht;
+   size_t    i;
+   nht = (uint32_t*)calloc(new_size, sizeof(uint32_t));
+   if (!nht)
+      return false;
+   if (p->ht)
+   {
+      for (i = 0; i <= p->htmask; i++)
+      {
+         uint32_t off = p->ht[i];
+         if (!off)
+            continue;
+         {
+            const char *s = p->data + (off - 1);
+            size_t      pos = dp_fnv1a32(s) & (new_size - 1);
+            while (nht[pos])
+               pos = (pos + 1) & (new_size - 1);
+            nht[pos] = off;
+         }
+      }
+      free(p->ht);
+   }
+   p->ht     = nht;
+   p->htmask = new_size - 1;
    return true;
 }
 
-downplay_thumbs_index_t *downplay_thumbs_index_parse(
-      const char *json, size_t json_len)
+static bool dp_strpool_grow_data(dp_strpool_t *p, size_t need)
+{
+   size_t new_cap = p->cap ? p->cap : 4096;
+   char  *n;
+   while (new_cap < p->size + need)
+   {
+      if (new_cap > ((size_t)1 << 30))
+         return false;
+      new_cap *= 2;
+   }
+   n = (char*)realloc(p->data, new_cap);
+   if (!n)
+      return false;
+   p->data = n;
+   p->cap  = new_cap;
+   return true;
+}
+
+/* Intern `s`.  On success writes its byte offset into the pool to
+ * `*out`.  Returns false on allocation failure. */
+static bool dp_strpool_intern(dp_strpool_t *p, const char *s, uint32_t *out)
+{
+   size_t   slen = strlen(s);
+   uint32_t h    = dp_fnv1a32(s);
+   size_t   pos;
+
+   /* Grow ht if load factor would exceed 0.5. */
+   if (!p->ht || (p->htcount + 1) * 2 > p->htmask + 1)
+      if (!dp_strpool_grow_ht(p))
+         return false;
+
+   pos = h & p->htmask;
+   while (p->ht[pos])
+   {
+      uint32_t off = p->ht[pos] - 1;
+      if (strcmp(p->data + off, s) == 0)
+      {
+         *out = off;
+         return true;
+      }
+      pos = (pos + 1) & p->htmask;
+   }
+   if (p->size + slen + 1 > p->cap)
+      if (!dp_strpool_grow_data(p, slen + 1))
+         return false;
+   memcpy(p->data + p->size, s, slen + 1);
+   *out       = (uint32_t)p->size;
+   p->ht[pos] = (uint32_t)(p->size + 1);
+   p->htcount++;
+   p->size   += slen + 1;
+   return true;
+}
+
+static void dp_strpool_free(dp_strpool_t *p)
+{
+   free(p->data);
+   free(p->ht);
+   memset(p, 0, sizeof(*p));
+}
+
+/* qsort comparator state.  File-static; only set during the writer's
+ * sort calls, on the single UI thread.  qsort takes no user-data
+ * pointer, hence the global. */
+static const dp_thumb_entry_t *g_dp_emit_entries;
+
+static int dp_cmp_canonical_idx(const void *a, const void *b)
+{
+   uint32_t ia = *(const uint32_t*)a;
+   uint32_t ib = *(const uint32_t*)b;
+   return strcmp(g_dp_emit_entries[ia].canonical,
+                 g_dp_emit_entries[ib].canonical);
+}
+
+typedef struct { uint32_t hash; uint32_t idx; } dp_hev_pair_t;
+
+static int dp_cmp_heavy_pair(const void *a, const void *b)
+{
+   const dp_hev_pair_t *pa = (const dp_hev_pair_t*)a;
+   const dp_hev_pair_t *pb = (const dp_hev_pair_t*)b;
+   int rv;
+   if (pa->hash != pb->hash)
+      return pa->hash < pb->hash ? -1 : 1;
+   /* On hash collision, sort by heavy strcmp so equal-heavy entries
+    * stay contiguous within an equal-hash run.  Then by canonical for
+    * full determinism even when two entries share an identical heavy. */
+   rv = strcmp(g_dp_emit_entries[pa->idx].heavy,
+               g_dp_emit_entries[pb->idx].heavy);
+   if (rv != 0)
+      return rv;
+   return strcmp(g_dp_emit_entries[pa->idx].canonical,
+                 g_dp_emit_entries[pb->idx].canonical);
+}
+
+/* Serialise the parsed entry array into the on-disk binary format.
+ * On success transfers ownership of the buffer to `*out_buf` (caller
+ * frees) and writes its length to `*out_len`.  Returns false on
+ * allocation failure or if `n` exceeds the entry-count cap. */
+static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
+      uint8_t **out_buf, size_t *out_len)
+{
+   uint8_t        *buf      = NULL;
+   uint32_t       *can_offs = NULL;
+   uint32_t       *hev_offs = NULL;
+   uint32_t       *bcanon   = NULL;
+   dp_hev_pair_t  *bheavy   = NULL;
+   dp_strpool_t    pool;
+   size_t          i;
+   size_t          entries_off, bcanon_off, bheavy_off, strings_off, footer_off;
+   size_t          entries_sz, bcanon_sz, bheavy_sz, total;
+   bool            ok = false;
+
+   memset(&pool, 0, sizeof(pool));
+   if (n > DP_THUMBS_MAX_ENTRIES)
+      return false;
+
+   if (n > 0)
+   {
+      can_offs = (uint32_t*)malloc(n * sizeof(*can_offs));
+      hev_offs = (uint32_t*)malloc(n * sizeof(*hev_offs));
+      if (!can_offs || !hev_offs)
+         goto out;
+   }
+   for (i = 0; i < n; i++)
+   {
+      if (!dp_strpool_intern(&pool, entries[i].canonical, &can_offs[i]))
+         goto out;
+      if (!dp_strpool_intern(&pool, entries[i].heavy,     &hev_offs[i]))
+         goto out;
+   }
+
+   entries_off = DP_IDX_HEADER_SZ;
+   entries_sz  = n * DP_IDX_REC_SZ;
+   bcanon_off  = entries_off + entries_sz;
+   bcanon_sz   = n * DP_IDX_BCAN_SZ;
+   bheavy_off  = bcanon_off + bcanon_sz;
+   bheavy_sz   = n * DP_IDX_BHEV_SZ;
+   strings_off = bheavy_off + bheavy_sz;
+   footer_off  = strings_off + pool.size;
+   total       = footer_off + DP_IDX_FOOTER_SZ;
+
+   /* All section offsets are written into the header as u32.  Today
+    * the entry-count cap (100k) and the string-pool cap (1 GB) keep
+    * us comfortably under 4 GB, but a future cap bump that pushed
+    * any offset past UINT32_MAX would silently produce a truncated
+    * header that subsequent dp_idx_open calls would fail with no
+    * useful error.  Fail loudly here instead. */
+   if (footer_off > UINT32_MAX || pool.size > UINT32_MAX)
+      goto out;
+
+   buf = (uint8_t*)calloc(total, 1);
+   if (!buf)
+      goto out;
+
+   /* Header.  All multibyte fields written as little-endian via
+    * memcpy of host u32 — Downplay ships only on LE targets. */
+   {
+      uint32_t v;
+      v = DP_IDX_MAGIC;            memcpy(buf +  0, &v, 4);
+      v = DP_IDX_VERSION;          memcpy(buf +  4, &v, 4);
+      v = (uint32_t)n;             memcpy(buf +  8, &v, 4);
+      v = (uint32_t)pool.size;     memcpy(buf + 12, &v, 4);
+      v = (uint32_t)entries_off;   memcpy(buf + 16, &v, 4);
+      v = (uint32_t)bcanon_off;    memcpy(buf + 20, &v, 4);
+      v = (uint32_t)bheavy_off;    memcpy(buf + 24, &v, 4);
+      v = (uint32_t)strings_off;   memcpy(buf + 28, &v, 4);
+   }
+
+   /* ENTRIES section: u32 canonical_off, u32 heavy_off per entry,
+    * original load order. */
+   for (i = 0; i < n; i++)
+   {
+      memcpy(buf + entries_off + i * DP_IDX_REC_SZ + 0, &can_offs[i], 4);
+      memcpy(buf + entries_off + i * DP_IDX_REC_SZ + 4, &hev_offs[i], 4);
+   }
+
+   /* BY_CANONICAL: u32 entry indices sorted by strcmp(canonical). */
+   if (n > 0)
+   {
+      bcanon = (uint32_t*)malloc(n * sizeof(*bcanon));
+      if (!bcanon)
+         goto out;
+      for (i = 0; i < n; i++)
+         bcanon[i] = (uint32_t)i;
+      g_dp_emit_entries = entries;
+      qsort(bcanon, n, sizeof(*bcanon), dp_cmp_canonical_idx);
+      g_dp_emit_entries = NULL;
+      for (i = 0; i < n; i++)
+         memcpy(buf + bcanon_off + i * DP_IDX_BCAN_SZ, &bcanon[i], 4);
+   }
+
+   /* BY_HEAVY: {u32 hash, u32 idx} sorted by (hash, strcmp(heavy)). */
+   if (n > 0)
+   {
+      bheavy = (dp_hev_pair_t*)malloc(n * sizeof(*bheavy));
+      if (!bheavy)
+         goto out;
+      for (i = 0; i < n; i++)
+      {
+         bheavy[i].hash = dp_fnv1a32(entries[i].heavy);
+         bheavy[i].idx  = (uint32_t)i;
+      }
+      g_dp_emit_entries = entries;
+      qsort(bheavy, n, sizeof(*bheavy), dp_cmp_heavy_pair);
+      g_dp_emit_entries = NULL;
+      for (i = 0; i < n; i++)
+      {
+         memcpy(buf + bheavy_off + i * DP_IDX_BHEV_SZ + 0, &bheavy[i].hash, 4);
+         memcpy(buf + bheavy_off + i * DP_IDX_BHEV_SZ + 4, &bheavy[i].idx,  4);
+      }
+   }
+
+   /* String pool. */
+   if (pool.size > 0)
+      memcpy(buf + strings_off, pool.data, pool.size);
+
+   /* Footer: magic + entry_count repeat.  Catches partial writes on
+    * FUSE-backed filesystems where rename(2) isn't reliably atomic. */
+   {
+      uint32_t v;
+      v = DP_IDX_MAGIC; memcpy(buf + footer_off + 0, &v, 4);
+      v = (uint32_t)n;  memcpy(buf + footer_off + 4, &v, 4);
+   }
+
+   *out_buf = buf;
+   *out_len = total;
+   buf      = NULL; /* ownership transferred */
+   ok       = true;
+
+out:
+   dp_strpool_free(&pool);
+   free(can_offs);
+   free(hev_offs);
+   free(bcanon);
+   free(bheavy);
+   free(buf);
+   return ok;
+}
+
+/* ---------------------------------------------------------------- */
+/* Section 3: binary index reader + match cascade                   */
+/* ---------------------------------------------------------------- */
+
+/* Public-API index handle.  Wraps a validated binary buffer; every
+ * field accessor reads via memcpy from offsets known at open time.
+ * No allocations during query, no string copies — all string returns
+ * are pointers into `buf`'s string pool, valid for the lifetime of
+ * the handle. */
+struct downplay_thumbs_index
+{
+   uint8_t  *buf;          /* owned, freed on _index_free */
+   size_t    buf_len;
+   uint32_t  entry_count;
+   uint32_t  entries_off;
+   uint32_t  bcanon_off;
+   uint32_t  bheavy_off;
+   uint32_t  strings_off;
+   uint32_t  strings_size;
+};
+
+/* All field reads go through memcpy.  Avoids strict-aliasing UB and
+ * compiles to a single ldr on arm64 at -O2. */
+static uint32_t dp_idx_read_u32(const uint8_t *base, size_t off)
+{
+   uint32_t v;
+   memcpy(&v, base + off, 4);
+   return v;
+}
+
+/* Validate `buf` against the format spec.  On success, returns a
+ * heap-allocated index_t that owns `buf` (frees on _index_free).
+ * On failure, frees `buf` and returns NULL.  Caller must not touch
+ * `buf` after this call regardless of outcome.
+ *
+ * Validation scope: header magic/version/section layout, total file
+ * size matches layout exactly, string pool ends in NUL, footer
+ * matches header.  We deliberately do NOT walk every entry to
+ * confirm its `canonical_off` / `heavy_off` is in-bounds — that
+ * would be O(N) work on open, and the file is written by trusted
+ * code (the writer never produces an out-of-range offset).  The
+ * dp_idx_str accessor returns "" on out-of-bounds offsets as a
+ * defensive fallback against post-validation memory corruption. */
+static downplay_thumbs_index_t *dp_idx_open(uint8_t *buf, size_t buf_len)
 {
    downplay_thumbs_index_t *idx;
-   dp_parse_ctx_t           ctx;
-   bool                     ok;
+   uint32_t magic, version, entry_count, strings_size;
+   uint32_t entries_off, bcanon_off, bheavy_off, strings_off;
+   uint64_t entries_sz, bcanon_sz, bheavy_sz, footer_off, expected;
+   uint32_t fmagic, fcount;
 
-   if (!json || json_len == 0)
-      return NULL;
+   if (!buf || buf_len < (size_t)(DP_IDX_HEADER_SZ + DP_IDX_FOOTER_SZ))
+      goto fail;
+
+   magic        = dp_idx_read_u32(buf,  0);
+   version      = dp_idx_read_u32(buf,  4);
+   entry_count  = dp_idx_read_u32(buf,  8);
+   strings_size = dp_idx_read_u32(buf, 12);
+   entries_off  = dp_idx_read_u32(buf, 16);
+   bcanon_off   = dp_idx_read_u32(buf, 20);
+   bheavy_off   = dp_idx_read_u32(buf, 24);
+   strings_off  = dp_idx_read_u32(buf, 28);
+
+   if (magic != DP_IDX_MAGIC)              goto fail;
+   if (version != DP_IDX_VERSION)          goto fail;
+   if (entry_count > DP_THUMBS_MAX_ENTRIES) goto fail;
+
+   /* Layout must be exact.  uint64_t math makes overflow impossible
+    * since entry_count is already capped above. */
+   entries_sz = (uint64_t)entry_count * DP_IDX_REC_SZ;
+   bcanon_sz  = (uint64_t)entry_count * DP_IDX_BCAN_SZ;
+   bheavy_sz  = (uint64_t)entry_count * DP_IDX_BHEV_SZ;
+   if (entries_off  != DP_IDX_HEADER_SZ)                              goto fail;
+   if ((uint64_t)bcanon_off  != (uint64_t)entries_off + entries_sz)   goto fail;
+   if ((uint64_t)bheavy_off  != (uint64_t)bcanon_off  + bcanon_sz)    goto fail;
+   if ((uint64_t)strings_off != (uint64_t)bheavy_off  + bheavy_sz)    goto fail;
+
+   footer_off = (uint64_t)strings_off + strings_size;
+   expected   = footer_off + DP_IDX_FOOTER_SZ;
+   if ((uint64_t)buf_len != expected)
+      goto fail;
+
+   /* String pool must end with NUL so strcmp inside the pool needs no
+    * per-call bounds check — anything off-by-one would walk straight
+    * into the footer's magic bytes. */
+   if (strings_size > 0 && buf[footer_off - 1] != '\0')
+      goto fail;
+
+   /* Footer mirrors the header — partial-write detection. */
+   fmagic = dp_idx_read_u32(buf, (size_t)footer_off);
+   fcount = dp_idx_read_u32(buf, (size_t)footer_off + 4);
+   if (fmagic != DP_IDX_MAGIC || fcount != entry_count)
+      goto fail;
+
    idx = (downplay_thumbs_index_t*)calloc(1, sizeof(*idx));
    if (!idx)
-      return NULL;
-
-   memset(&ctx, 0, sizeof(ctx));
-   ctx.idx = idx;
-
-   ok = rjson_parse_quick(json, json_len, &ctx, 0,
-         dp_h_member, dp_h_string, dp_h_number,
-         dp_h_start_object, dp_h_end_object,
-         dp_h_start_array, dp_h_end_array,
-         dp_h_bool, dp_h_null,
-#ifdef DOWNPLAY_THUMBS_TEST_BUILD
-         dp_h_error
-#else
-         NULL /* error_handler */
-#endif
-         );
-   /* Tolerate trailing-state weirdness: as long as we got at least one
-    * entry committed and didn't hit OOM, we return the index. */
-   if (ctx.oom || !ctx.saw_files_obj || !ok)
-   {
-      free(ctx.cur_canonical);
-      downplay_thumbs_index_free(idx);
-      return NULL;
-   }
-
-   if (!dp_idx_finalize_sort(idx))
-   {
-      downplay_thumbs_index_free(idx);
-      return NULL;
-   }
+      goto fail;
+   idx->buf          = buf;
+   idx->buf_len      = buf_len;
+   idx->entry_count  = entry_count;
+   idx->entries_off  = entries_off;
+   idx->bcanon_off   = bcanon_off;
+   idx->bheavy_off   = bheavy_off;
+   idx->strings_off  = strings_off;
+   idx->strings_size = strings_size;
    return idx;
+
+fail:
+   free(buf);
+   return NULL;
 }
 
 void downplay_thumbs_index_free(downplay_thumbs_index_t *idx)
 {
-   size_t i;
    if (!idx)
       return;
-   for (i = 0; i < idx->entries_count; i++)
-   {
-      free(idx->entries[i].canonical);
-      free(idx->entries[i].heavy);
-   }
-   free(idx->entries);
-   free(idx->by_heavy);
-   free(idx->by_canonical);
+   free(idx->buf);
    free(idx);
 }
 
 size_t downplay_thumbs_index_count(const downplay_thumbs_index_t *idx)
 {
-   return idx ? idx->entries_count : 0;
+   return idx ? idx->entry_count : 0;
 }
 
-/* ---------------------------------------------------------------- */
-/* Section 3: lookup                                                */
-/* ---------------------------------------------------------------- */
+/* String pool resolver.  Validation guarantees `off < strings_size`
+ * for any offset the format itself produced, and that the pool is
+ * NUL-terminated, so strcmp on the returned pointer is safe.  Out-of-
+ * bounds offsets (post-validation memory corruption — not reachable
+ * via the file format) return "" defensively. */
+static const char *dp_idx_str(const downplay_thumbs_index_t *idx, uint32_t off)
+{
+   if (off >= idx->strings_size)
+      return "";
+   return (const char*)(idx->buf + idx->strings_off + off);
+}
+
+static const char *dp_idx_canonical(
+      const downplay_thumbs_index_t *idx, uint32_t e)
+{
+   return dp_idx_str(idx, dp_idx_read_u32(idx->buf,
+         idx->entries_off + (size_t)e * DP_IDX_REC_SZ + 0));
+}
+
+static const char *dp_idx_heavy(
+      const downplay_thumbs_index_t *idx, uint32_t e)
+{
+   return dp_idx_str(idx, dp_idx_read_u32(idx->buf,
+         idx->entries_off + (size_t)e * DP_IDX_REC_SZ + 4));
+}
+
+static uint32_t dp_idx_bcanon_at(
+      const downplay_thumbs_index_t *idx, size_t i)
+{
+   return dp_idx_read_u32(idx->buf,
+         idx->bcanon_off + i * DP_IDX_BCAN_SZ);
+}
+
+static void dp_idx_bheavy_at(const downplay_thumbs_index_t *idx, size_t i,
+      uint32_t *out_hash, uint32_t *out_idx)
+{
+   *out_hash = dp_idx_read_u32(idx->buf,
+         idx->bheavy_off + i * DP_IDX_BHEV_SZ + 0);
+   *out_idx  = dp_idx_read_u32(idx->buf,
+         idx->bheavy_off + i * DP_IDX_BHEV_SZ + 4);
+}
 
 /* Strip `.ext` from `in` into `out`.  Returns out for chaining. */
 static char *dp_strip_ext(const char *in, char *out, size_t out_size)
 {
    const char *dot;
-   if (out_size == 0) return out;
+   if (out_size == 0)
+      return out;
    strlcpy(out, in ? in : "", out_size);
    /* Caller passes a basename (no path separators), so plain strrchr
     * on the buffer is correct.  Skip files starting with '.' — they
@@ -1082,109 +1461,117 @@ static char *dp_strip_ext(const char *in, char *out, size_t out_size)
    return out;
 }
 
-/* Lower bound bsearch on `by_heavy`, comparing by entry's `heavy`
- * string.  Returns the smallest index in `by_heavy` whose entry's
- * heavy is >= `needle`, or `entries_count` if none. */
-static size_t dp_lower_bound_heavy(const downplay_thumbs_index_t *idx,
-      const char *needle)
+/* Phase 1: bsearch BY_CANONICAL for an exact match.  Returns the
+ * entry index or SIZE_MAX on miss. */
+static size_t dp_lookup_exact_canonical(
+      const downplay_thumbs_index_t *idx, const char *stem)
 {
-   size_t lo = 0, hi = idx->entries_count;
+   size_t lo = 0, hi = idx->entry_count;
    while (lo < hi)
    {
-      size_t mid = lo + (hi - lo) / 2;
-      const dp_thumb_entry_t *e = &idx->entries[idx->by_heavy[mid]];
-      if (strcmp(e->heavy, needle) < 0)
+      size_t   mid = lo + (hi - lo) / 2;
+      uint32_t e   = dp_idx_bcanon_at(idx, mid);
+      int      rv  = strcmp(dp_idx_canonical(idx, e), stem);
+      if (rv == 0)
+         return e;
+      if (rv < 0) lo = mid + 1;
+      else        hi = mid;
+   }
+   return (size_t)-1;
+}
+
+/* Phase 2 helper: bsearch BY_HEAVY by (hash, then strcmp on tie).
+ * Returns the smallest BY_HEAVY index whose key is >= (needle_hash,
+ * needle), or entry_count if all keys are smaller. */
+static size_t dp_lower_bound_heavy(const downplay_thumbs_index_t *idx,
+      const char *needle, uint32_t needle_hash)
+{
+   size_t lo = 0, hi = idx->entry_count;
+   while (lo < hi)
+   {
+      size_t   mid = lo + (hi - lo) / 2;
+      uint32_t h, ei;
+      dp_idx_bheavy_at(idx, mid, &h, &ei);
+      if (h < needle_hash)
          lo = mid + 1;
-      else
+      else if (h > needle_hash)
          hi = mid;
+      else
+      {
+         /* Tie on hash — refine by strcmp on the heavy string. */
+         int rv = strcmp(dp_idx_heavy(idx, ei), needle);
+         if (rv < 0) lo = mid + 1;
+         else        hi = mid;
+      }
    }
    return lo;
 }
 
-/* Compute a tiebreak score for an entry.  Lower wins.
+/* Tiebreak score for one candidate, derived from canonical on
+ * demand — the binary format stores none of region/rev/disc/bad_dump,
+ * so we recompute here.  Cascade ranges are tiny (1-5 entries) so
+ * total per-query cost is well under a microsecond.  Lower wins.
  *
- * Layered, in order of significance (each layer is decisive on its
- * own — region_score doesn't matter if the disc bands differ):
- *   - bad_dump:    +1,000,000 if true
- *   - disc match:  ±100,000 (matches user_disc → bonus, mismatches → penalty)
- *   - region_score (×100, range 0..900)
- *   - -rev_num     (negative so newer rev wins)
- *
- * A canonical-lex tiebreak is applied at the comparison site (not
- * scored — strings can't be folded into a single int). */
-static int dp_score_entry(const dp_thumb_entry_t *e, const char *user_disc)
+ * Layered, in order of significance:
+ *   - bad_dump:      +1,000,000
+ *   - disc match:    ±100,000 (matches user_disc → bonus, mismatches → penalty)
+ *   - region_score:  ×100, range 0..900
+ *   - -rev_num:      negative so newer rev wins */
+static int dp_score_canonical(const char *canonical, const char *user_disc)
 {
    int sc = 0;
-   if (e->bad_dump)
+   if (dp_detect_bad_dump(canonical))
       sc += 1000000;
    if (user_disc && *user_disc)
    {
-      if (*e->disc_token && !strcmp(e->disc_token, user_disc))
-         sc -= 100000;
-      else if (*e->disc_token)
-         sc += 100000;
-      /* user named a disc but entry has none → neutral (0). */
+      char disc[16];
+      dp_extract_disc_token(canonical, disc, sizeof(disc));
+      if      (*disc && !strcmp(disc, user_disc)) sc -= 100000;
+      else if (*disc)                             sc += 100000;
    }
-   sc += e->region_score * 100;
-   sc -= e->rev_num;
+   sc += dp_score_region(canonical) * 100;
+   sc -= dp_extract_rev(canonical);
    return sc;
 }
 
-/* Among the [start..) range of `by_heavy` whose `heavy` equals
- * `needle`, pick the best candidate by `dp_score_entry`.  Canonical
- * lex order breaks score ties for full determinism.  Returns
- * SIZE_MAX if no candidate matched. */
+/* Among the BY_HEAVY range starting at `start` whose (hash, heavy)
+ * equal the needle, pick the best candidate by dp_score_canonical.
+ * Canonical lex order breaks score ties for full determinism.
+ * Returns SIZE_MAX if no candidate matched. */
 static size_t dp_pick_best(const downplay_thumbs_index_t *idx,
-      const char *needle, size_t start, const char *user_disc)
+      size_t start, uint32_t needle_hash, const char *needle_heavy,
+      const char *user_disc)
 {
-   size_t i;
-   size_t best       = (size_t)-1;
-   const dp_thumb_entry_t *best_e = NULL;
-   int    best_sc    = 0x7fffffff;
-   for (i = start; i < idx->entries_count; i++)
+   size_t      i;
+   size_t      best       = (size_t)-1;
+   const char *best_canon = NULL;
+   int         best_sc    = 0x7fffffff;
+   for (i = start; i < idx->entry_count; i++)
    {
-      const dp_thumb_entry_t *e = &idx->entries[idx->by_heavy[i]];
-      int sc;
-      if (strcmp(e->heavy, needle) != 0)
+      uint32_t    h, ei;
+      const char *can;
+      int         sc;
+      dp_idx_bheavy_at(idx, i, &h, &ei);
+      if (h != needle_hash)
          break;
-      sc = dp_score_entry(e, user_disc);
+      if (strcmp(dp_idx_heavy(idx, ei), needle_heavy) != 0)
+         break;
+      can = dp_idx_canonical(idx, ei);
+      sc  = dp_score_canonical(can, user_disc);
       if (sc < best_sc
-            || (sc == best_sc && best_e
-                  && strcmp(e->canonical, best_e->canonical) < 0))
+            || (sc == best_sc && best_canon
+                  && strcmp(can, best_canon) < 0))
       {
-         best_sc = sc;
-         best_e  = e;
-         best    = idx->by_heavy[i];
+         best_sc    = sc;
+         best_canon = can;
+         best       = ei;
       }
    }
    return best;
 }
 
-/* Bsearch on by_canonical for an exact match.  Returns the entry
- * index, or SIZE_MAX on miss. */
-static size_t dp_lookup_exact_canonical(
-      const downplay_thumbs_index_t *idx, const char *stem)
-{
-   size_t lo = 0, hi = idx->entries_count;
-   while (lo < hi)
-   {
-      size_t mid = lo + (hi - lo) / 2;
-      const dp_thumb_entry_t *e = &idx->entries[idx->by_canonical[mid]];
-      int rv = strcmp(e->canonical, stem);
-      if (rv == 0)
-         return idx->by_canonical[mid];
-      if (rv < 0)
-         lo = mid + 1;
-      else
-         hi = mid;
-   }
-   return (size_t)-1;
-}
-
-/* Internal lookup returning the entry index (or SIZE_MAX).  Spares
- * callers a second linear scan to recover the entry from a returned
- * canonical pointer.  Used directly by the manager; the public
- * `_match` wraps it for tests. */
+/* Internal lookup returning the entry index (or SIZE_MAX).  Used
+ * directly by the manager; the public `_match` wraps it for tests. */
 static size_t dp_index_match_idx(
       const downplay_thumbs_index_t *idx,
       const char *rom_basename)
@@ -1192,6 +1579,8 @@ static size_t dp_index_match_idx(
    char        stem[512];
    char        heavy_user[512];
    char        user_disc[16];
+   uint32_t    needle_hash;
+   uint32_t    h, ei;
    size_t      lo;
    size_t      hit_idx;
 
@@ -1210,14 +1599,20 @@ static size_t dp_index_match_idx(
    if (!*heavy_user)
       return (size_t)-1;
 
-   lo = dp_lower_bound_heavy(idx, heavy_user);
-   if (lo >= idx->entries_count)
+   needle_hash = dp_fnv1a32(heavy_user);
+   lo = dp_lower_bound_heavy(idx, heavy_user, needle_hash);
+   if (lo >= idx->entry_count)
       return (size_t)-1;
-   if (strcmp(idx->entries[idx->by_heavy[lo]].heavy, heavy_user) != 0)
+   /* Confirm the lower-bound hit is actually equal — lower-bound
+    * returns the first slot >= so a non-equal landing means miss. */
+   dp_idx_bheavy_at(idx, lo, &h, &ei);
+   if (h != needle_hash)
+      return (size_t)-1;
+   if (strcmp(dp_idx_heavy(idx, ei), heavy_user) != 0)
       return (size_t)-1;
 
    dp_extract_disc_token(stem, user_disc, sizeof(user_disc));
-   return dp_pick_best(idx, heavy_user, lo, user_disc);
+   return dp_pick_best(idx, lo, needle_hash, heavy_user, user_disc);
 }
 
 const char *downplay_thumbs_index_match(
@@ -1227,7 +1622,86 @@ const char *downplay_thumbs_index_match(
    size_t hit_idx = dp_index_match_idx(idx, rom_basename);
    if (hit_idx == (size_t)-1)
       return NULL;
-   return idx->entries[hit_idx].canonical;
+   return dp_idx_canonical(idx, (uint32_t)hit_idx);
+}
+
+/* ---------------------------------------------------------------- */
+/* Section 3.5: public parse entrypoint                             */
+/* ---------------------------------------------------------------- */
+
+/* Free the parse-time temp index (transient — used only inside the
+ * JSON → binary conversion helpers). */
+static void dp_parse_index_free(dp_parse_index_t *idx)
+{
+   size_t i;
+   if (!idx)
+      return;
+   for (i = 0; i < idx->entries_count; i++)
+   {
+      free(idx->entries[i].canonical);
+      free(idx->entries[i].heavy);
+   }
+   free(idx->entries);
+   free(idx);
+}
+
+/* Parse JSON into a serialised binary `.idx` buffer.  Shared between
+ * the public test entrypoint (which then opens+validates) and the
+ * download callbacks (which write the buffer to disk).  On success
+ * the caller owns `*out_buf` and frees with free(). */
+static bool dp_idx_parse_json_to_buffer(const char *json, size_t json_len,
+      uint8_t **out_buf, size_t *out_len)
+{
+   dp_parse_index_t *parse_idx;
+   dp_parse_ctx_t    ctx;
+   bool              ok;
+   bool              emitted = false;
+
+   if (!json || json_len == 0)
+      return false;
+   parse_idx = (dp_parse_index_t*)calloc(1, sizeof(*parse_idx));
+   if (!parse_idx)
+      return false;
+
+   memset(&ctx, 0, sizeof(ctx));
+   ctx.idx = parse_idx;
+
+   ok = rjson_parse_quick(json, json_len, &ctx, 0,
+         dp_h_member, dp_h_string, dp_h_number,
+         dp_h_start_object, dp_h_end_object,
+         dp_h_start_array, dp_h_end_array,
+         dp_h_bool, dp_h_null,
+#ifdef DOWNPLAY_THUMBS_TEST_BUILD
+         dp_h_error
+#else
+         NULL /* error_handler */
+#endif
+         );
+   /* Free leftover parse-context state regardless of outcome.
+    * cur_canonical is the only ctx-side allocation that survives
+    * past handlers when parsing aborts mid-entry. */
+   free(ctx.cur_canonical);
+
+   if (!ok || ctx.oom || !ctx.saw_files_obj)
+   {
+      dp_parse_index_free(parse_idx);
+      return false;
+   }
+   emitted = dp_idx_emit_buffer(parse_idx->entries, parse_idx->entries_count,
+         out_buf, out_len);
+   dp_parse_index_free(parse_idx);
+   return emitted;
+}
+
+downplay_thumbs_index_t *downplay_thumbs_index_parse(
+      const char *json, size_t json_len)
+{
+   uint8_t *buf     = NULL;
+   size_t   buf_len = 0;
+   if (!dp_idx_parse_json_to_buffer(json, json_len, &buf, &buf_len))
+      return NULL;
+   /* dp_idx_open takes ownership of buf — frees on validation failure. */
+   return dp_idx_open(buf, buf_len);
 }
 
 /* ---------------------------------------------------------------- */
@@ -1260,12 +1734,12 @@ struct downplay_thumbs
 
    downplay_thumbs_index_t *index;
 
-   /* Per-canonical fetch tracking.  Parallel to index->entries; an
-    * entry's status drives _request return values + de-dups in-flight
-    * downloads.  Allocated on index ready. */
-   uint8_t *attempt;        /* DP_ATT_* values, length entries_count */
+   /* Per-canonical fetch tracking.  Parallel to the binary index's
+    * ENTRIES section; an entry's status drives _request return values
+    * + de-dups in-flight downloads.  Allocated on index ready. */
+   uint8_t *attempt;        /* DP_ATT_* values, length entry_count */
 
-   /* Image fetch ring buffer of canonical-key indices into index->entries. */
+   /* Image fetch ring buffer of entry indices into the binary index. */
    uint32_t queue[DP_THUMBS_QUEUE_CAP];
    uint8_t  queue_pri[DP_THUMBS_QUEUE_CAP]; /* 1=active, 0=prefetch */
    int      queue_head, queue_tail;
@@ -1297,11 +1771,17 @@ enum
 
 /* ---- internal: paths ---- */
 
-/* Compute <root>/Thumbs/index/<system>.index.json into `out`.
- * Single source of truth for the on-disk index location: both
- * `downplay_thumbs_open` and the boot-time prefetch use this so they
- * cannot disagree on where the file lives.  Returns false if the
- * filesystem root can't be resolved. */
+/* Compute <root>/Thumbs/index/<system>.idx into `out`.  Single source
+ * of truth for the on-disk binary-format index location: both
+ * `downplay_thumbs_open` and the boot-time prefetch share this so
+ * they cannot disagree on where the file lives.  Returns false if
+ * the filesystem root can't be resolved.
+ *
+ * Filename used to be `<system>.index.json` when the cache held
+ * gzipped JSON.  The on-disk format is now a packed binary file
+ * (see DP_IDX_* constants); old `.index.json` caches are abandoned
+ * naturally — first open after upgrade sees no `.idx`, refetches,
+ * writes the new format. */
 static bool dp_thumbs_index_path(const char *system,
       char *out, size_t out_size)
 {
@@ -1315,78 +1795,45 @@ static bool dp_thumbs_index_path(const char *system,
       return false;
    fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
    fill_pathname_join_special(idx_dir, base, "index", sizeof(idx_dir));
-   snprintf(fname, sizeof(fname), "%s.index.json", system);
+   snprintf(fname, sizeof(fname), "%s.idx", system);
    fill_pathname_join_special(out, idx_dir, fname, out_size);
    return true;
 }
 
-/* Pick the on-disk + remote extension for an entry.  Webp wins when
- * available — it's typically ~40% smaller than the matching jpg with
- * indistinguishable visual quality at thumbnail resolution. */
-static const char *dp_pick_ext(const dp_thumb_entry_t *e)
-{
-#ifdef HAVE_DOWNPLAY_WEBP
-   if (e && e->webp_size > 0)
-      return ".webp";
-#else
-   (void)e;
-#endif
-   return ".jpg";
-}
-
-/* Build the on-disk path for an image of canonical key `canon`.  We
- * use the canonical key verbatim as the filename — it's already the
- * No-Intro safe form (no path separators since it's a No-Intro game
- * title), with the entry's preferred extension appended. */
+/* Build the on-disk path for an image of canonical key `canonical`.
+ * The canonical key is used verbatim as the filename — it's already
+ * the No-Intro safe form (no path separators, since it's the title
+ * of a game).  We always use `.webp` since the server is guaranteed
+ * to publish WebP for every entry. */
 static void dp_build_image_path(downplay_thumbs_t *t,
-      const dp_thumb_entry_t *e, char *out, size_t out_size)
+      const char *canonical, char *out, size_t out_size)
 {
    char tmp[DP_THUMBS_PATH_MAX];
-   fill_pathname_join_special(tmp, t->cache_dir, e->canonical, sizeof(tmp));
-   snprintf(out, out_size, "%s%s", tmp, dp_pick_ext(e));
+   fill_pathname_join_special(tmp, t->cache_dir, canonical, sizeof(tmp));
+   snprintf(out, out_size, "%s.webp", tmp);
 }
 
-/* Resolve the on-disk path for an entry, applying the webp→jpg
- * sibling fallback lazily.  When an entry prefers .webp but only the
- * .jpg sibling is on disk (typical right after a Downplay upgrade
- * where the previous version cached jpg only), clear the entry's
- * webp_size so subsequent path/URL builds for this entry stay on
- * .jpg.  Replaces the old upfront stat sweep in dp_try_load_local_index
- * — we only stat entries that the user (or a prefetch) actually asks
- * about, instead of every entry in a 5k–20k-row index at open time. */
+/* Resolve the on-disk path for an entry.  Stat the cache; on hit,
+ * write the path and return true.  We no longer need a webp→jpg
+ * sibling fallback: the manager always writes `.webp` and the
+ * server always publishes `.webp`.  Pre-WebP `.jpg` siblings from
+ * old Downplay versions are simply ignored (they sit on disk
+ * orphaned until manual cleanup; harmless). */
 static bool dp_resolve_local_image(downplay_thumbs_t *t,
       uint32_t e_idx, char *out, size_t out_size)
 {
-   dp_thumb_entry_t *e = &t->index->entries[e_idx];
-   dp_build_image_path(t, e, out, out_size);
-   if (path_is_valid(out))
-      return true;
-#ifdef HAVE_DOWNPLAY_WEBP
-   if (e->webp_size > 0)
-   {
-      char tmp[DP_THUMBS_PATH_MAX];
-      char jpg[DP_THUMBS_PATH_MAX];
-      fill_pathname_join_special(tmp, t->cache_dir, e->canonical,
-            sizeof(tmp));
-      snprintf(jpg, sizeof(jpg), "%s.jpg", tmp);
-      if (path_is_valid(jpg))
-      {
-         e->webp_size = 0;
-         strlcpy(out, jpg, out_size);
-         return true;
-      }
-   }
-#endif
-   return false;
+   const char *canonical = dp_idx_canonical(t->index, e_idx);
+   dp_build_image_path(t, canonical, out, out_size);
+   return path_is_valid(out);
 }
 
-/* Build the remote URL for an image. */
+/* Build the remote URL for an image of canonical key `canonical`. */
 static void dp_build_image_url(downplay_thumbs_t *t,
-      const dp_thumb_entry_t *e, char *out, size_t out_size)
+      const char *canonical, char *out, size_t out_size)
 {
    char raw[2048];
-   snprintf(raw, sizeof(raw), "%s/%s/Named_Boxarts/%s%s",
-         DP_THUMBS_BASE_URL, t->system, e->canonical, dp_pick_ext(e));
+   snprintf(raw, sizeof(raw), "%s/%s/Named_Boxarts/%s.webp",
+         DP_THUMBS_BASE_URL, t->system, canonical);
    net_http_urlencode_full(out, raw, out_size);
 }
 
@@ -1399,9 +1846,10 @@ static void dp_build_image_url(downplay_thumbs_t *t,
 
 /* ---- internal: gzip helper ----
  *
- * Indexes are served as `index.json.gz`; the on-disk cache stores the
- * decompressed JSON so the (frequently-called) parse path stays
- * unchanged.  We decompress once at fetch-completion time.
+ * Indexes are served as `index.json.gz`.  We decompress once at
+ * fetch-completion time, parse the JSON straight into the binary
+ * `.idx` form, and write that to disk — JSON never lands on the
+ * filesystem.  See dp_cb_index_download.
  *
  * gzip wraps a deflate stream with a 10-byte header (magic 1F 8B + a
  * tiny metadata block) and an 8-byte footer carrying CRC32 + ISIZE
@@ -1496,15 +1944,69 @@ static uint8_t *dp_gunzip(const uint8_t *in, size_t in_len, size_t *out_len)
  * free their context — they never touch the manager.  The manager
  * discovers completion by stat'ing the path on the next pump/request. */
 
+/* Atomically publish a binary `.idx` payload at `path`.  Writes to a
+ * sibling .tmp first, renames over.  fsync's the parent directory so
+ * the rename is durable across power loss; this matters less for an
+ * index cache (we'd just refetch) but the cost is one syscall.
+ *
+ * Returns NULL on success, or a short error string for the caller's
+ * log line (caller frees nothing — the string is static). */
+static const char *dp_atomic_write_idx(const char *path,
+      const uint8_t *buf, size_t buf_len)
+{
+   char  output_dir[DP_THUMBS_PATH_MAX];
+   char  tmp_path[DP_THUMBS_PATH_MAX];
+
+   if (!path || !*path || !buf || buf_len == 0)
+      return "bad args";
+
+   strlcpy(output_dir, path, sizeof(output_dir));
+   path_basedir_wrapper(output_dir);
+   if (!path_mkdir(output_dir))
+      return "mkdir failed";
+
+   snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+   if (!filestream_write_file(tmp_path, buf, (int64_t)buf_len))
+      return "write failed";
+#ifdef _WIN32
+   /* rename() refuses to clobber on Windows; remove first. */
+   filestream_delete(path);
+#endif
+   if (rename(tmp_path, path) != 0)
+   {
+      filestream_delete(tmp_path);
+      return "rename failed";
+   }
+#ifndef _WIN32
+   /* fsync the parent directory so the rename survives power loss.
+    * Best-effort: ENOTDIR / ENOSYS / sandboxed paths just leave us
+    * with the same durability as the previous code path. */
+   {
+      int dir_fd = open(output_dir, O_RDONLY
+#ifdef O_DIRECTORY
+            | O_DIRECTORY
+#endif
+            );
+      if (dir_fd >= 0)
+      {
+         (void)fsync(dir_fd);
+         close(dir_fd);
+      }
+   }
+#endif
+   return NULL;
+}
+
 static void dp_cb_index_download(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
-   http_transfer_data_t *data   = (http_transfer_data_t*)task_data;
-   file_transfer_t      *transf = (file_transfer_t*)user_data;
-   uint8_t              *json   = NULL;
+   http_transfer_data_t *data    = (http_transfer_data_t*)task_data;
+   file_transfer_t      *transf  = (file_transfer_t*)user_data;
+   uint8_t              *json    = NULL;
    size_t                json_len = 0;
-   char                  output_dir[DP_THUMBS_PATH_MAX];
-   char                  tmp_path[DP_THUMBS_PATH_MAX];
+   uint8_t              *idx_buf = NULL;
+   size_t                idx_len = 0;
+   const char           *werr;
    (void)task;
 
    if (!transf)
@@ -1524,38 +2026,25 @@ static void dp_cb_index_download(retro_task_t *task, void *task_data,
       err = "response too large";
       goto finish;
    }
-   /* Server returns gzipped JSON — decompress before writing the
-    * cache so the parse path stays unchanged. */
+   /* Decompress to JSON, parse straight into the binary `.idx` form,
+    * write that to disk.  JSON never touches the cache. */
    json = dp_gunzip((const uint8_t*)data->data, (size_t)data->len, &json_len);
    if (!json || json_len == 0)
    {
       err = "gunzip failed";
       goto finish;
    }
-
-   strlcpy(output_dir, transf->path, sizeof(output_dir));
-   path_basedir_wrapper(output_dir);
-   if (!path_mkdir(output_dir))
+   if (!dp_idx_parse_json_to_buffer((const char*)json, json_len,
+            &idx_buf, &idx_len))
    {
-      err = "mkdir failed";
+      err = "parse failed";
       goto finish;
    }
 
-   /* Write to .tmp, rename — index parse must see all-or-nothing. */
-   snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", transf->path);
-   if (!filestream_write_file(tmp_path, json, json_len))
+   werr = dp_atomic_write_idx(transf->path, idx_buf, idx_len);
+   if (werr)
    {
-      err = "write failed";
-      goto finish;
-   }
-#ifdef _WIN32
-   /* rename() refuses to clobber on Windows; remove first. */
-   filestream_delete(transf->path);
-#endif
-   if (rename(tmp_path, transf->path) != 0)
-   {
-      filestream_delete(tmp_path);
-      err = "rename failed";
+      err = werr;
       goto finish;
    }
 
@@ -1566,6 +2055,7 @@ finish:
    else
       RARCH_LOG("[Downplay] thumbs index -> %s\n", transf->path);
    free(json);
+   free(idx_buf);
    free(transf);
 }
 
@@ -1740,15 +2230,16 @@ static int64_t dp_index_age_seconds(const char *path)
    return (int64_t)(now - st.st_mtime);
 }
 
-/* Try to load + parse the on-disk index into the manager.  Returns
- * true on success (sets load_state=READY).  Leaves state unchanged on
+/* Try to load the on-disk binary index into the manager.  Reads the
+ * `.idx` file into a malloc'd buffer (single read, no JSON parse),
+ * validates it via dp_idx_open, and installs.  Returns true on
+ * success (sets load_state=READY).  Leaves state unchanged on
  * failure so caller can decide between FETCHING (still waiting) vs
  * FAILED (give up). */
 static bool dp_try_load_local_index(downplay_thumbs_t *t)
 {
-   int64_t  size      = 0;
-   void    *buf       = NULL;
-   bool     ok        = false;
+   int64_t  size = 0;
+   void    *buf  = NULL;
 
    if (!path_is_valid(t->idx_path))
       return false;
@@ -1757,29 +2248,22 @@ static bool dp_try_load_local_index(downplay_thumbs_t *t)
       free(buf);
       return false;
    }
-   t->index = downplay_thumbs_index_parse((const char*)buf, (size_t)size);
-   free(buf);
+   /* dp_idx_open takes ownership of buf — frees on validation failure. */
+   t->index = dp_idx_open((uint8_t*)buf, (size_t)size);
    if (!t->index)
    {
-      RARCH_WARN("[Downplay] thumbs: parse failed for %s\n", t->idx_path);
+      RARCH_WARN("[Downplay] thumbs: validate failed for %s\n", t->idx_path);
       return false;
    }
-   t->attempt = (uint8_t*)calloc(t->index->entries_count, 1);
+   t->attempt = (uint8_t*)calloc(t->index->entry_count, 1);
    if (!t->attempt)
    {
       downplay_thumbs_index_free(t->index);
       t->index = NULL;
       return false;
    }
-   /* On-disk pre-mark + webp→jpg sibling fallback are now lazy: see
-    * dp_resolve_local_image.  Doing the stat sweep up front cost an
-    * O(entries) syscall walk on system-enter — 5k–20k stats per open
-    * on Android sdcard fuse, bad enough to hitch the menu transition.
-    * Lazy resolution pays the same stats only for the (small) set of
-    * rows actually queried. */
    t->load_state = DP_LOAD_READY;
-   ok = true;
-   return ok;
+   return true;
 }
 
 /* Push the index HTTP fetch.  Caller should set state=FETCHING. */
@@ -1902,13 +2386,13 @@ static void dp_reap_inflight(downplay_thumbs_t *t)
    while (i < t->inflight)
    {
       uint32_t e_idx = t->fetching[i];
-      if (e_idx >= t->index->entries_count)
+      if (e_idx >= t->index->entry_count)
       {
          /* Defensive: invalid entry — drop. */
          t->fetching[i] = t->fetching[--t->inflight];
          continue;
       }
-      dp_build_image_path(t, &t->index->entries[e_idx],
+      dp_build_image_path(t, dp_idx_canonical(t->index, e_idx),
             path, sizeof(path));
       if (path_is_valid(path))
       {
@@ -1926,7 +2410,7 @@ static void dp_reap_inflight(downplay_thumbs_t *t)
 static void dp_drain_queue(downplay_thumbs_t *t)
 {
    uint32_t e_idx;
-   const dp_thumb_entry_t *e;
+   const char *canonical;
    char path[DP_THUMBS_PATH_MAX];
    char url[2048];
    file_transfer_t *transf;
@@ -1941,24 +2425,24 @@ static void dp_drain_queue(downplay_thumbs_t *t)
    e_idx = t->queue[t->queue_head];
    t->queue_head = (t->queue_head + 1) % DP_THUMBS_QUEUE_CAP;
 
-   if (e_idx >= t->index->entries_count)
+   if (e_idx >= t->index->entry_count)
       return;
    /* Re-check state: row may have transitioned to ON_DISK since enqueue. */
    if (t->attempt[e_idx] != DP_ATT_UNTRIED
        && t->attempt[e_idx] != DP_ATT_FETCHING)
       return;
 
-   /* Lazy on-disk check + webp→jpg sibling fallback.  This entry was
-    * queued without the old upfront sweep proving it was missing, so
-    * recheck now (and possibly switch to .jpg if a sibling is cached
-    * from a pre-WebP build). */
+   /* Lazy on-disk check.  This entry was queued without an upfront
+    * stat-sweep proving it was missing, so recheck now — the user
+    * may have triggered a fetch for an image already cached on disk
+    * (webp landed via a different code path, etc.). */
    if (dp_resolve_local_image(t, e_idx, path, sizeof(path)))
    {
       t->attempt[e_idx] = DP_ATT_ON_DISK;
       return;
    }
-   e = &t->index->entries[e_idx];
-   dp_build_image_url(t, e, url, sizeof(url));
+   canonical = dp_idx_canonical(t->index, e_idx);
+   dp_build_image_url(t, canonical, url, sizeof(url));
    if (!*url)
       return;
    transf = (file_transfer_t*)calloc(1, sizeof(*transf));
@@ -1979,7 +2463,7 @@ static void dp_drain_queue(downplay_thumbs_t *t)
 
 /* ---- index prefetch (boot-time fan-out) ---------------------------
  *
- * Drive a small global queue of <root>/Thumbs/index/<system>.index.json
+ * Drive a small global queue of <root>/Thumbs/index/<system>.idx
  * fetches at app launch, before the user can navigate.  By the time
  * they enter any system view, the index is already on disk and
  * `_open` skips its own HTTP call.
@@ -2138,12 +2622,13 @@ static void dp_pf_drain(void); /* fwd */
 static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
-   http_transfer_data_t *data     = (http_transfer_data_t*)task_data;
-   dp_pf_transfer_t     *pf       = (dp_pf_transfer_t*)user_data;
-   uint8_t              *json     = NULL;
+   http_transfer_data_t *data    = (http_transfer_data_t*)task_data;
+   dp_pf_transfer_t     *pf      = (dp_pf_transfer_t*)user_data;
+   uint8_t              *json    = NULL;
    size_t                json_len = 0;
-   char                  output_dir[DP_THUMBS_PATH_MAX];
-   char                  tmp_path[DP_THUMBS_PATH_MAX];
+   uint8_t              *idx_buf = NULL;
+   size_t                idx_len = 0;
+   const char           *werr;
    (void)task;
 
    retro_assert(task_is_on_main_thread());
@@ -2161,35 +2646,25 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
       err = "response too large";
       goto finish;
    }
-   /* Server returns gzipped JSON — decompress before writing the
-    * cache.  Mirrors dp_cb_index_download. */
+   /* Same JSON → .idx path as dp_cb_index_download.  We never write
+    * the JSON or any intermediate form to disk — the binary file IS
+    * the cache. */
    json = dp_gunzip((const uint8_t*)data->data, (size_t)data->len, &json_len);
    if (!json || json_len == 0)
    {
       err = "gunzip failed";
       goto finish;
    }
-   strlcpy(output_dir, pf->base.path, sizeof(output_dir));
-   path_basedir_wrapper(output_dir);
-   if (!path_mkdir(output_dir))
+   if (!dp_idx_parse_json_to_buffer((const char*)json, json_len,
+            &idx_buf, &idx_len))
    {
-      err = "mkdir failed";
+      err = "parse failed";
       goto finish;
    }
-   /* Atomic write: .tmp + rename — consistent with dp_cb_index_download. */
-   snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", pf->base.path);
-   if (!filestream_write_file(tmp_path, json, json_len))
+   werr = dp_atomic_write_idx(pf->base.path, idx_buf, idx_len);
+   if (werr)
    {
-      err = "write failed";
-      goto finish;
-   }
-#ifdef _WIN32
-   filestream_delete(pf->base.path);
-#endif
-   if (rename(tmp_path, pf->base.path) != 0)
-   {
-      filestream_delete(tmp_path);
-      err = "rename failed";
+      err = werr;
       goto finish;
    }
 
@@ -2200,6 +2675,7 @@ finish:
    else
       RARCH_LOG("[Downplay] thumbs prefetch -> %s\n", pf->base.path);
    free(json);
+   free(idx_buf);
    dp_pf_inflight_remove(pf->system);
    free(pf);
    dp_pf_drain();
@@ -2349,8 +2825,8 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
 
    /* <root>/Thumbs/ */
    fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
-   /* <root>/Thumbs/index/<system>.index.json — via shared helper so
-    * boot-time prefetch and per-system open agree on the location. */
+   /* <root>/Thumbs/index/<system>.idx — via shared helper so boot-
+    * time prefetch and per-system open agree on the location. */
    if (!dp_thumbs_index_path(system, t->idx_path, sizeof(t->idx_path)))
    {
       free(t);
@@ -2450,7 +2926,7 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
 
    if (t->attempt[e_idx] == DP_ATT_ON_DISK)
    {
-      dp_build_image_path(t, &t->index->entries[e_idx],
+      dp_build_image_path(t, dp_idx_canonical(t->index, (uint32_t)e_idx),
             out->local_path, sizeof(out->local_path));
       out->status = DP_THUMB_OK;
       return;
@@ -2528,6 +3004,140 @@ void downplay_thumbs_pump(downplay_thumbs_t *t)
    }
 }
 
+/* ---- recents resolver -----------------------------------------
+ *
+ * Lazy multi-system reader.  Holds at most one parsed binary index
+ * per distinct system seen across the recents view.  No HTTP, no
+ * pump, no prefetch — if a system's `.idx` isn't on disk yet the
+ * row simply renders without art.  Designed so the recents view
+ * does the minimum work to surface a thumbnail when one's already
+ * cached (i.e. the user has visited that system before).
+ *
+ * Lifecycle: open on view enter, resolve per row per frame, close
+ * on view exit.  Slot table grows by doubling; expected steady-
+ * state size is the small set of distinct systems in the user's
+ * recently-played list (typically <10). */
+
+typedef struct
+{
+   char                    *system;     /* heap, owned */
+   downplay_thumbs_index_t *index;      /* NULL on miss/parse-fail */
+   bool                     tried;      /* don't retry the load every frame */
+} dp_recents_slot_t;
+
+struct downplay_thumbs_recents
+{
+   dp_recents_slot_t *slots;
+   size_t             count;
+   size_t             cap;
+};
+
+downplay_thumbs_recents_t *downplay_thumbs_recents_open(void)
+{
+   return (downplay_thumbs_recents_t*)calloc(1,
+         sizeof(downplay_thumbs_recents_t));
+}
+
+void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r)
+{
+   size_t i;
+   if (!r)
+      return;
+   for (i = 0; i < r->count; i++)
+   {
+      free(r->slots[i].system);
+      downplay_thumbs_index_free(r->slots[i].index);
+   }
+   free(r->slots);
+   free(r);
+}
+
+/* Find or insert the slot for `system`.  On insert, sets tried=false
+ * so the next resolve attempts a load exactly once.  Linear scan is
+ * fine here — distinct-systems count is in the single digits in
+ * practice.  Returns NULL on allocation failure. */
+static dp_recents_slot_t *dp_recents_get_slot(
+      downplay_thumbs_recents_t *r, const char *system)
+{
+   size_t i;
+   dp_recents_slot_t *s;
+   for (i = 0; i < r->count; i++)
+      if (string_is_equal(r->slots[i].system, system))
+         return &r->slots[i];
+   if (r->count == r->cap)
+   {
+      size_t             new_cap = r->cap ? r->cap * 2 : 8;
+      dp_recents_slot_t *n       = (dp_recents_slot_t*)realloc(
+            r->slots, new_cap * sizeof(*n));
+      if (!n)
+         return NULL;
+      r->slots = n;
+      r->cap   = new_cap;
+   }
+   s = &r->slots[r->count];
+   memset(s, 0, sizeof(*s));
+   s->system = strdup(system);
+   if (!s->system)
+      return NULL;
+   r->count++;
+   return s;
+}
+
+bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
+      const char *system, const char *rom_basename,
+      char *out, size_t out_size)
+{
+   dp_recents_slot_t *slot;
+   size_t             mi;
+   char               root[DP_THUMBS_PATH_MAX];
+   char               base[DP_THUMBS_PATH_MAX];
+   char               cache_dir[DP_THUMBS_PATH_MAX];
+   char               tmp[DP_THUMBS_PATH_MAX];
+
+   if (!r || !system || !*system || !rom_basename || !*rom_basename
+       || !out || out_size == 0)
+      return false;
+   /* Same path-traversal guards as downplay_thumbs_open. */
+   if (strstr(system, "..")
+       || strchr(system, '/') || strchr(system, '\\'))
+      return false;
+
+   slot = dp_recents_get_slot(r, system);
+   if (!slot)
+      return false;
+
+   if (!slot->tried)
+   {
+      char     idx_path[DP_THUMBS_PATH_MAX];
+      slot->tried = true;
+      if (dp_thumbs_index_path(system, idx_path, sizeof(idx_path))
+          && path_is_valid(idx_path))
+      {
+         int64_t  size = 0;
+         void    *buf  = NULL;
+         if (filestream_read_file(idx_path, &buf, &size)
+               && buf && size > 0)
+            slot->index = dp_idx_open((uint8_t*)buf, (size_t)size);
+         else
+            free(buf);
+      }
+   }
+   if (!slot->index)
+      return false;
+   mi = dp_index_match_idx(slot->index, rom_basename);
+   if (mi == (size_t)-1)
+      return false;
+
+   if (!downplay_paths_get_root(root, sizeof(root)))
+      return false;
+   fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
+   fill_pathname_join_special(cache_dir, base, system, sizeof(cache_dir));
+   fill_pathname_join_special(tmp, cache_dir,
+         dp_idx_canonical(slot->index, (uint32_t)mi), sizeof(tmp));
+   snprintf(out, out_size, "%s.webp", tmp);
+   return path_is_valid(out);
+}
+
 #else /* DOWNPLAY_THUMBS_TEST_BUILD */
 
 /* Manager API stubs for the unit-test build — tests only exercise the
@@ -2548,5 +3158,15 @@ void downplay_thumbs_pump(downplay_thumbs_t *t) { (void)t; }
 void downplay_thumbs_prefetch_indexes(
       const char * const *systems, size_t count)
 { (void)systems; (void)count; }
+downplay_thumbs_recents_t *downplay_thumbs_recents_open(void) { return NULL; }
+bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
+      const char *system, const char *rom_basename,
+      char *out, size_t out_size)
+{
+   (void)r; (void)system; (void)rom_basename;
+   if (out && out_size) out[0] = '\0';
+   return false;
+}
+void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r) { (void)r; }
 
 #endif /* DOWNPLAY_THUMBS_TEST_BUILD */

@@ -126,11 +126,20 @@ typedef struct
 /* One row in the recents view.  pl_idx is the entry's index in
  * g_defaults.content_history at build time — kept around because we
  * skip rows whose entries have neither a label nor a usable path, so
- * the array index would otherwise drift from the playlist index. */
+ * the array index would otherwise drift from the playlist index.
+ *
+ * db_name + rom_basename are populated at build time when both can
+ * be derived from the playlist entry (ROM path inside a Downplay-
+ * convention system folder, resolvable via the disambig table).  If
+ * either is NULL the row simply renders without art — recents never
+ * kicks downloads, so an unresolvable system is silently artless. */
 typedef struct
 {
-   char  *display_name;
-   size_t pl_idx;
+   char           *display_name;
+   char           *db_name;       /* resolved canonical system name; may be NULL */
+   char           *rom_basename;  /* basename of the ROM file path; may be NULL */
+   gfx_thumbnail_t thumbnail;     /* loaded on hover when a cached image exists */
+   size_t          pl_idx;
 } downplay_recent_t;
 /* No sort_key on recents — they're presented in chronological order
  * straight from g_defaults.content_history, never alphabetized. */
@@ -408,6 +417,13 @@ struct downplay_handle_s
     * canonical-key index, on-disk image cache, and the lookahead
     * fetch queue.  Open on system enter, close on system exit. */
    downplay_thumbs_t  *current_thumbs;
+
+   /* Read-only recents resolver.  Lazy-loads per-system binary
+    * indexes on demand.  Does NOT issue HTTP fetches; rows whose
+    * system has no cached `.idx` simply render without art until
+    * the user opens that system view.  Open on recents enter,
+    * close on recents exit. */
+   downplay_thumbs_recents_t *recents_thumbs;
 
    /* Index of the row whose thumbnail is currently loading or loaded.
     * On selection change we reset the previous row's thumbnail so
@@ -998,8 +1014,17 @@ static void downplay_recents_free(downplay_recent_t *rows, size_t count)
    size_t i;
    if (!rows)
       return;
+   /* Cancel any in-flight gfx_thumbnail_request_file before resetting,
+    * mirroring downplay_roms_free; otherwise a callback can race onto
+    * freed memory.  Safe even if no requests were ever issued. */
+   gfx_thumbnail_cancel_pending_requests();
    for (i = 0; i < count; i++)
+   {
       free(rows[i].display_name);
+      free(rows[i].db_name);
+      free(rows[i].rom_basename);
+      gfx_thumbnail_reset(&rows[i].thumbnail);
+   }
    free(rows);
 }
 
@@ -1058,6 +1083,47 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
       }
       out[count].display_name = dup;
       out[count].pl_idx       = i;
+      gfx_thumbnail_init_blank(&out[count].thumbnail);
+
+      /* Best-effort thumbnail-resolution metadata.  Either piece may
+       * be NULL; the recents-view drive function treats that as "no
+       * art for this row" and moves on without complaining.  Recents
+       * never kicks downloads, so an unresolvable system is silently
+       * artless until the user opens that system view (which
+       * populates the index cache via the manager). */
+      if (entry->path && *entry->path)
+      {
+         char         parent_dir[PATH_MAX_LENGTH];
+         const char  *folder;
+         char        *display = NULL;
+         char        *ident   = NULL;
+         const char  *basename;
+
+         basename = path_basename(entry->path);
+         if (basename && *basename)
+            out[count].rom_basename = strdup(basename);
+
+         strlcpy(parent_dir, entry->path, sizeof(parent_dir));
+         path_basedir_wrapper(parent_dir);
+         /* Trim trailing slash so path_basename gives the folder name
+          * itself ("Foo (core)"), not an empty tail. */
+         {
+            size_t plen = strlen(parent_dir);
+            while (plen > 0 && (parent_dir[plen - 1] == '/'
+                  || parent_dir[plen - 1] == '\\'))
+               parent_dir[--plen] = '\0';
+         }
+         folder = path_basename(parent_dir);
+         if (folder && *folder
+               && downplay_parse_system_folder(folder, &display, &ident))
+         {
+            const char *db = downplay_metadata_resolve_db_name(display, ident);
+            if (db && *db)
+               out[count].db_name = strdup(db);
+            free(display);
+            free(ident);
+         }
+      }
       count++;
    }
 
@@ -1415,16 +1481,23 @@ static void downplay_refresh_resume(downplay_handle_t *dp)
    dp->resume_pl_idx    = 0;
 }
 
-/* Dispose hook for the RECENTS frame: free the cached display rows.
- * Selection is preserved by the parent TOP frame underneath us, so
- * we don't need to do anything to restore it. */
+/* Dispose hook for the RECENTS frame: free the cached display rows
+ * and the read-only thumbnail resolver.  Selection is preserved by
+ * the parent TOP frame underneath us, so we don't need to do
+ * anything to restore it. */
 static void downplay_recents_dispose(void *user, void *side)
 {
    downplay_handle_t *dp = (downplay_handle_t*)user;
    (void)side;
    downplay_recents_free(dp->recents, dp->recent_row_count);
-   dp->recents          = NULL;
-   dp->recent_row_count = 0;
+   dp->recents             = NULL;
+   dp->recent_row_count    = 0;
+   downplay_thumbs_recents_close(dp->recents_thumbs);
+   dp->recents_thumbs      = NULL;
+   dp->thumb_prev_selection = SIZE_MAX;
+   /* Reset the right-pane fade key so re-entering a two-pane view
+    * starts fresh from alpha 0 even if the GPU recycled a handle. */
+   dp->preview_last_tex    = 0;
 }
 
 /* Dispose hook for the INGAME frame.  The action array stays on dp
@@ -1461,6 +1534,10 @@ static void downplay_open_recents(downplay_handle_t *dp)
    dp->recents          = NULL;
    dp->recent_row_count = 0;
    dp->recents          = downplay_build_recents(&dp->recent_row_count);
+   /* Cheap allocation; no I/O until the first row's resolve fires. */
+   downplay_thumbs_recents_close(dp->recents_thumbs);
+   dp->recents_thumbs        = downplay_thumbs_recents_open();
+   dp->thumb_prev_selection  = SIZE_MAX;
    dp_nav_push(&dp->nav, DOWNPLAY_VIEW_RECENTS, NULL, downplay_recents_dispose);
 }
 
@@ -4573,10 +4650,28 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
             DOWNPLAY_PREVIEW_SCALE_FIT);
    }
+   else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS
+         && dp->recents && dp->nav.selection < dp->recent_row_count)
+   {
+      const gfx_thumbnail_t *t = &dp->recents[dp->nav.selection].thumbnail;
+      enum gfx_thumbnail_status st = (enum gfx_thumbnail_status)
+            retro_atomic_load_acquire_int((retro_atomic_int_t*)&t->status);
+      uintptr_t  tex = 0;
+      unsigned   w   = 0;
+      unsigned   h   = 0;
+      if (st == GFX_THUMBNAIL_STATUS_AVAILABLE)
+      {
+         tex = t->texture;
+         w   = t->width;
+         h   = t->height;
+      }
+      downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
+            DOWNPLAY_PREVIEW_SCALE_FIT);
+   }
    else
    {
-      /* Single-pane view (TOP, RECENTS, INGAME): clear the fade tracker
-       * so re-entering a two-pane view starts fresh from alpha 0. */
+      /* Single-pane view (TOP, INGAME): clear the fade tracker so
+       * re-entering a two-pane view starts fresh from alpha 0. */
       dp->preview_last_tex = 0;
    }
 
@@ -4764,6 +4859,92 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
       if (n > 0)
          downplay_thumbs_prefetch(dp->current_thumbs, names, n);
    }
+}
+
+/* Drive per-frame thumbnail loading for the RECENTS view.  Mirrors
+ * downplay_drive_system_thumbnails but reads from the read-only
+ * recents resolver — no pump, no prefetch, no fetch.  If the
+ * selected row's system has no cached `.idx` or no cached image,
+ * the row simply renders without art.  Self-heals on first run as
+ * the user opens system views and populates the cache. */
+static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
+{
+   const downplay_recent_t *row;
+   char                     path[1024];
+   settings_t              *settings;
+   unsigned                 upscale_thresh;
+   size_t                   sel;
+   enum gfx_thumbnail_status status;
+
+   if (dp->nav.view != DOWNPLAY_VIEW_RECENTS)
+      return;
+   if (!dp->recents || dp->recent_row_count == 0)
+      return;
+   if (!dp->recents_thumbs)
+      return;
+
+   sel = dp->nav.selection;
+   if (sel >= dp->recent_row_count)
+      sel = dp->recent_row_count - 1;
+
+   /* Selection change → reset the prior selection's thumbnail to
+    * keep the resident-texture count at one.  gfx_thumbnail.h
+    * requires cancel-before-reset: an in-flight load callback
+    * could otherwise race onto the freed texture slot.  The cancel
+    * is global (bumps RA's thumbnail list_id, dropping every
+    * in-flight load), which is fine here — recents only ever has
+    * one row's load in flight at a time. */
+   if (   dp->thumb_prev_selection != sel
+       && dp->thumb_prev_selection < dp->recent_row_count)
+   {
+      gfx_thumbnail_cancel_pending_requests();
+      gfx_thumbnail_reset(&dp->recents[dp->thumb_prev_selection].thumbnail);
+   }
+   dp->thumb_prev_selection = sel;
+
+   row = &dp->recents[sel];
+   if (!row->db_name || !*row->db_name)
+      return;
+   if (!row->rom_basename || !*row->rom_basename)
+      return;
+
+   if (!downplay_thumbs_recents_resolve(dp->recents_thumbs,
+            row->db_name, row->rom_basename, path, sizeof(path)))
+      return;
+
+   status = (enum gfx_thumbnail_status)
+         retro_atomic_load_acquire_int(&dp->recents[sel].thumbnail.status);
+   if (status != GFX_THUMBNAIL_STATUS_UNKNOWN
+       && status != GFX_THUMBNAIL_STATUS_MISSING)
+      return; /* already loaded or in-flight */
+
+   settings       = config_get_ptr();
+   upscale_thresh = settings
+         ? settings->uints.gfx_thumbnail_upscale_threshold : 0;
+#ifdef HAVE_DOWNPLAY_WEBP
+   {
+      const char *ext = strrchr(path, '.');
+      if (ext && !strcmp(ext, ".webp"))
+      {
+         gfx_thumbnail_t *th = &dp->recents[sel].thumbnail;
+         unsigned w = 0, h = 0;
+         gfx_thumbnail_reset(th);
+         retro_atomic_store_release_int(&th->status,
+               GFX_THUMBNAIL_STATUS_MISSING);
+         if (downplay_webp_load_texture(path, &th->texture, &w, &h))
+         {
+            th->width  = w;
+            th->height = h;
+            th->alpha  = 1.0f;
+            retro_atomic_store_release_int(&th->status,
+                  GFX_THUMBNAIL_STATUS_AVAILABLE);
+         }
+         return;
+      }
+   }
+#endif
+   gfx_thumbnail_request_file(path, &dp->recents[sel].thumbnail,
+         upscale_thresh);
 }
 
 /* Drive the INGAME view from the actual core-running state.  Upstream
@@ -5065,6 +5246,9 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    /* Thumbnail / index pump for the SYSTEM view.  No-op elsewhere; safe
     * to call before layout because it doesn't touch geometry. */
    downplay_drive_system_thumbnails(dp);
+   /* Recents view loads thumbnails from the on-disk cache only — no
+    * downloads kicked.  No-op outside RECENTS. */
+   downplay_drive_recents_thumbnails(dp);
 
    /* Core flipped option visibility on the previous frame's cycle.
     * Rebuild the active core-options list in place — same stack
