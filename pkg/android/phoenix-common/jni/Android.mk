@@ -72,7 +72,79 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
 							$(RARCH_DIR)/downplay/downplay_metadata.c \
 							$(RARCH_DIR)/downplay/downplay_metadata_disambig.c \
 							$(RARCH_DIR)/downplay/downplay_display_name.c \
-							$(RARCH_DIR)/downplay/downplay_thumbs.c
+							$(RARCH_DIR)/downplay/downplay_thumbs.c \
+							$(RARCH_DIR)/downplay/downplay_webp.c
+# Vendored libwebp decoder.  Decoder-only subset; arch-specific
+# (neon/sse2/sse41/mips/msa) variants are gated internally on compiler
+# defines — including all of them is safe across ABIs.
+LOCAL_SRC_FILES  +=	$(RARCH_DIR)/deps/libwebp/src/dec/alpha_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/buffer_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/frame_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/idec_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/io_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/quant_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/tree_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/vp8_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/vp8l_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dec/webp_dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/alpha_processing.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/alpha_processing_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/alpha_processing_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/alpha_processing_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/alpha_processing_sse41.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/cpu.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_clip_tables.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_mips32.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_msa.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/dec_sse41.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/filters.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/filters_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/filters_msa.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/filters_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/filters_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/lossless.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/lossless_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/lossless_msa.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/lossless_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/lossless_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/lossless_sse41.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/rescaler.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/rescaler_mips32.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/rescaler_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/rescaler_msa.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/rescaler_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/rescaler_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/upsampling.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/upsampling_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/upsampling_msa.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/upsampling_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/upsampling_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/upsampling_sse41.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/yuv.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/yuv_mips32.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/yuv_mips_dsp_r2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/yuv_neon.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/yuv_sse2.c \
+							$(RARCH_DIR)/deps/libwebp/src/dsp/yuv_sse41.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/bit_reader_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/color_cache_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/filters_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/huffman_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/palette.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/quant_levels_dec_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/random_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/rescaler_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/thread_utils.c \
+							$(RARCH_DIR)/deps/libwebp/src/utils/utils.c
+# HAVE_DOWNPLAY_WEBP is currently Android-only.  Desktop builds via
+# Makefile.common silently fall back to .jpg (still correct — both are
+# available on the server).  Wire into Makefile.common when desktop
+# builds need format parity.
+DEFINES          += -DHAVE_DOWNPLAY_WEBP
 endif
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)
@@ -236,6 +308,13 @@ INCLUDE_DIRS     := \
 		    -I$(LOCAL_PATH)/$(DEPS_DIR)/7zip/ \
 		    -I$(LOCAL_PATH)/$(DEPS_DIR)/zstd/lib/ \
 		    -I$(LOCAL_PATH)/$(DEPS_DIR)/libFLAC/include
+
+# DOWNPLAY: vendored libwebp decoder include path (must come after the
+# INCLUDE_DIRS := reset above).  libwebp internal sources use
+# `#include "src/webp/decode.h"` style paths that resolve against this.
+ifeq ($(HAVE_DOWNPLAY),1)
+INCLUDE_DIRS += -I$(LOCAL_PATH)/$(DEPS_DIR)/libwebp
+endif
 
 ifeq ($(HAVE_CHEEVOS),1)
 INCLUDE_DIRS += -I$(LOCAL_PATH)/$(DEPS_DIR)/rcheevos/include

@@ -59,6 +59,9 @@
 #include "../../downplay/downplay_nav.h"
 #include "../../downplay/downplay_setup.h"
 #include "../../downplay/downplay_thumbs.h"
+#ifdef HAVE_DOWNPLAY_WEBP
+#include "../../downplay/downplay_webp.h"
+#endif
 
 #include <features/features_cpu.h>
 
@@ -4689,13 +4692,46 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
 
    if (result.status == DP_THUMB_OK)
    {
-      /* File on disk → kick a (synchronous-on-disk) load if we haven't
-       * already.  request_file is idempotent vs PENDING/AVAILABLE: it
-       * checks status internally and bails. */
+      /* File on disk → kick a load if we haven't already. */
       if (status == GFX_THUMBNAIL_STATUS_UNKNOWN
           || status == GFX_THUMBNAIL_STATUS_MISSING)
-         gfx_thumbnail_request_file(result.local_path,
-               &dp->roms[sel].thumbnail, upscale_thresh);
+      {
+#ifdef HAVE_DOWNPLAY_WEBP
+         /* WebP path uses our vendored libwebp directly — RA's
+          * `task_push_image_load` doesn't know our format-selection
+          * rules, and going through it would round-trip through the
+          * (broken) `formats/rwebp` shim.  Decode synchronously and
+          * publish into the existing gfx_thumbnail_t slot.
+          *
+          * Tradeoff: this blocks the menu thread for ~5–15 ms per
+          * first-load while the JPG path is async.  Acceptable today
+          * because the boot-time prefetch (downplay_thumbs.c) warms
+          * the on-disk cache before the user navigates, so the I/O is
+          * page-cache-hot and decode is the only cost.  If real-world
+          * jank shows up on cold storage, move this to a task. */
+         const char *ext = strrchr(result.local_path, '.');
+         if (ext && !strcmp(ext, ".webp"))
+         {
+            gfx_thumbnail_t *th = &dp->roms[sel].thumbnail;
+            unsigned w = 0, h = 0;
+            gfx_thumbnail_reset(th);
+            retro_atomic_store_release_int(&th->status,
+                  GFX_THUMBNAIL_STATUS_MISSING);
+            if (downplay_webp_load_texture(result.local_path,
+                     &th->texture, &w, &h))
+            {
+               th->width  = w;
+               th->height = h;
+               th->alpha  = 1.0f; /* skip fade for the synchronous path */
+               retro_atomic_store_release_int(&th->status,
+                     GFX_THUMBNAIL_STATUS_AVAILABLE);
+            }
+         }
+         else
+#endif
+            gfx_thumbnail_request_file(result.local_path,
+                  &dp->roms[sel].thumbnail, upscale_thresh);
+      }
       dp->roms[sel].art_state = DP_ART_OK;
    }
    else if (result.status == DP_THUMB_MISSING)

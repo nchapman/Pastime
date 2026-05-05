@@ -95,6 +95,7 @@ typedef struct
    char *heavy;         /* aggressively-normalized, parens stripped */
    char  disc_token[16];/* "Disc 2" / "CD 1" / "Side B" / "" */
    int   jpg_size;      /* bytes; 0 if .jpg absent in formats */
+   int   webp_size;     /* bytes; 0 if .webp absent in formats */
    int   region_score;  /* lower = better; only used on multi-candidate */
    int   rev_num;       /* (Rev N) parsed; 0 if absent */
    bool  bad_dump;      /* (Beta|Proto|Demo|Sample|Pirate|Unl|Hack|...) */
@@ -624,6 +625,7 @@ typedef struct
     * or DP_PS_IN_FORMATS).  Strings strdup'd, NULL when no entry. */
    char *cur_canonical;
    int   cur_jpg_size;
+   int   cur_webp_size;
 
    /* Last seen object-member name; consumed by the next value handler. */
    char  last_member[256];
@@ -658,8 +660,8 @@ static bool dp_idx_grow(downplay_thumbs_index_t *idx)
  * without re-running normalize on the same canonical.  Returns
  * false on OOM (caller propagates). */
 static bool dp_append_entry(downplay_thumbs_index_t *idx,
-      const char *canonical, const char *heavy, int jpg_size,
-      bool *oom)
+      const char *canonical, const char *heavy,
+      int jpg_size, int webp_size, bool *oom)
 {
    dp_thumb_entry_t *e;
    if (idx->entries_count == idx->entries_cap && !dp_idx_grow(idx))
@@ -678,6 +680,7 @@ static bool dp_append_entry(downplay_thumbs_index_t *idx,
       return false;
    }
    e->jpg_size     = jpg_size;
+   e->webp_size    = webp_size;
    e->region_score = dp_score_region(canonical);
    e->rev_num      = dp_extract_rev(canonical);
    e->bad_dump     = dp_detect_bad_dump(canonical);
@@ -716,7 +719,7 @@ static bool dp_commit_entry(dp_parse_ctx_t *c)
    if (*heavy_buf)
    {
       if (!dp_append_entry(idx, c->cur_canonical, heavy_buf,
-               c->cur_jpg_size, &c->oom))
+               c->cur_jpg_size, c->cur_webp_size, &c->oom))
          goto fail;
       any_committed = true;
    }
@@ -762,7 +765,8 @@ static bool dp_commit_entry(dp_parse_ctx_t *c)
                            idx->entries_count - 1].heavy) != 0)
                {
                   if (!dp_append_entry(idx, c->cur_canonical,
-                           heavy_buf, c->cur_jpg_size, &c->oom))
+                           heavy_buf, c->cur_jpg_size,
+                           c->cur_webp_size, &c->oom))
                      goto fail;
                }
 seg_advance:
@@ -778,6 +782,7 @@ seg_advance:
    free(c->cur_canonical);
    c->cur_canonical = NULL;
    c->cur_jpg_size  = 0;
+   c->cur_webp_size = 0;
    (void)any_committed;
    return true;
 
@@ -785,6 +790,7 @@ fail:
    free(c->cur_canonical);
    c->cur_canonical = NULL;
    c->cur_jpg_size  = 0;
+   c->cur_webp_size = 0;
    return false;
 }
 
@@ -844,6 +850,7 @@ static bool dp_h_member(void *ctx, const char *str, size_t len)
       free(c->cur_canonical);
       c->cur_canonical = NULL;
       c->cur_jpg_size  = 0;
+      c->cur_webp_size = 0;
       if (!dp_canonical_safe(str, len))
          return true;
       c->cur_canonical = (char*)malloc(len + 1);
@@ -924,9 +931,19 @@ static bool dp_h_number(void *ctx, const char *str, size_t len)
    dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx;
    (void)len;
    if (c->depth > 0
-       && c->state_stack[c->depth - 1] == DP_PS_IN_FORMATS
-       && !strcmp(c->last_member, "jpg"))
-      c->cur_jpg_size = atoi(str);
+       && c->state_stack[c->depth - 1] == DP_PS_IN_FORMATS)
+   {
+      /* Clamp negatives — atoi("-1") would otherwise survive into
+       * dp_pick_ext's `> 0` test as a falsy value but propagate as a
+       * weird int elsewhere.  Hostile or malformed indexes only. */
+      int n = atoi(str);
+      if (n < 0)
+         n = 0;
+      if (!strcmp(c->last_member, "jpg"))
+         c->cur_jpg_size = n;
+      else if (!strcmp(c->last_member, "webp"))
+         c->cur_webp_size = n;
+   }
    c->last_member[0] = '\0';
    return true;
 }
@@ -1302,25 +1319,39 @@ static bool dp_thumbs_index_path(const char *system,
    return true;
 }
 
+/* Pick the on-disk + remote extension for an entry.  Webp wins when
+ * available — it's typically ~40% smaller than the matching jpg with
+ * indistinguishable visual quality at thumbnail resolution. */
+static const char *dp_pick_ext(const dp_thumb_entry_t *e)
+{
+#ifdef HAVE_DOWNPLAY_WEBP
+   if (e && e->webp_size > 0)
+      return ".webp";
+#else
+   (void)e;
+#endif
+   return ".jpg";
+}
+
 /* Build the on-disk path for an image of canonical key `canon`.  We
  * use the canonical key verbatim as the filename — it's already the
  * No-Intro safe form (no path separators since it's a No-Intro game
- * title), with the .jpg extension appended. */
+ * title), with the entry's preferred extension appended. */
 static void dp_build_image_path(downplay_thumbs_t *t,
-      const char *canon, char *out, size_t out_size)
+      const dp_thumb_entry_t *e, char *out, size_t out_size)
 {
    char tmp[DP_THUMBS_PATH_MAX];
-   fill_pathname_join_special(tmp, t->cache_dir, canon, sizeof(tmp));
-   snprintf(out, out_size, "%s.jpg", tmp);
+   fill_pathname_join_special(tmp, t->cache_dir, e->canonical, sizeof(tmp));
+   snprintf(out, out_size, "%s%s", tmp, dp_pick_ext(e));
 }
 
 /* Build the remote URL for an image. */
 static void dp_build_image_url(downplay_thumbs_t *t,
-      const char *canon, char *out, size_t out_size)
+      const dp_thumb_entry_t *e, char *out, size_t out_size)
 {
    char raw[2048];
-   snprintf(raw, sizeof(raw), "%s/%s/Named_Boxarts/%s.jpg",
-         DP_THUMBS_BASE_URL, t->system, canon);
+   snprintf(raw, sizeof(raw), "%s/%s/Named_Boxarts/%s%s",
+         DP_THUMBS_BASE_URL, t->system, e->canonical, dp_pick_ext(e));
    net_http_urlencode_full(out, raw, out_size);
 }
 
@@ -1403,17 +1434,32 @@ static void dp_cb_image_download(retro_task_t *task, void *task_data,
       err = "non-200";
       goto finish;
    }
-   /* Reject non-JPEG payloads up front.  A 200 OK with HTML or zero
-    * bytes (CDN error page, typo-squat, content-type confusion) gets
-    * cached and then handed to the image decoder on every frame for
-    * a week (cache TTL).  Magic-byte sniff closes that vector:
-    * JPEG SOI is FF D8 — present on every valid JPEG variant. */
-   if (data->len < 4
-         || (unsigned char)data->data[0] != 0xFF
-         || (unsigned char)data->data[1] != 0xD8)
+   /* Reject payloads whose magic bytes don't match the requested
+    * format.  A 200 OK with HTML or zero bytes (CDN error page,
+    * typo-squat, content-type confusion) would otherwise get cached
+    * and handed to the image decoder on every frame for a week
+    * (cache TTL).  Path extension picks which sniff to apply:
+    *   .jpg  → SOI must be FF D8
+    *   .webp → RIFF....WEBP (12-byte container header) */
    {
-      err = "not a JPEG";
-      goto finish;
+      const unsigned char *p = (const unsigned char*)data->data;
+      const char          *ext = strrchr(transf->path, '.');
+      bool ok = false;
+      if (ext && data->len >= 12 && !strcmp(ext, ".webp"))
+      {
+         ok = (p[0] == 'R' && p[1] == 'I' && p[2] == 'F' && p[3] == 'F'
+            && p[8] == 'W' && p[9] == 'E' && p[10] == 'B' && p[11] == 'P');
+         if (!ok)
+            err = "not a WebP";
+      }
+      else
+      {
+         ok = (data->len >= 4 && p[0] == 0xFF && p[1] == 0xD8);
+         if (!ok)
+            err = "not a JPEG";
+      }
+      if (!ok)
+         goto finish;
    }
 
    strlcpy(output_dir, transf->path, sizeof(output_dir));
@@ -1573,16 +1619,37 @@ static bool dp_try_load_local_index(downplay_thumbs_t *t)
       return false;
    }
    /* Pre-mark on-disk images so we don't spuriously refetch.  Cheap:
-    * a stat() per cached file at open time, not per frame. */
+    * a stat() per cached file at open time, not per frame.  When an
+    * entry has webp_size>0 (preferred) but only the .jpg sibling is
+    * on disk — typical after a Downplay upgrade where the previous
+    * version cached jpg only — clear webp_size so the entry stays
+    * on the cached jpg until natural TTL refresh.  Avoids a forced
+    * full re-download on every existing user's first launch. */
    {
       size_t i;
       char img_path[DP_THUMBS_PATH_MAX];
+      char jpg_path[DP_THUMBS_PATH_MAX];
       for (i = 0; i < t->index->entries_count; i++)
       {
-         dp_build_image_path(t, t->index->entries[i].canonical,
-               img_path, sizeof(img_path));
+         dp_thumb_entry_t *e = &t->index->entries[i];
+         dp_build_image_path(t, e, img_path, sizeof(img_path));
          if (path_is_valid(img_path))
+         {
             t->attempt[i] = DP_ATT_ON_DISK;
+            continue;
+         }
+         if (e->webp_size > 0)
+         {
+            char tmp[DP_THUMBS_PATH_MAX];
+            fill_pathname_join_special(tmp, t->cache_dir,
+                  e->canonical, sizeof(tmp));
+            snprintf(jpg_path, sizeof(jpg_path), "%s.jpg", tmp);
+            if (path_is_valid(jpg_path))
+            {
+               e->webp_size = 0; /* fall through to .jpg in dp_pick_ext */
+               t->attempt[i] = DP_ATT_ON_DISK;
+            }
+         }
       }
    }
    t->load_state = DP_LOAD_READY;
@@ -1713,7 +1780,7 @@ static void dp_reap_inflight(downplay_thumbs_t *t)
          t->fetching[i] = t->fetching[--t->inflight];
          continue;
       }
-      dp_build_image_path(t, t->index->entries[e_idx].canonical,
+      dp_build_image_path(t, &t->index->entries[e_idx],
             path, sizeof(path));
       if (path_is_valid(path))
       {
@@ -1731,7 +1798,7 @@ static void dp_reap_inflight(downplay_thumbs_t *t)
 static void dp_drain_queue(downplay_thumbs_t *t)
 {
    uint32_t e_idx;
-   const char *canon;
+   const dp_thumb_entry_t *e;
    char path[DP_THUMBS_PATH_MAX];
    char url[2048];
    file_transfer_t *transf;
@@ -1753,14 +1820,14 @@ static void dp_drain_queue(downplay_thumbs_t *t)
        && t->attempt[e_idx] != DP_ATT_FETCHING)
       return;
 
-   canon = t->index->entries[e_idx].canonical;
-   dp_build_image_path(t, canon, path, sizeof(path));
+   e = &t->index->entries[e_idx];
+   dp_build_image_path(t, e, path, sizeof(path));
    if (path_is_valid(path))
    {
       t->attempt[e_idx] = DP_ATT_ON_DISK;
       return;
    }
-   dp_build_image_url(t, canon, url, sizeof(url));
+   dp_build_image_url(t, e, url, sizeof(url));
    if (!*url)
       return;
    transf = (file_transfer_t*)calloc(1, sizeof(*transf));
@@ -2176,8 +2243,8 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
       const char *rom_basename,
       downplay_thumb_result_t *out)
 {
-   const char *canon;
-   int         e_idx;
+   const dp_thumb_entry_t *e;
+   int                     e_idx;
 
    if (!out)
       return;
@@ -2212,9 +2279,9 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
       }
       e_idx = (int)mi;
    }
-   canon = t->index->entries[e_idx].canonical;
+   e = &t->index->entries[e_idx];
 
-   dp_build_image_path(t, canon, out->local_path, sizeof(out->local_path));
+   dp_build_image_path(t, e, out->local_path, sizeof(out->local_path));
 
    if (t->attempt[e_idx] == DP_ATT_ON_DISK
        || path_is_valid(out->local_path))
