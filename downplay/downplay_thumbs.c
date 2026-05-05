@@ -64,6 +64,7 @@
 #include <streams/file_stream.h>
 #include <streams/trans_stream.h>
 #include <string/stdstring.h>
+#include <rthreads/rthreads.h>
 
 #include "downplay_thumbs.h"
 #include "downplay_display_name.h"
@@ -1100,37 +1101,47 @@ static void dp_strpool_free(dp_strpool_t *p)
    memset(p, 0, sizeof(*p));
 }
 
-/* qsort comparator state.  File-static; only set during the writer's
- * sort calls, on the single UI thread.  qsort takes no user-data
- * pointer, hence the global. */
-static const dp_thumb_entry_t *g_dp_emit_entries;
-
-static int dp_cmp_canonical_idx(const void *a, const void *b)
+/* qsort comparators carry every field they need inside the element
+ * itself.  No file-static base pointer — that would race when two
+ * worker threads emit indexes concurrently (boot prefetch fan-out
+ * spawns up to DP_THUMBS_PF_INFLIGHT_MAX workers in flight).  The
+ * extra ~16 bytes/entry of transient sort memory is the price of
+ * keeping these comparators pure. */
+typedef struct
 {
-   uint32_t ia = *(const uint32_t*)a;
-   uint32_t ib = *(const uint32_t*)b;
-   return strcmp(g_dp_emit_entries[ia].canonical,
-                 g_dp_emit_entries[ib].canonical);
+   const char *canonical;
+   uint32_t    idx;
+} dp_sort_canon_t;
+
+static int dp_cmp_canonical_kv(const void *a, const void *b)
+{
+   const dp_sort_canon_t *pa = (const dp_sort_canon_t*)a;
+   const dp_sort_canon_t *pb = (const dp_sort_canon_t*)b;
+   return strcmp(pa->canonical, pb->canonical);
 }
 
-typedef struct { uint32_t hash; uint32_t idx; } dp_hev_pair_t;
-
-static int dp_cmp_heavy_pair(const void *a, const void *b)
+typedef struct
 {
-   const dp_hev_pair_t *pa = (const dp_hev_pair_t*)a;
-   const dp_hev_pair_t *pb = (const dp_hev_pair_t*)b;
+   uint32_t    hash;
+   const char *heavy;
+   const char *canonical;
+   uint32_t    idx;
+} dp_sort_heavy_t;
+
+static int dp_cmp_heavy_kv(const void *a, const void *b)
+{
+   const dp_sort_heavy_t *pa = (const dp_sort_heavy_t*)a;
+   const dp_sort_heavy_t *pb = (const dp_sort_heavy_t*)b;
    int rv;
    if (pa->hash != pb->hash)
       return pa->hash < pb->hash ? -1 : 1;
    /* On hash collision, sort by heavy strcmp so equal-heavy entries
     * stay contiguous within an equal-hash run.  Then by canonical for
     * full determinism even when two entries share an identical heavy. */
-   rv = strcmp(g_dp_emit_entries[pa->idx].heavy,
-               g_dp_emit_entries[pb->idx].heavy);
+   rv = strcmp(pa->heavy, pb->heavy);
    if (rv != 0)
       return rv;
-   return strcmp(g_dp_emit_entries[pa->idx].canonical,
-                 g_dp_emit_entries[pb->idx].canonical);
+   return strcmp(pa->canonical, pb->canonical);
 }
 
 /* Serialise the parsed entry array into the on-disk binary format.
@@ -1140,12 +1151,12 @@ static int dp_cmp_heavy_pair(const void *a, const void *b)
 static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
       uint8_t **out_buf, size_t *out_len)
 {
-   uint8_t        *buf      = NULL;
-   uint32_t       *can_offs = NULL;
-   uint32_t       *hev_offs = NULL;
-   uint32_t       *bcanon   = NULL;
-   dp_hev_pair_t  *bheavy   = NULL;
-   dp_strpool_t    pool;
+   uint8_t          *buf      = NULL;
+   uint32_t         *can_offs = NULL;
+   uint32_t         *hev_offs = NULL;
+   dp_sort_canon_t  *bcanon   = NULL;
+   dp_sort_heavy_t  *bheavy   = NULL;
+   dp_strpool_t      pool;
    size_t          i;
    size_t          entries_off, bcanon_off, bheavy_off, strings_off, footer_off;
    size_t          entries_sz, bcanon_sz, bheavy_sz, total;
@@ -1215,35 +1226,40 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
       memcpy(buf + entries_off + i * DP_IDX_REC_SZ + 4, &hev_offs[i], 4);
    }
 
-   /* BY_CANONICAL: u32 entry indices sorted by strcmp(canonical). */
+   /* BY_CANONICAL: u32 entry indices sorted by strcmp(canonical).
+    * The sort tuples carry the canonical pointer inline so the
+    * comparator is pure — multiple workers can emit indexes
+    * concurrently without a file-static base pointer. */
    if (n > 0)
    {
-      bcanon = (uint32_t*)malloc(n * sizeof(*bcanon));
+      bcanon = (dp_sort_canon_t*)malloc(n * sizeof(*bcanon));
       if (!bcanon)
          goto out;
       for (i = 0; i < n; i++)
-         bcanon[i] = (uint32_t)i;
-      g_dp_emit_entries = entries;
-      qsort(bcanon, n, sizeof(*bcanon), dp_cmp_canonical_idx);
-      g_dp_emit_entries = NULL;
+      {
+         bcanon[i].canonical = entries[i].canonical;
+         bcanon[i].idx       = (uint32_t)i;
+      }
+      qsort(bcanon, n, sizeof(*bcanon), dp_cmp_canonical_kv);
       for (i = 0; i < n; i++)
-         memcpy(buf + bcanon_off + i * DP_IDX_BCAN_SZ, &bcanon[i], 4);
+         memcpy(buf + bcanon_off + i * DP_IDX_BCAN_SZ, &bcanon[i].idx, 4);
    }
 
-   /* BY_HEAVY: {u32 hash, u32 idx} sorted by (hash, strcmp(heavy)). */
+   /* BY_HEAVY: {u32 hash, u32 idx} sorted by (hash, strcmp(heavy),
+    * strcmp(canonical)).  Same rationale for inline tuple data. */
    if (n > 0)
    {
-      bheavy = (dp_hev_pair_t*)malloc(n * sizeof(*bheavy));
+      bheavy = (dp_sort_heavy_t*)malloc(n * sizeof(*bheavy));
       if (!bheavy)
          goto out;
       for (i = 0; i < n; i++)
       {
-         bheavy[i].hash = dp_fnv1a32(entries[i].heavy);
-         bheavy[i].idx  = (uint32_t)i;
+         bheavy[i].hash      = dp_fnv1a32(entries[i].heavy);
+         bheavy[i].heavy     = entries[i].heavy;
+         bheavy[i].canonical = entries[i].canonical;
+         bheavy[i].idx       = (uint32_t)i;
       }
-      g_dp_emit_entries = entries;
-      qsort(bheavy, n, sizeof(*bheavy), dp_cmp_heavy_pair);
-      g_dp_emit_entries = NULL;
+      qsort(bheavy, n, sizeof(*bheavy), dp_cmp_heavy_kv);
       for (i = 0; i < n; i++)
       {
          memcpy(buf + bheavy_off + i * DP_IDX_BHEV_SZ + 0, &bheavy[i].hash, 4);
@@ -1997,65 +2013,143 @@ static const char *dp_atomic_write_idx(const char *path,
    return NULL;
 }
 
+/* Off-main-thread worker for the JSON-decompress + parse + binary-emit
+ * + atomic-write pipeline.  RA dispatches HTTP completion callbacks on
+ * the main thread; doing 10–40 ms of compute there during cold-start
+ * fan-out (a dozen systems landing in quick succession) is enough to
+ * stutter the menu.  The HTTP callback now copies the gzipped payload
+ * into a heap buffer and hands the rest to a detached sthread.
+ *
+ * "Completion" is fire-and-forget: the worker writes the .idx via the
+ * existing atomic .tmp+rename, and the per-system manager / boot
+ * prefetch discover the file on the next pump frame via path_is_valid.
+ * No main-thread completion callback needed beyond the HTTP one.
+ *
+ * Threading invariant: the worker function must touch ONLY its own
+ * job struct + the file system.  It must not call any RA logger,
+ * task-queue, or manager state — those are main-thread-only.  The
+ * RARCH_LOG / RARCH_WARN macros in upstream are technically not
+ * thread-safe (they go through the runloop's message queue) but
+ * have been observed-safe in practice for low-frequency one-shot
+ * messages; we use them anyway for diagnostic visibility.  If real-
+ * world telemetry shows races, switch to a deferred main-thread log. */
+typedef struct
+{
+   uint8_t *gz_data;        /* malloc'd copy of compressed payload */
+   size_t   gz_len;
+   char     idx_path[DP_THUMBS_PATH_MAX];
+} dp_idx_emit_job_t;
+
+static void dp_idx_emit_worker(void *userdata)
+{
+   dp_idx_emit_job_t *job      = (dp_idx_emit_job_t*)userdata;
+   uint8_t           *json     = NULL;
+   size_t             json_len = 0;
+   uint8_t           *idx_buf  = NULL;
+   size_t             idx_len  = 0;
+   const char        *werr     = NULL;
+
+   json = dp_gunzip(job->gz_data, job->gz_len, &json_len);
+   if (!json || json_len == 0)
+   {
+      werr = "gunzip failed";
+      goto out;
+   }
+   if (!dp_idx_parse_json_to_buffer((const char*)json, json_len,
+            &idx_buf, &idx_len))
+   {
+      werr = "parse failed";
+      goto out;
+   }
+   werr = dp_atomic_write_idx(job->idx_path, idx_buf, idx_len);
+
+out:
+   if (werr && *werr)
+      RARCH_WARN("[Downplay] thumbs index worker \"%s\" failed: %s\n",
+            job->idx_path, werr);
+   else
+      RARCH_LOG("[Downplay] thumbs index -> %s\n", job->idx_path);
+   free(json);
+   free(idx_buf);
+   free(job->gz_data);
+   free(job);
+}
+
+/* Hand off parse+emit+write to a detached worker thread.  Takes
+ * ownership of `gz_data` on success (worker frees it).  On failure
+ * the caller still owns `gz_data` and must free it. */
+static bool dp_idx_dispatch_emit(uint8_t *gz_data, size_t gz_len,
+      const char *idx_path)
+{
+   dp_idx_emit_job_t *job;
+   sthread_t         *t;
+   if (!gz_data || gz_len == 0 || !idx_path || !*idx_path)
+      return false;
+   job = (dp_idx_emit_job_t*)calloc(1, sizeof(*job));
+   if (!job)
+      return false;
+   job->gz_data = gz_data;
+   job->gz_len  = gz_len;
+   strlcpy(job->idx_path, idx_path, sizeof(job->idx_path));
+   t = sthread_create(dp_idx_emit_worker, job);
+   if (!t)
+   {
+      free(job);
+      return false;
+   }
+   sthread_detach(t);
+   return true;
+}
+
 static void dp_cb_index_download(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
    http_transfer_data_t *data    = (http_transfer_data_t*)task_data;
    file_transfer_t      *transf  = (file_transfer_t*)user_data;
-   uint8_t              *json    = NULL;
-   size_t                json_len = 0;
-   uint8_t              *idx_buf = NULL;
-   size_t                idx_len = 0;
-   const char           *werr;
+   uint8_t              *gz_copy = NULL;
    (void)task;
 
    if (!transf)
       return;
    if (!data || !data->data || !*transf->path)
+   {
+      err = "no data";
       goto finish;
+   }
    if (data->status != 200)
    {
       err = "non-200";
       goto finish;
    }
    /* Compressed-size gate: matches dp_cb_pf_index_download.  dp_gunzip
-    * also caps internally, but the early-out avoids holding a multi-MB
-    * CDN error page in memory while we look at it. */
+    * also caps internally, but the early-out avoids paying memcpy +
+    * thread spawn for a multi-MB CDN error page. */
    if (data->len > DP_THUMBS_PF_INDEX_MAX_BYTES)
    {
       err = "response too large";
       goto finish;
    }
-   /* Decompress to JSON, parse straight into the binary `.idx` form,
-    * write that to disk.  JSON never touches the cache. */
-   json = dp_gunzip((const uint8_t*)data->data, (size_t)data->len, &json_len);
-   if (!json || json_len == 0)
+   /* Copy the gzipped payload — http_transfer_data_t->data is freed
+    * when this callback returns, so the worker can't borrow it. */
+   gz_copy = (uint8_t*)malloc((size_t)data->len);
+   if (!gz_copy)
    {
-      err = "gunzip failed";
+      err = "alloc failed";
       goto finish;
    }
-   if (!dp_idx_parse_json_to_buffer((const char*)json, json_len,
-            &idx_buf, &idx_len))
+   memcpy(gz_copy, data->data, (size_t)data->len);
+   if (!dp_idx_dispatch_emit(gz_copy, (size_t)data->len, transf->path))
    {
-      err = "parse failed";
+      free(gz_copy);
+      err = "worker spawn failed";
       goto finish;
    }
-
-   werr = dp_atomic_write_idx(transf->path, idx_buf, idx_len);
-   if (werr)
-   {
-      err = werr;
-      goto finish;
-   }
+   /* Worker now owns gz_copy and will log the final outcome. */
 
 finish:
    if (err && *err)
       RARCH_WARN("[Downplay] thumbs index \"%s\" failed: %s\n",
             transf->path, err);
-   else
-      RARCH_LOG("[Downplay] thumbs index -> %s\n", transf->path);
-   free(json);
-   free(idx_buf);
    free(transf);
 }
 
@@ -2624,18 +2718,17 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
 {
    http_transfer_data_t *data    = (http_transfer_data_t*)task_data;
    dp_pf_transfer_t     *pf      = (dp_pf_transfer_t*)user_data;
-   uint8_t              *json    = NULL;
-   size_t                json_len = 0;
-   uint8_t              *idx_buf = NULL;
-   size_t                idx_len = 0;
-   const char           *werr;
+   uint8_t              *gz_copy = NULL;
    (void)task;
 
    retro_assert(task_is_on_main_thread());
    if (!pf)
       return;
    if (!data || !data->data || !*pf->base.path)
+   {
+      err = "no data";
       goto finish;
+   }
    if (data->status != 200)
    {
       err = "non-200";
@@ -2646,36 +2739,29 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
       err = "response too large";
       goto finish;
    }
-   /* Same JSON → .idx path as dp_cb_index_download.  We never write
-    * the JSON or any intermediate form to disk — the binary file IS
-    * the cache. */
-   json = dp_gunzip((const uint8_t*)data->data, (size_t)data->len, &json_len);
-   if (!json || json_len == 0)
+   /* Hand parse+emit+write off to a detached worker.  The prefetch
+    * inflight slot is released below regardless of worker dispatch
+    * outcome — the network round-trip is done either way, and a
+    * stuck slot would block the rest of the boot fan-out. */
+   gz_copy = (uint8_t*)malloc((size_t)data->len);
+   if (!gz_copy)
    {
-      err = "gunzip failed";
+      err = "alloc failed";
       goto finish;
    }
-   if (!dp_idx_parse_json_to_buffer((const char*)json, json_len,
-            &idx_buf, &idx_len))
+   memcpy(gz_copy, data->data, (size_t)data->len);
+   if (!dp_idx_dispatch_emit(gz_copy, (size_t)data->len, pf->base.path))
    {
-      err = "parse failed";
+      free(gz_copy);
+      err = "worker spawn failed";
       goto finish;
    }
-   werr = dp_atomic_write_idx(pf->base.path, idx_buf, idx_len);
-   if (werr)
-   {
-      err = werr;
-      goto finish;
-   }
+   /* Worker now owns gz_copy + will log final outcome. */
 
 finish:
    if (err && *err)
       RARCH_WARN("[Downplay] thumbs prefetch \"%s\" failed: %s\n",
             pf->system, err);
-   else
-      RARCH_LOG("[Downplay] thumbs prefetch -> %s\n", pf->base.path);
-   free(json);
-   free(idx_buf);
    dp_pf_inflight_remove(pf->system);
    free(pf);
    dp_pf_drain();
@@ -3083,6 +3169,69 @@ static dp_recents_slot_t *dp_recents_get_slot(
    return s;
 }
 
+/* Same path-traversal guards as downplay_thumbs_open.  Inlined here
+ * because the recents API is the only other consumer of `system` as
+ * a filesystem path component. */
+static bool dp_system_safe(const char *system)
+{
+   if (!system || !*system)
+      return false;
+   if (strstr(system, ".."))
+      return false;
+   if (strchr(system, '/') || strchr(system, '\\'))
+      return false;
+   return true;
+}
+
+/* Lazy-load the slot's binary index from disk if not yet attempted.
+ * Marks the slot tried even on a missing-or-broken file so subsequent
+ * frames don't re-stat / re-read.  Returns true if work was done
+ * this call (i.e. the slot just transitioned from untried). */
+static bool dp_recents_slot_load(dp_recents_slot_t *slot)
+{
+   char     idx_path[DP_THUMBS_PATH_MAX];
+   int64_t  size = 0;
+   void    *buf  = NULL;
+   if (!slot || slot->tried || !slot->system)
+      return false;
+   slot->tried = true;
+   if (!dp_thumbs_index_path(slot->system, idx_path, sizeof(idx_path)))
+      return true;
+   if (!path_is_valid(idx_path))
+      return true;
+   if (filestream_read_file(idx_path, &buf, &size) && buf && size > 0)
+      slot->index = dp_idx_open((uint8_t*)buf, (size_t)size);
+   else
+      free(buf);
+   return true;
+}
+
+void downplay_thumbs_recents_seed(downplay_thumbs_recents_t *r,
+      const char *system)
+{
+   if (!r || !dp_system_safe(system))
+      return;
+   /* dp_recents_get_slot creates the slot on first sight; we don't
+    * care about the return — the slot exists in the table now and
+    * pump/resolve will pick it up. */
+   (void)dp_recents_get_slot(r, system);
+}
+
+bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r)
+{
+   size_t i;
+   if (!r)
+      return false;
+   /* Walk slots in seed order; load the first not-yet-tried one and
+    * stop.  This bounds blocking I/O to one .idx read per frame —
+    * a 1500-system recents list (impossible in practice; bound is ~10)
+    * would still pre-warm in well under a second of real time. */
+   for (i = 0; i < r->count; i++)
+      if (dp_recents_slot_load(&r->slots[i]))
+         return true;
+   return false;
+}
+
 bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
       char *out, size_t out_size)
@@ -3094,34 +3243,22 @@ bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
    char               cache_dir[DP_THUMBS_PATH_MAX];
    char               tmp[DP_THUMBS_PATH_MAX];
 
-   if (!r || !system || !*system || !rom_basename || !*rom_basename
+   if (!r || !rom_basename || !*rom_basename
        || !out || out_size == 0)
       return false;
-   /* Same path-traversal guards as downplay_thumbs_open. */
-   if (strstr(system, "..")
-       || strchr(system, '/') || strchr(system, '\\'))
+   if (!dp_system_safe(system))
       return false;
 
    slot = dp_recents_get_slot(r, system);
    if (!slot)
       return false;
+   /* No-op once tried — pump pre-warmed it, or a previous resolve
+    * already settled it.  Worst case (caller hovered a row before
+    * pump caught up, or never seeded): load inline now.  slot_load
+    * marks tried regardless of outcome so the pump skips this slot
+    * on subsequent frames. */
+   dp_recents_slot_load(slot);
 
-   if (!slot->tried)
-   {
-      char     idx_path[DP_THUMBS_PATH_MAX];
-      slot->tried = true;
-      if (dp_thumbs_index_path(system, idx_path, sizeof(idx_path))
-          && path_is_valid(idx_path))
-      {
-         int64_t  size = 0;
-         void    *buf  = NULL;
-         if (filestream_read_file(idx_path, &buf, &size)
-               && buf && size > 0)
-            slot->index = dp_idx_open((uint8_t*)buf, (size_t)size);
-         else
-            free(buf);
-      }
-   }
    if (!slot->index)
       return false;
    mi = dp_index_match_idx(slot->index, rom_basename);
@@ -3159,6 +3296,10 @@ void downplay_thumbs_prefetch_indexes(
       const char * const *systems, size_t count)
 { (void)systems; (void)count; }
 downplay_thumbs_recents_t *downplay_thumbs_recents_open(void) { return NULL; }
+void downplay_thumbs_recents_seed(downplay_thumbs_recents_t *r,
+      const char *system) { (void)r; (void)system; }
+bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r)
+{ (void)r; return false; }
 bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
       char *out, size_t out_size)

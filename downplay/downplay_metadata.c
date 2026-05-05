@@ -74,19 +74,126 @@ struct downplay_index
    dp_entry_t  *entries;
    size_t       entries_count;
    size_t       entries_cap;
+
+   /* Open-addressing basename → entry-index hash table.  Each slot
+    * holds (entry_index + 1); 0 means empty.  Sized to keep load
+    * factor below 0.5.  Replaces a per-call linear scan over
+    * entries[] — system-enter previously did O(R*E) string compares
+    * across the reconcile loop (note_present + lookup), bad enough
+    * to hitch the menu transition on a 1500-ROM PSX folder. */
+   uint32_t    *ht;
+   size_t       htmask;            /* (htsize - 1); htsize is a power of 2 */
+
    bool         dirty;
 };
+
+/* fnv1a-32 over a NUL-terminated string.  Same constants as the
+ * thumbnail index's hasher; cheap, no table, well-distributed for
+ * filename-shaped keys. */
+static uint32_t dp_idx_hash_basename(const char *s)
+{
+   uint32_t h = 0x811c9dc5u;
+   while (*s)
+   {
+      h ^= (unsigned char)*s++;
+      h *= 0x01000193u;
+   }
+   return h;
+}
+
+/* Grow (or create) the hash table to the next power-of-two size.
+ * Re-inserts every existing slot.  Caller invokes this when load
+ * factor is about to exceed 0.5 OR when the entries array has been
+ * compacted and the table needs rebuilding from scratch. */
+static bool dp_ht_grow(downplay_index_t *idx)
+{
+   size_t    new_size = idx->htmask ? (idx->htmask + 1) * 2 : 64;
+   uint32_t *nht;
+   size_t    i;
+   nht = (uint32_t*)calloc(new_size, sizeof(*nht));
+   if (!nht)
+      return false;
+   if (idx->ht)
+   {
+      for (i = 0; i <= idx->htmask; i++)
+      {
+         uint32_t v = idx->ht[i];
+         if (!v)
+            continue;
+         {
+            const char *bn  = idx->entries[v - 1].basename;
+            size_t      pos = dp_idx_hash_basename(bn) & (new_size - 1);
+            while (nht[pos])
+               pos = (pos + 1) & (new_size - 1);
+            nht[pos] = v;
+         }
+      }
+      free(idx->ht);
+   }
+   idx->ht     = nht;
+   idx->htmask = new_size - 1;
+   return true;
+}
+
+/* Reserve enough hash-table capacity for `expected_count` entries
+ * at < 0.5 load.  Idempotent + cheap once large enough. */
+static bool dp_ht_reserve(downplay_index_t *idx, size_t expected_count)
+{
+   while (!idx->ht || expected_count * 2 > idx->htmask + 1)
+      if (!dp_ht_grow(idx))
+         return false;
+   return true;
+}
+
+/* Insert entry index `e_idx` into the hash table.  Caller must have
+ * reserved capacity via dp_ht_reserve; this does no growing. */
+static void dp_ht_insert(downplay_index_t *idx, uint32_t e_idx)
+{
+   const char *bn  = idx->entries[e_idx].basename;
+   size_t      pos = dp_idx_hash_basename(bn) & idx->htmask;
+   while (idx->ht[pos])
+      pos = (pos + 1) & idx->htmask;
+   idx->ht[pos] = e_idx + 1;
+}
+
+/* Wipe the hash table and re-insert every live entry.  Used after
+ * downplay_index_finish_scan compacts entries[] in place.
+ *
+ * On reserve failure we still wipe the existing table — leaving the
+ * pre-compaction slots in place would have them pointing at moved
+ * (or freed) entry indices, which is a memory-safety hazard, not a
+ * graceful degradation.  After the wipe, lookups answer NULL until
+ * a future create grows ht; that's the same effect the comment in
+ * the caller describes. */
+static bool dp_ht_rebuild(downplay_index_t *idx)
+{
+   size_t i;
+   if (!dp_ht_reserve(idx, idx->entries_count))
+   {
+      if (idx->ht)
+         memset(idx->ht, 0, (idx->htmask + 1) * sizeof(*idx->ht));
+      return false;
+   }
+   memset(idx->ht, 0, (idx->htmask + 1) * sizeof(*idx->ht));
+   for (i = 0; i < idx->entries_count; i++)
+      dp_ht_insert(idx, (uint32_t)i);
+   return true;
+}
 
 static dp_entry_t *dp_entries_find(downplay_index_t *idx,
       const char *basename)
 {
-   size_t i;
-   if (!idx || !basename)
+   size_t pos;
+   if (!idx || !basename || !idx->ht || idx->entries_count == 0)
       return NULL;
-   for (i = 0; i < idx->entries_count; i++)
+   pos = dp_idx_hash_basename(basename) & idx->htmask;
+   while (idx->ht[pos])
    {
-      if (string_is_equal(idx->entries[i].basename, basename))
-         return &idx->entries[i];
+      uint32_t    v = idx->ht[pos];
+      dp_entry_t *e = &idx->entries[v - 1];
+      if (string_is_equal(e->basename, basename))
+         return e;
+      pos = (pos + 1) & idx->htmask;
    }
    return NULL;
 }
@@ -105,11 +212,18 @@ static dp_entry_t *dp_entries_create(downplay_index_t *idx,
       idx->entries     = grown;
       idx->entries_cap = new_cap;
    }
+   /* Reserve hash-table capacity AFTER the entries realloc succeeds.
+    * If we reserved first and then the entries realloc failed, the
+    * table would be over-sized for entries_count and stay that way,
+    * silently wasting memory after every OOM event. */
+   if (!dp_ht_reserve(idx, idx->entries_count + 1))
+      return NULL;
    e = &idx->entries[idx->entries_count];
    memset(e, 0, sizeof(*e));
    e->basename = strdup(basename);
    if (!e->basename)
       return NULL;
+   dp_ht_insert(idx, (uint32_t)idx->entries_count);
    idx->entries_count++;
    return e;
 }
@@ -498,6 +612,9 @@ downplay_index_t *downplay_index_open(const char *system_folder_name,
       for (i = 0; i < idx->entries_count; i++)
          dp_entry_free(&idx->entries[i]);
       idx->entries_count = 0;
+      /* Wipe ht in lockstep so a fresh rebuild starts from empty. */
+      if (idx->ht)
+         memset(idx->ht, 0, (idx->htmask + 1) * sizeof(*idx->ht));
    }
 
    return idx;
@@ -512,24 +629,34 @@ void downplay_index_close(downplay_index_t *idx)
    for (i = 0; i < idx->entries_count; i++)
       dp_entry_free(&idx->entries[i]);
    free(idx->entries);
+   free(idx->ht);
    free(idx->json_path);
    free(idx->system_folder);
    free(idx->db_name);
    free(idx);
 }
 
+/* The mtime/size parameters are vestigial — kept on the API surface
+ * so callers don't have to change, but no longer drive validity
+ * checks.  We used to invalidate the cached art_state on a (basename,
+ * mtime, size) mismatch, but the per-file stat() that produced those
+ * numbers cost ~150 ms per system enter on Android FUSE.  art_state
+ * is layout-only (truncation gate) and self-heals on first hover via
+ * drive_system_thumbnails → downplay_index_set_art_state, so a stale
+ * value is at worst a one-frame layout miss, never a wrong launch. */
 bool downplay_index_lookup(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size,
       downplay_index_record_t *out)
 {
    dp_entry_t *e;
+   (void)mtime; (void)size;
    if (!out)
       return false;
    memset(out, 0, sizeof(*out));
    if (!idx || !basename)
       return false;
    e = dp_entries_find(idx, basename);
-   if (!e || e->mtime != (int64_t)mtime || e->size != size)
+   if (!e)
       return false;
    out->art_state = e->art_state;
    return true;
@@ -539,7 +666,7 @@ void downplay_index_note_present(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size)
 {
    dp_entry_t *e;
-   bool        is_new = false;
+   (void)mtime; (void)size;
    if (!idx || !basename || !*basename)
       return;
    e = dp_entries_find(idx, basename);
@@ -548,16 +675,9 @@ void downplay_index_note_present(downplay_index_t *idx,
       e = dp_entries_create(idx, basename);
       if (!e)
          return;
-      is_new = true;
+      idx->dirty = true; /* new entry */
    }
    e->present = true;
-   if (is_new || e->mtime != (int64_t)mtime || e->size != size)
-   {
-      e->mtime     = (int64_t)mtime;
-      e->size      = size;
-      e->art_state = DP_ART_UNKNOWN;
-      idx->dirty   = true;
-   }
 }
 
 void downplay_index_finish_scan(downplay_index_t *idx)
@@ -582,6 +702,15 @@ void downplay_index_finish_scan(downplay_index_t *idx)
       }
    }
    idx->entries_count = write_i;
+   /* Compaction shifted entries[] indices around; the hash table
+    * holds stale offsets pointing at moved (or freed) slots.  A
+    * full rebuild is the simplest correct recovery — entries_count
+    * is the new total ROM count, well under hash-grow thresholds.
+    * The only failure mode here is calloc OOM during a grow (rare;
+    * the working set is on the order of kilobytes); on failure the
+    * rebuild leaves a wiped ht so lookups answer NULL until create
+    * eventually grows it again. */
+   (void)dp_ht_rebuild(idx);
 }
 
 void downplay_index_set_art_state(downplay_index_t *idx,

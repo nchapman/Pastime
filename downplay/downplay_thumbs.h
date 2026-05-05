@@ -150,6 +150,21 @@ typedef struct downplay_thumbs_recents downplay_thumbs_recents_t;
 
 downplay_thumbs_recents_t *downplay_thumbs_recents_open(void);
 
+/* Pre-create a slot for `system` so the resolver knows about it
+ * before the first resolve hits.  Cheap (no I/O); idempotent —
+ * re-seeding is a no-op.  Used by the menu driver at recents-view
+ * enter to enumerate every distinct db_name across the row set so
+ * `downplay_thumbs_recents_pump` can drive their loads in order. */
+void downplay_thumbs_recents_seed(downplay_thumbs_recents_t *r,
+      const char *system);
+
+/* Pre-warm one seeded-but-not-yet-loaded slot per call.  Returns
+ * true if a load was attempted (file read attempted) this call,
+ * false when every seeded slot is settled.  Call from the menu's
+ * per-frame drive function to bound blocking I/O to one .idx read
+ * per frame regardless of how the user scrolls. */
+bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r);
+
 /* Resolve one row.  Returns true and writes the on-disk image path
  * into `out` iff the system's binary index is on disk, the cascade
  * matches `rom_basename`, AND the resolved image is cached.  No HTTP

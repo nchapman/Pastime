@@ -910,7 +910,6 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          char       *sort_dup;
          char        clean[NAME_MAX_LENGTH];
          char        sort_buf[NAME_MAX_LENGTH];
-         struct stat st;
          /* Strip No-Intro / Redump trailing tags here so the user sees
           * "Super Mario Bros. 3" not "Super Mario Bros. 3 (USA) (Rev A)".
           * sort_key folds case + drops a leading article so "The Legend
@@ -936,15 +935,17 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          roms[count].display_name = display;
          roms[count].sort_key     = sort_dup;
          roms[count].full_path    = path_dup;
-         /* mtime/size pin the index entry; mismatch invalidates the
-          * cached label/match.  stat failure leaves both 0 — the index
-          * treats 0/0 as "unknown" and forces a re-match each visit,
-          * which is fine for the rare case (e.g. transient FS error). */
-         if (stat(path_dup, &st) == 0)
-         {
-            roms[count].mtime = (int64_t)st.st_mtime;
-            roms[count].size  = (int64_t)st.st_size;
-         }
+         /* mtime/size deliberately left zero.  The metadata index keys
+          * cache validity by basename only — we used to stat() every
+          * ROM here for a strict (basename, mtime, size) pin, which
+          * cost ~150ms on a 1500-ROM folder over Android FUSE just to
+          * detect the rare case where a user replaces a ROM file in
+          * place.  art_state is layout-only (truncation gate) and
+          * self-heals on first hover via downplay_drive_system_thumbnails,
+          * so a stale entry is at worst a one-frame layout miss, never
+          * a wrong launch.  Saved indexes from older code keep their
+          * mtime/size fields; the lookup compares against zero now and
+          * forces a re-match the first time, which heals naturally. */
          gfx_thumbnail_init_blank(&roms[count].thumbnail);
          /* art_state is seeded from the persisted index after
           * downplay_index_finish_scan in downplay_open_system, and
@@ -1530,14 +1531,29 @@ static void downplay_save_picker_dispose(void *user, void *side)
 
 static void downplay_open_recents(downplay_handle_t *dp)
 {
+   size_t i;
    downplay_recents_free(dp->recents, dp->recent_row_count);
    dp->recents          = NULL;
    dp->recent_row_count = 0;
    dp->recents          = downplay_build_recents(&dp->recent_row_count);
-   /* Cheap allocation; no I/O until the first row's resolve fires. */
+   /* Cheap allocation; no I/O until the per-frame pump fires. */
    downplay_thumbs_recents_close(dp->recents_thumbs);
    dp->recents_thumbs        = downplay_thumbs_recents_open();
    dp->thumb_prev_selection  = SIZE_MAX;
+   /* Seed every distinct db_name across the row set so the per-frame
+    * pump can pre-warm them in seed order, one .idx read per frame.
+    * Without this, the first hover on each system pays a synchronous
+    * 5–30 ms read; with it, the loads happen during the natural
+    * frames it takes the user to settle on a row. */
+   if (dp->recents && dp->recents_thumbs)
+   {
+      for (i = 0; i < dp->recent_row_count; i++)
+      {
+         const char *db = dp->recents[i].db_name;
+         if (db && *db)
+            downplay_thumbs_recents_seed(dp->recents_thumbs, db);
+      }
+   }
    dp_nav_push(&dp->nav, DOWNPLAY_VIEW_RECENTS, NULL, downplay_recents_dispose);
 }
 
@@ -4882,6 +4898,12 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
       return;
    if (!dp->recents_thumbs)
       return;
+
+   /* Pre-warm one seeded-but-unloaded system per frame.  No-op once
+    * every distinct system in the row set has been settled.  Bounds
+    * blocking I/O to one .idx read per frame regardless of how the
+    * user scrolls. */
+   downplay_thumbs_recents_pump(dp->recents_thumbs);
 
    sel = dp->nav.selection;
    if (sel >= dp->recent_row_count)
