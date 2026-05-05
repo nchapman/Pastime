@@ -319,7 +319,7 @@ static void test_pop_to_target_already_top_is_noop(
    ASSERT_EQ(u->dispose_calls, 0);
 }
 
-static void test_pop_to_top_collapses_full_stack(
+static void test_pop_to_top_collapses_multiple_frames(
       dp_nav_state_t *s, test_user_t *u)
 {
    dp_nav_push(s, DOWNPLAY_VIEW_INGAME, NULL, recording_dispose);
@@ -452,6 +452,41 @@ static void test_top_returns_correct_frame(
    ASSERT_PTR_EQ(t, &s->nav[1]);
 }
 
+/* ---- NULL after_change ---- */
+
+/* These bypass the RUN_TEST macro because it always wires a real
+ * after_change.  The header documents the callback as optional;
+ * push/pop must guard the NULL case rather than dereferencing it. */
+static void test_null_after_change_is_safe(void)
+{
+   dp_nav_state_t state;
+   int            pass_at_start = g_pass;
+   int            fail_at_start = g_fail;
+
+   dp_nav_init(&state, DOWNPLAY_VIEW_TOP, NULL, NULL);
+   ASSERT_EQ(state.nav_depth, 1);
+
+   /* Push then pop with no callback wired — must not crash. */
+   dp_nav_push(&state, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   ASSERT_EQ(state.nav_depth, 2);
+   ASSERT_EQ(state.view, DOWNPLAY_VIEW_SYSTEM);
+
+   dp_nav_pop(&state);
+   ASSERT_EQ(state.nav_depth, 1);
+   ASSERT_EQ(state.view, DOWNPLAY_VIEW_TOP);
+
+   /* set_selection has no after_change side effect by contract; just
+    * confirm it still mutates state cleanly. */
+   dp_nav_set_selection(&state, 7);
+   ASSERT_EQ(state.selection, 7);
+
+   printf("  %-52s  %s  (+%d -%d)\n",
+         "test_null_after_change_is_safe",
+         (g_fail == fail_at_start) ? "ok  " : "FAIL",
+         g_pass - pass_at_start,
+         g_fail - fail_at_start);
+}
+
 /* ============================================================
  * Runner
  * ============================================================ */
@@ -479,7 +514,7 @@ int main(void)
 
    RUN_TEST(test_pop_to_existing_target);
    RUN_TEST(test_pop_to_target_already_top_is_noop);
-   RUN_TEST(test_pop_to_top_collapses_full_stack);
+   RUN_TEST(test_pop_to_top_collapses_multiple_frames);
    RUN_TEST(test_pop_to_absent_target_flattens_and_warns);
 
    RUN_TEST(test_root_view_only_ground_returns_top);
@@ -493,6 +528,8 @@ int main(void)
    RUN_TEST(test_nested_push_pop_preserves_each_parent);
 
    RUN_TEST(test_top_returns_correct_frame);
+
+   test_null_after_change_is_safe();
 
    printf("\n%d passed, %d failed\n", g_pass, g_fail);
    return g_fail > 0 ? 1 : 0;

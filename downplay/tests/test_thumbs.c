@@ -1,10 +1,7 @@
-/* Unit tests for downplay/downplay_thumbs.c (pure match cascade).
- *
- * The manager (HTTP, FS, paths) is stubbed by DOWNPLAY_THUMBS_TEST_BUILD.
- * We only exercise the JSON parse + tier-cascade matcher.
- *
- * Build line in run_tests.sh.
- */
+/* Unit tests for downplay/downplay_thumbs_index.c — the pure parse +
+ * tier-cascade matcher.  The HTTP/IO manager (downplay_thumbs.c) is
+ * a separate translation unit and is intentionally NOT linked into
+ * this test binary; see run_tests.sh. */
 
 #include <stdio.h>
 #include <stdint.h>
@@ -317,36 +314,18 @@ static void test_multi_disc_disambiguation(void)
 static void test_region_prefix_not_a_false_match(void)
 {
    /* "(USA Proto)" must NOT score as USA — proto is a different
-    * release.  Regression for the bare-prefix bug. */
+    * release.  Regression for the bare-prefix bug: if the region
+    * scorer matched on "USA" prefix without checking what follows,
+    * USA Proto would beat clean USA.  The dp_is_region_terminator
+    * check guards this. */
    const char *titles[] = {
       "Game (USA Proto)",
-      "Game (Japan)"
+      "Game (USA)"
    };
    downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   /* Both should score as something other than USA.  Expect Japan to
-    * win since proto scores as DP_REGION_OTHER (5) and Japan scores
-    * as DP_REGION_JP (7); OTHER < JP so Proto wins.  The bug-free
-    * behavior is "USA Proto != USA"; either result is acceptable as
-    * long as the test below holds. */
-   const char *hit = downplay_thumbs_index_match(idx, "Game.gb");
-   ASSERT_NONNULL(hit);
-   /* If "USA Proto" had been mis-scored as USA, it would beat Japan
-    * unconditionally; the bug-free implementation gives proto only
-    * OTHER, so it still beats Japan — but for a tighter regression
-    * we test the reversed pair: */
+   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Game.gb"),
+         "Game (USA)");
    downplay_thumbs_index_free(idx);
-
-   /* USA Proto vs USA — USA must win unambiguously. */
-   {
-      const char *titles2[] = {
-         "Game (USA Proto)",
-         "Game (USA)"
-      };
-      downplay_thumbs_index_t *idx2 = make_idx(titles2, 2);
-      ASSERT_STR_EQ(downplay_thumbs_index_match(idx2, "Game.gb"),
-            "Game (USA)");
-      downplay_thumbs_index_free(idx2);
-   }
 }
 
 static void test_path_traversal_rejected(void)
@@ -618,6 +597,64 @@ static void test_unbalanced_paren_in_user_input(void)
    downplay_thumbs_index_free(idx);
 }
 
+static void test_null_and_empty_inputs(void)
+{
+   /* The parse + match + count + free APIs all promise NULL/empty
+    * safety in the header.  These exercise those guards directly
+    * — without them, a bug introduced in the early-return paths
+    * would only surface in the manager and never in tests. */
+   const char *titles[] = { "Sonic the Hedgehog (USA)" };
+   downplay_thumbs_index_t *idx;
+
+   /* _parse: bad inputs return NULL, never deref. */
+   ASSERT_NULL(downplay_thumbs_index_parse(NULL, 0));
+   ASSERT_NULL(downplay_thumbs_index_parse(NULL, 16));
+   ASSERT_NULL(downplay_thumbs_index_parse("ignored", 0));
+   /* Outright malformed JSON. */
+   ASSERT_NULL(downplay_thumbs_index_parse("garbage", 7));
+   ASSERT_NULL(downplay_thumbs_index_parse("{", 1));
+   /* JSON without a "files" object — saw_files_obj guard. */
+   ASSERT_NULL(downplay_thumbs_index_parse("{}", 2));
+   ASSERT_NULL(downplay_thumbs_index_parse(
+         "{\"system\":\"Test\"}", 17));
+
+   /* _count: NULL returns 0. */
+   ASSERT_TRUE(downplay_thumbs_index_count(NULL) == 0);
+
+   /* _match: NULL idx and NULL/empty rom basename short-circuit. */
+   idx = make_idx(titles, 1);
+   ASSERT_NONNULL(idx);
+   ASSERT_NULL(downplay_thumbs_index_match(NULL,  "Sonic.md"));
+   ASSERT_NULL(downplay_thumbs_index_match(idx,   NULL));
+   ASSERT_NULL(downplay_thumbs_index_match(idx,   ""));
+   /* Sanity: a real query against the same idx still works. */
+   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+         "Sonic the Hedgehog.md"),
+         "Sonic the Hedgehog (USA)");
+   downplay_thumbs_index_free(idx);
+
+   /* _free: NULL is a no-op. */
+   downplay_thumbs_index_free(NULL);
+}
+
+static void test_filename_extension_edge_cases(void)
+{
+   /* dp_strip_ext skips files starting with '.' — a bare ".gb"
+    * input is treated literally as ".gb", not stripped to "".
+    * A no-extension input is passed through unchanged. */
+   const char *titles[] = { "Sonic the Hedgehog (USA)" };
+   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   /* No-extension query: "Sonic the Hedgehog" → matches. */
+   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+         "Sonic the Hedgehog"),
+         "Sonic the Hedgehog (USA)");
+   /* Bare extension only: dp_strip_ext leaves ".gb" intact (skips
+    * names starting with '.'); heavy normalize then yields "gb",
+    * which doesn't match the canonical's "sonichedgehog" → miss. */
+   ASSERT_NULL(downplay_thumbs_index_match(idx, ".gb"));
+   downplay_thumbs_index_free(idx);
+}
+
 int main(void)
 {
    test_parse_basic();
@@ -651,6 +688,8 @@ int main(void)
    test_ampersand_and_underscore_equivalence();
    test_latin_fold();
    test_punctuation_and_spacing_irrelevant();
+   test_null_and_empty_inputs();
+   test_filename_extension_edge_cases();
 
    printf("test_thumbs: %d passed, %d failed\n", g_pass, g_fail);
    return g_fail ? 1 : 0;
