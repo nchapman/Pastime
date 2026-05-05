@@ -51,9 +51,13 @@ $CC $CFLAGS $INC \
 BUILT+=(test_display_name)
 
 # --- thumbnail match cascade ---
+# Pure side only: downplay_thumbs_index.c carries the parse + match
+# cascade with no HTTP/IO/log dependencies, so we link it directly
+# (no DOWNPLAY_THUMBS_TEST_BUILD stub dance — the manager file isn't
+# linked in).
 echo "== building test_thumbs"
-$CC $CFLAGS -DDOWNPLAY_THUMBS_TEST_BUILD $INC \
-    test_thumbs.c ../downplay_thumbs.c ../downplay_display_name.c \
+$CC $CFLAGS $INC \
+    test_thumbs.c ../downplay_thumbs_index.c \
     "${PROJECT_ROOT}/libretro-common/formats/json/rjson.c" \
     -o test_thumbs
 BUILT+=(test_thumbs)

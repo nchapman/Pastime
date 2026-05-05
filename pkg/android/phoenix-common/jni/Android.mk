@@ -73,6 +73,7 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
 							$(RARCH_DIR)/downplay/downplay_metadata_disambig.c \
 							$(RARCH_DIR)/downplay/downplay_display_name.c \
 							$(RARCH_DIR)/downplay/downplay_thumbs.c \
+							$(RARCH_DIR)/downplay/downplay_thumbs_index.c \
 							$(RARCH_DIR)/downplay/downplay_webp.c
 # Vendored libwebp decoder.  Decoder-only subset; arch-specific
 # (neon/sse2/sse41/mips/msa) variants are gated internally on compiler
