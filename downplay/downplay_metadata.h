@@ -45,28 +45,19 @@ RETRO_BEGIN_DECLS
 const char *downplay_metadata_resolve_db_name(
       const char *display_name, const char *core_ident);
 
-/* ---------- per-system index ---------- */
-
-/* Opaque per-system metadata index.  Owns:
- *  - the JSON file at <RA_config>/downplay/index/<system_folder>.json
- *  - an open libretrodb_t* for the resolved db_name's RDB (or NULL)
- *  - a dynamic array of (basename, mtime, size, label, ...) entries
- *  - a queue of basenames pending CRC/serial match
- *  - a dirty flag for debounced flush
+/* ---------- per-system art-state index ----------
  *
- * Lifetime: open on system view enter, close on view exit.  Holding the
- * libretrodb handle across a session amortizes file-open cost; per-file
- * matching cost drops from ~50ms to ~10ms.  See plan
- * (.../this-looks-great-turn-functional-lollipop.md) for the full
- * reuse map and rationale. */
+ * Persists `art_state` (OK / MISSING / UNKNOWN) per (system, basename)
+ * tuple to disk so the row drawer can pre-truncate row labels for
+ * known-art rows on system enter, before the thumbnail manager has
+ * had a chance to look anything up.  Pure cache: tearing down the
+ * file is always safe; the next session repopulates from
+ * `downplay_thumbs_request` outcomes.
+ *
+ * Was historically a richer module (CRC/serial RDB matching for
+ * canonical labels) — removed once the pastime.gg-backed thumbnail
+ * pipeline took over both label resolution and art lookup. */
 typedef struct downplay_index downplay_index_t;
-
-enum downplay_match_kind
-{
-   DP_MATCH_NONE = 0,
-   DP_MATCH_CRC,
-   DP_MATCH_SERIAL
-};
 
 enum downplay_art_state
 {
@@ -75,103 +66,50 @@ enum downplay_art_state
    DP_ART_MISSING
 };
 
-/* Snapshot of an index entry.  The `const char*` pointers reference
- * storage owned by the index; read-only, never free.
- *
- * Lifetime contract: pointers are valid only within the same call
- * frame as the lookup that returned them.  Do NOT store across a
- * subsequent downplay_index_pump / note_present / set_art_state /
- * close call — the apply path can free and replace the underlying
- * label/match_value strings.  In practice all current callers (the
- * menu driver's per-row render) read once and discard, which is
- * fine. */
+/* Snapshot of an index entry.  Lifetime contract: the snapshot is
+ * value-typed and stable across subsequent calls. */
 typedef struct
 {
-   const char              *label;        /* may be NULL — caller falls back to filename */
-   const char              *match_value;  /* may be NULL — hex CRC or serial string */
-   enum downplay_match_kind match_kind;
-   enum downplay_art_state  art_state;
+   enum downplay_art_state art_state;
 } downplay_index_record_t;
 
-/* Open (or create) the index for a system folder.
- *
- * system_folder_name is the "Display Name (core_ident)" string used as
- * the JSON filename stem.  system_root_path is the absolute on-disk
- * path of the folder (used to locate ROM files for matching).  db_name
- * is the resolved libretro-thumbnails system name (used to locate the
- * .rdb).  db_name may be NULL/empty: matching is then disabled, but
- * the index still works for art-state caching.
- *
- * Returns NULL on allocation failure or if the index root path can't
- * be resolved. */
+/* Open (or create) the index for a system folder.  `db_name` is
+ * accepted for forward-compatibility (recorded in the JSON for
+ * diagnostics) but no longer drives any matching logic.  Returns NULL
+ * on allocation failure or if the index root path can't be resolved. */
 downplay_index_t *downplay_index_open(const char *system_folder_name,
       const char *system_root_path, const char *db_name);
 
-/* Close the index, flushing any dirty state to disk.  Safe to call with
+/* Close the index, flushing dirty state to disk.  Safe to call with
  * NULL. */
 void downplay_index_close(downplay_index_t *idx);
 
 /* Look up an entry by basename.  Validates against (mtime, size); on
- * mismatch the cached record is invalidated and the entry re-enqueued.
- * Returns true if the entry is known to the index AND the validity
- * check passes; false otherwise (caller renders filename, no art).
- *
- * Pure read; never blocks, never does I/O. */
+ * mismatch returns false (caller treats as UNKNOWN).  Pure read; no
+ * I/O, no blocking. */
 bool downplay_index_lookup(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size,
       downplay_index_record_t *out);
 
-/* Note that an entry exists in the filesystem.  Idempotent.  If the
- * entry is unknown, creates a stub and enqueues it for matching.  If
- * (mtime, size) differs from the cached entry, invalidates and re-
- * enqueues.  Call once per ROM at scan time. */
+/* Note that an entry exists in the filesystem.  Idempotent.  Creates
+ * a stub if unknown; if (mtime, size) differs invalidates the cached
+ * art_state.  Call once per ROM at scan time. */
 void downplay_index_note_present(downplay_index_t *idx,
       const char *basename, time_t mtime, int64_t size);
 
 /* End-of-scan reconciliation: prune any cached entries that weren't
- * note_present()'d this scan.  Marks the index dirty if anything was
- * removed.  Call once after the per-ROM note_present loop. */
+ * note_present()'d this scan.  Call once after the per-ROM
+ * note_present loop. */
 void downplay_index_finish_scan(downplay_index_t *idx);
 
-/* Set the art state for an entry.  Idempotent; marks dirty only if the
- * value actually changed.  Stamps art_checked_at = now() for future
- * "refresh missing art after N days" support. */
+/* Set the art state for an entry.  Idempotent; marks dirty only if
+ * the value actually changed. */
 void downplay_index_set_art_state(downplay_index_t *idx,
       const char *basename, enum downplay_art_state state);
-
-/* Process up to max_ops queued match operations.  Each op:
- *   - dispatches CRC32 or serial extraction by file extension
- *     (mirrors tasks/task_database.c:716 task_database_iterate_playlist)
- *   - opens a cursor on the cached libretrodb handle with a CRC or
- *     serial query (verbatim format from task_database.c:1199-1201,
- *     :1374-1378)
- *   - reads the first matched record's `name` field as the canonical
- *     label
- *
- * Returns the number of ops actually performed (0 when queue empty).
- * Call from the menu driver's per-frame callback with a small budget
- * (1-2 ops/frame at 60fps gives ~10-30 enrichments per second). */
-int downplay_index_pump(downplay_index_t *idx, int max_ops);
 
 /* Force-flush dirty state to disk via atomic temp+rename.  Otherwise
  * auto-flushed on close.  Cheap when clean (no-op). */
 void downplay_index_flush(downplay_index_t *idx);
-
-/* ---------- box-art download ---------- */
-
-/* Asynchronously fetch the boxart PNG for (system, label) from
- * libretro-thumbnails into the user's directory_thumbnails location.
- * No-op if the local file already exists or required state is missing.
- *
- * We have to roll this ourselves because RA's
- * task_push_pl_entry_thumbnail_download hard-requires a playlist_t with
- * a backing config path, and gfx_thumbnail_request_stream's on-demand
- * download path bails when given playlist=NULL (gfx_thumbnail.c:406).
- *
- * Implementation mirrors task_pl_thumbnail_download.c:241-243 (URL
- * format) + :358 (task_push_http_transfer_file) — same wire format,
- * same destination layout, just without the playlist plumbing. */
-void downplay_metadata_request_boxart(const char *system, const char *label);
 
 RETRO_END_DECLS
 

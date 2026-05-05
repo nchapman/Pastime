@@ -4660,9 +4660,6 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
    if (sel >= dp->rom_count)
       sel = dp->rom_count - 1;
 
-   /* Pump the canonical-label resolver (independent of art). */
-   if (dp->current_index)
-      downplay_index_pump(dp->current_index, 2);
    /* Pump the thumbnail manager (drains image queue, reconciles). */
    if (dp->current_thumbs)
       downplay_thumbs_pump(dp->current_thumbs);
