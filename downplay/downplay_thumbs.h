@@ -90,6 +90,19 @@ typedef struct
  * TTL; cheap when cached.  Returns NULL on system==NULL or empty. */
 downplay_thumbs_t *downplay_thumbs_open(const char *system);
 
+/* Boot-time fan-out: queue async index.json fetches for every
+ * canonical system name in `systems` whose on-disk cache is missing
+ * or older than the TTL.  Bounded concurrency; fire-and-forget.
+ *
+ * Indexes simply land on disk for a future `_open` to find.  Per-URL
+ * dedup against any in-flight fetches issued by `_open` — opening a
+ * system whose prefetch is mid-flight does NOT issue a duplicate
+ * fetch; the open's pump-loop discovers the file when it lands.
+ *
+ * Safe with count==0 or systems==NULL. */
+void downplay_thumbs_prefetch_indexes(
+      const char * const *systems, size_t count);
+
 /* Close + free.  Safe with NULL. */
 void downplay_thumbs_close(downplay_thumbs_t *t);
 

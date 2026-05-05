@@ -1580,6 +1580,30 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
    if (sys->db_name && *sys->db_name)
       dp->current_thumbs = downplay_thumbs_open(sys->db_name);
 
+   /* Speculative prefetch: kick off image fetches for the first ~10
+    * rows immediately on system enter, before the user hovers.  By
+    * the time their selection lands on a row, its art is on disk
+    * (or in flight) — eliminates the wait-for-hover latency gate.
+    * Existing _prefetch dedups against in-flight; harmless if the
+    * index isn't ready yet (it will skip with no harm done). */
+   if (dp->current_thumbs && dp->rom_count > 0)
+   {
+      /* names[] borrows pointers into dp->roms[].full_path; valid
+       * because _prefetch consumes them synchronously and does not
+       * retain references after returning. */
+      const char *names[10];
+      size_t      n   = 0;
+      size_t      cap = dp->rom_count < 10 ? dp->rom_count : 10;
+      for (i = 0; i < cap; i++)
+      {
+         const char *b = path_basename(dp->roms[i].full_path);
+         if (b && *b)
+            names[n++] = b;
+      }
+      if (n > 0)
+         downplay_thumbs_prefetch(dp->current_thumbs, names, n);
+   }
+
    dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SYSTEM, NULL, downplay_system_dispose);
 }
 
@@ -5575,6 +5599,30 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
             idents[i] = dp->systems[i].core_ident;
          downplay_setup_plan_boot(idents, dp->system_count);
          free(idents);
+      }
+   }
+
+   /* Boot-time thumbnail-index prefetch (PLAN — first-image-load
+    * optimization).  Fan out async fetches for every installed
+    * system's index.json so that by the time the user navigates
+    * into a system view, downplay_thumbs_open finds a fresh
+    * on-disk index and skips its own HTTP fetch. */
+   if (dp->system_count > 0)
+   {
+      const char **systems = (const char**)malloc(
+            dp->system_count * sizeof(*systems));
+      if (systems)
+      {
+         size_t i, n = 0;
+         for (i = 0; i < dp->system_count; i++)
+         {
+            const char *db = dp->systems[i].db_name;
+            if (db && *db)
+               systems[n++] = db;
+         }
+         if (n > 0)
+            downplay_thumbs_prefetch_indexes(systems, n);
+         free(systems);
       }
    }
 

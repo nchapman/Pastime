@@ -686,7 +686,7 @@ static bool dp_append_entry(downplay_thumbs_index_t *idx,
 
 /* Commit cur_canonical / cur_jpg_size as one or more entries.  Most
  * canonicals produce a single entry.  Canonicals that contain ` _ `
- * (libretro's alt-name separator after &/* / sanitization) are
+ * (libretro's alt-name separator after & or `/` sanitization) are
  * recognised as multi-name bundles like
  *
  *   "F-16 Fighting Falcon _ F-16 Fighter _ F16 Falcon Fighter (USA)"
@@ -1277,6 +1277,29 @@ enum
 
 /* ---- internal: paths ---- */
 
+/* Compute <root>/Thumbs/index/<system>.index.json into `out`.
+ * Single source of truth for the on-disk index location: both
+ * `downplay_thumbs_open` and the boot-time prefetch use this so they
+ * cannot disagree on where the file lives.  Returns false if the
+ * filesystem root can't be resolved. */
+static bool dp_thumbs_index_path(const char *system,
+      char *out, size_t out_size)
+{
+   char root[DP_THUMBS_PATH_MAX];
+   char base[DP_THUMBS_PATH_MAX];
+   char idx_dir[DP_THUMBS_PATH_MAX];
+   char fname[256];
+   if (!system || !*system || !out || out_size == 0)
+      return false;
+   if (!downplay_paths_get_root(root, sizeof(root)))
+      return false;
+   fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
+   fill_pathname_join_special(idx_dir, base, "index", sizeof(idx_dir));
+   snprintf(fname, sizeof(fname), "%s.index.json", system);
+   fill_pathname_join_special(out, idx_dir, fname, out_size);
+   return true;
+}
+
 /* Build the on-disk path for an image of canonical key `canon`.  We
  * use the canonical key verbatim as the filename — it's already the
  * No-Intro safe form (no path separators since it's a No-Intro game
@@ -1754,6 +1777,280 @@ static void dp_drain_queue(downplay_thumbs_t *t)
    t->fetching[t->inflight++] = e_idx;
 }
 
+/* ---- index prefetch (boot-time fan-out) ---------------------------
+ *
+ * Drive a small global queue of <root>/Thumbs/index/<system>.index.json
+ * fetches at app launch, before the user can navigate.  By the time
+ * they enter any system view, the index is already on disk and
+ * `_open` skips its own HTTP call.
+ *
+ * THREADING INVARIANT: every entry below (g_pf_pending, g_pf_inflight,
+ * the count ints, and every helper that touches them) is main-thread
+ * only.  RA's task callbacks fire from `retro_task_internal_gather`,
+ * which is reached only from `task_queue_check`; that in turn is
+ * called from main-thread sites (runloop + menu select-handler).
+ * Both threaded and non-threaded task modes funnel through this one
+ * gather point.  Therefore no locks are required.  If a future
+ * maintainer ever moves task_queue_check off the main thread, this
+ * block needs an slock — the corruption would otherwise be silent. */
+
+#define DP_THUMBS_PF_PENDING_CAP   128
+#define DP_THUMBS_PF_INFLIGHT_MAX  3
+
+static char g_pf_pending[DP_THUMBS_PF_PENDING_CAP][256];
+static int  g_pf_pending_count;
+static bool g_pf_overflow_warned; /* one-shot log when cap is first hit */
+
+static char g_pf_inflight[DP_THUMBS_PF_INFLIGHT_MAX][256];
+static int  g_pf_inflight_count;
+
+/* Subtype of file_transfer_t (must be first member): RA's task API
+ * takes file_transfer_t* and reads .path on completion; we tail-extend
+ * with the canonical system name so the callback can update the
+ * in-flight set without re-parsing the path. */
+typedef struct
+{
+   file_transfer_t base;          /* must be first; .path is the on-disk dest */
+   char            system[256];   /* canonical name; key for inflight set */
+} dp_pf_transfer_t;
+
+static bool dp_pf_inflight_contains(const char *system)
+{
+   int i;
+   if (!system)
+      return false;
+   for (i = 0; i < g_pf_inflight_count; i++)
+   {
+      if (string_is_equal(g_pf_inflight[i], system))
+         return true;
+   }
+   return false;
+}
+
+static bool dp_pf_pending_contains(const char *system)
+{
+   int i;
+   if (!system)
+      return false;
+   for (i = 0; i < g_pf_pending_count; i++)
+   {
+      if (string_is_equal(g_pf_pending[i], system))
+         return true;
+   }
+   return false;
+}
+
+static bool dp_pf_inflight_add(const char *system)
+{
+   if (g_pf_inflight_count >= DP_THUMBS_PF_INFLIGHT_MAX)
+      return false;
+   strlcpy(g_pf_inflight[g_pf_inflight_count], system,
+         sizeof(g_pf_inflight[0]));
+   g_pf_inflight_count++;
+   return true;
+}
+
+static void dp_pf_inflight_remove(const char *system)
+{
+   int i;
+   if (!system)
+      return;
+   for (i = 0; i < g_pf_inflight_count; i++)
+   {
+      if (string_is_equal(g_pf_inflight[i], system))
+      {
+         /* Compact: move last entry into this slot. */
+         g_pf_inflight_count--;
+         if (i != g_pf_inflight_count)
+            strlcpy(g_pf_inflight[i],
+                  g_pf_inflight[g_pf_inflight_count],
+                  sizeof(g_pf_inflight[0]));
+         g_pf_inflight[g_pf_inflight_count][0] = '\0';
+         return;
+      }
+   }
+}
+
+static bool dp_pf_pending_pop(char *out_system, size_t out_size)
+{
+   int i;
+   if (g_pf_pending_count <= 0)
+      return false;
+   strlcpy(out_system, g_pf_pending[0], out_size);
+   for (i = 1; i < g_pf_pending_count; i++)
+      strlcpy(g_pf_pending[i - 1], g_pf_pending[i],
+            sizeof(g_pf_pending[0]));
+   g_pf_pending_count--;
+   g_pf_pending[g_pf_pending_count][0] = '\0';
+   return true;
+}
+
+static void dp_pf_drain(void); /* fwd */
+
+static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
+   dp_pf_transfer_t     *pf   = (dp_pf_transfer_t*)user_data;
+   char                  output_dir[DP_THUMBS_PATH_MAX];
+   char                  tmp_path[DP_THUMBS_PATH_MAX];
+   (void)task;
+
+   if (!pf)
+      return;
+   if (!data || !data->data || !*pf->base.path)
+      goto finish;
+   if (data->status != 200)
+   {
+      err = "non-200";
+      goto finish;
+   }
+   strlcpy(output_dir, pf->base.path, sizeof(output_dir));
+   path_basedir_wrapper(output_dir);
+   if (!path_mkdir(output_dir))
+   {
+      err = "mkdir failed";
+      goto finish;
+   }
+   /* Atomic write: .tmp + rename — consistent with dp_cb_index_download. */
+   snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", pf->base.path);
+   if (!filestream_write_file(tmp_path, data->data, data->len))
+   {
+      err = "write failed";
+      goto finish;
+   }
+#ifdef _WIN32
+   filestream_delete(pf->base.path);
+#endif
+   if (rename(tmp_path, pf->base.path) != 0)
+   {
+      filestream_delete(tmp_path);
+      err = "rename failed";
+      goto finish;
+   }
+
+finish:
+   if (err && *err)
+      RARCH_WARN("[Downplay] thumbs prefetch \"%s\" failed: %s\n",
+            pf->system, err);
+   else
+      RARCH_LOG("[Downplay] thumbs prefetch -> %s\n", pf->base.path);
+   dp_pf_inflight_remove(pf->system);
+   free(pf);
+   dp_pf_drain();
+}
+
+/* Drain the pending queue up to the concurrency cap. */
+static void dp_pf_drain(void)
+{
+   while (g_pf_inflight_count < DP_THUMBS_PF_INFLIGHT_MAX
+         && g_pf_pending_count > 0)
+   {
+      char system[256];
+      char idx_path[DP_THUMBS_PATH_MAX];
+      char raw_url[2048];
+      char url[2048];
+      dp_pf_transfer_t *pf;
+      int64_t age;
+
+      if (!dp_pf_pending_pop(system, sizeof(system)))
+         break;
+
+      /* Re-check freshness right before issuing — the file may have
+       * landed in the window between enqueue and drain (e.g. a user
+       * `_open` raced ahead of us and won). */
+      if (!dp_thumbs_index_path(system, idx_path, sizeof(idx_path)))
+         continue;
+      age = dp_index_age_seconds(idx_path);
+      if (age >= 0 && age < DP_THUMBS_INDEX_TTL_SEC)
+         continue;
+      if (dp_pf_inflight_contains(system))
+         continue;
+
+      snprintf(raw_url, sizeof(raw_url),
+            "%s/%s/Named_Boxarts/index.json",
+            DP_THUMBS_BASE_URL, system);
+      net_http_urlencode_full(url, raw_url, sizeof(url));
+      if (!*url)
+         continue;
+
+      pf = (dp_pf_transfer_t*)calloc(1, sizeof(*pf));
+      if (!pf)
+         continue;
+      pf->base.enum_idx = MSG_UNKNOWN;
+      strlcpy(pf->base.path, idx_path, sizeof(pf->base.path));
+      strlcpy(pf->system,    system,   sizeof(pf->system));
+
+      if (!dp_pf_inflight_add(system))
+      {
+         free(pf);
+         continue;
+      }
+      RARCH_LOG("[Downplay] thumbs prefetch fetch: %s\n", url);
+      if (!task_push_http_transfer_file(url, true /* mute */, NULL,
+               dp_cb_pf_index_download, &pf->base))
+      {
+         RARCH_WARN("[Downplay] thumbs prefetch task push failed: %s\n",
+               url);
+         dp_pf_inflight_remove(system);
+         free(pf);
+      }
+   }
+}
+
+void downplay_thumbs_prefetch_indexes(
+      const char * const *systems, size_t count)
+{
+   size_t i;
+   if (!systems || !count)
+      return;
+   for (i = 0; i < count; i++)
+   {
+      const char *system = systems[i];
+      char idx_path[DP_THUMBS_PATH_MAX];
+      int64_t age;
+
+      if (!system || !*system)
+         continue;
+      /* Path-escape: same rules as downplay_thumbs_open. */
+      if (   strstr(system, "..")
+          || strchr(system, '/')
+          || strchr(system, '\\'))
+         continue;
+      /* Bound: must fit our fixed-size slot. */
+      if (strlen(system) >= sizeof(g_pf_pending[0]))
+         continue;
+      /* Skip if fresh on disk. */
+      if (!dp_thumbs_index_path(system, idx_path, sizeof(idx_path)))
+         continue;
+      age = dp_index_age_seconds(idx_path);
+      if (age >= 0 && age < DP_THUMBS_INDEX_TTL_SEC)
+         continue;
+      /* Skip if already in flight or already queued. */
+      if (dp_pf_inflight_contains(system))
+         continue;
+      if (dp_pf_pending_contains(system))
+         continue;
+      if (g_pf_pending_count >= DP_THUMBS_PF_PENDING_CAP)
+      {
+         /* Capacity is generous (128 systems); a hit means something
+          * unusual.  Warn once so we have a bread crumb in logcat. */
+         if (!g_pf_overflow_warned)
+         {
+            RARCH_WARN("[Downplay] thumbs prefetch queue full at %d; "
+                  "remaining systems will not be prefetched\n",
+                  DP_THUMBS_PF_PENDING_CAP);
+            g_pf_overflow_warned = true;
+         }
+         continue;
+      }
+      strlcpy(g_pf_pending[g_pf_pending_count], system,
+            sizeof(g_pf_pending[0]));
+      g_pf_pending_count++;
+   }
+   dp_pf_drain();
+}
+
 /* ---- public manager API ---- */
 
 downplay_thumbs_t *downplay_thumbs_open(const char *system)
@@ -1783,14 +2080,12 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
 
    /* <root>/Thumbs/ */
    fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
-   /* <root>/Thumbs/index/<system>.index.json */
+   /* <root>/Thumbs/index/<system>.index.json — via shared helper so
+    * boot-time prefetch and per-system open agree on the location. */
+   if (!dp_thumbs_index_path(system, t->idx_path, sizeof(t->idx_path)))
    {
-      char idx_dir[DP_THUMBS_PATH_MAX];
-      char fname[256];
-      fill_pathname_join_special(idx_dir, base, "index", sizeof(idx_dir));
-      snprintf(fname, sizeof(fname), "%s.index.json", system);
-      fill_pathname_join_special(t->idx_path, idx_dir, fname,
-            sizeof(t->idx_path));
+      free(t);
+      return NULL;
    }
    /* <root>/Thumbs/<system>/ */
    fill_pathname_join_special(t->cache_dir, base, system,
@@ -1812,7 +2107,13 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
       }
    }
    t->load_state = DP_LOAD_FETCHING;
-   dp_kick_index_fetch(t);
+   /* Suppress duplicate HTTP work if a boot-time prefetch is already
+    * in flight OR queued for this system; the per-frame pump in
+    * _request / _pump will pick up the file when it lands.  Pending
+    * matters here because the user can navigate before dp_pf_drain
+    * has had a chance to promote the entry to inflight. */
+   if (!dp_pf_inflight_contains(system) && !dp_pf_pending_contains(system))
+      dp_kick_index_fetch(t);
    return t;
 }
 
@@ -1968,5 +2269,8 @@ void downplay_thumbs_prefetch(downplay_thumbs_t *t,
       const char * const *basenames, size_t count)
 { (void)t; (void)basenames; (void)count; }
 void downplay_thumbs_pump(downplay_thumbs_t *t) { (void)t; }
+void downplay_thumbs_prefetch_indexes(
+      const char * const *systems, size_t count)
+{ (void)systems; (void)count; }
 
 #endif /* DOWNPLAY_THUMBS_TEST_BUILD */
