@@ -742,19 +742,35 @@ static bool pastime_parse_system_folder(const char *folder,
 
    if (ident_len > 4 && strncmp(ident, "ext-", 4) == 0)
    {
-      const char *pkg = NULL;
+      const char *payload = NULL;
       is_external = true;
-      if (!pastime_external_parse_marker(ident, &pkg))
+      if (!pastime_external_parse_marker(ident, &payload))
       {
          RARCH_WARN("[Pastime] malformed ext- marker in folder '%s'\n",
                folder);
          free(ident);
          return false;
       }
-      if (!(spec = pastime_external_lookup(pkg)))
+      /* Dispatch on form: full package (contains '.') vs shortname.
+       * Both lookups are O(N) over the ~94-entry preset table; cheap. */
+      spec = pastime_external_payload_is_shortname(payload)
+         ? pastime_external_lookup_shortname(payload)
+         : pastime_external_lookup(payload);
+      if (!spec)
       {
-         RARCH_WARN("[Pastime] external emulator package '%s' is not in "
-               "the preset table; hiding folder '%s'\n", pkg, folder);
+         RARCH_WARN("[Pastime] external emulator '%s' is not in the "
+               "preset table; hiding folder '%s'\n", payload, folder);
+         free(ident);
+         return false;
+      }
+      /* Hide when the resolved app isn't installed — matches the
+       * libretro-folder convention (folders whose core isn't available
+       * stay hidden, no broken-row UX).  Desktop / test stub returns
+       * true so external folders stay visible for development. */
+      if (!pastime_external_is_installed(spec->package))
+      {
+         RARCH_LOG("[Pastime] external app '%s' not installed; hiding "
+               "folder '%s'\n", spec->package, folder);
          free(ident);
          return false;
       }

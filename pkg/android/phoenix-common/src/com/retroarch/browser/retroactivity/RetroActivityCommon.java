@@ -1274,4 +1274,30 @@ public class RetroActivityCommon extends NativeActivity
     android.widget.Toast.makeText(this, msg,
         android.widget.Toast.LENGTH_SHORT).show();
   }
+
+  /* PASTIME: package-installed check called from
+   * pastime_external_android.c per external folder during menu list
+   * build.  Same JNI signature pattern as pastimeLaunchExternal — sync
+   * call, returns boolean.
+   *
+   * Used by the menu driver to hide system folders whose external app
+   * the user hasn't installed (parallels libretro folders that hide
+   * when their core isn't on the buildbot).  Cheap: getPackageInfo is
+   * a single binder hop and we only call it once per external folder
+   * at startup. */
+  public boolean pastimeIsPackageInstalled(String pkg) {
+    if (pkg == null || pkg.isEmpty()) return false;
+    try {
+      getPackageManager().getPackageInfo(pkg, 0);
+      return true;
+    } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+      return false;
+    } catch (Exception e) {
+      /* Defensive: any other PackageManager exception (Dead-PM,
+       * security, etc.) is treated as "not installed" so the folder
+       * is hidden rather than presented as a row that can't launch. */
+      Log.w("Pastime", "pastimeIsPackageInstalled(" + pkg + ") failed: " + e);
+      return false;
+    }
+  }
 }

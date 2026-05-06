@@ -27,6 +27,32 @@ API = "https://api.github.com/repos/" + REPO
 
 OUT_PATH = Path(__file__).resolve().parent.parent / "pastime_external_presets.h"
 
+# Hand-curated shortname overrides.  Daijishou's `name` field for some
+# packages is just the package name itself ("atomiswave - com.flycast.emulator")
+# rather than the human app name, which would generate a noisy shortname
+# like `comflycastemulator`.  Map by package -> preferred shortname; the
+# sync script logs whenever an override is applied so we can spot when an
+# upstream JSON cleanup makes the override redundant.  Only add packages
+# the user is realistically going to type — long-tail emulators can keep
+# the noisy default until someone files a request.
+SHORTNAME_OVERRIDES = {
+    "com.flycast.emulator":            "flycast",
+    "io.recompiled.redream":           "redream",
+    "com.seleuco.mame4droid":          "mame4droid",
+    "org.mupen64plusae.v3.alpha":      "mupen64plus",
+    "org.mupen64plusae.v3.fzurita":    "mupen64plusfz",
+    "com.PceEmu":                      "pceemu",
+    "com.fastemulator.gba":            "myboy",       # FastEmulator's GBA app
+    "com.fastemulator.gbc":            "mygbc",
+    "com.explusalpha.GbaEmu":          "gbaemu",
+    "com.explusalpha.GbcEmu":          "gbcemu",
+    "com.explusalpha.LynxEmu":         "lynxemu",
+    "com.explusalpha.MdEmu":           "mdemu",
+    "com.explusalpha.NesEmu":          "nesemu",
+    "com.explusalpha.Snes9xPlus":      "snes9xplus",
+    "com.explusalpha.SwanEmu":         "swanemu",
+}
+
 
 def fetch(url: str) -> bytes:
     with urllib.request.urlopen(url, timeout=30) as r:
@@ -156,17 +182,37 @@ def is_retroarch_player(unique_id: str, component: str) -> bool:
     return False
 
 
+def derive_shortname(name: str) -> str:
+    """Daijishou's `name` field is structured as "<platform-prefix> - <App>"
+    (e.g. "psx - Duckstation", "gba - Skyemu", "n64 - Mupen64Plus FZ").
+    The user-facing shortname should be just the app side, so we split on
+    " - " and take the rightmost segment, then sanitize to [a-z0-9]+.
+
+    Naturally distinguishes free-vs-paid SKUs ("ppsspp" vs "ppssppgold")
+    and handles odd capitalisation ("ePSXe" → "epsxe").  The full catalog
+    (94 deduped entries today) yields zero collisions; the sync script
+    warns if a future regen introduces one.
+    """
+    if not name:
+        return ""
+    # rsplit handles "name - with - dashes - in - app - name" by always
+    # taking the last segment, which is the most specific.
+    app = name.rsplit(" - ", 1)[-1]
+    return re.sub(r"[^a-z0-9]", "", app.lower())
+
+
 def collect_presets(sha: str) -> tuple[list[dict], dict]:
     files = list_platform_files(sha)
     presets: dict[str, dict] = {}  # package → spec
     skipped = {"retroarch": 0, "raw_path_or_bool": 0, "no_package": 0,
-               "duplicate": 0}
+               "duplicate": 0, "no_shortname": 0}
 
     for fname in files:
         platform_data = fetch_json(f"{RAW}/{sha}/platforms/{fname}")
         for player in platform_data.get("playerList", []):
             unique_id = player.get("uniqueId", "")
             am_args = player.get("amStartArguments", "")
+            name = player.get("name", "")
 
             parsed = parse_am_args(am_args)
             if not parsed:
@@ -181,8 +227,16 @@ def collect_presets(sha: str) -> tuple[list[dict], dict]:
                 skipped["no_package"] += 1
                 continue
 
+            shortname = SHORTNAME_OVERRIDES.get(pkg) or derive_shortname(name)
+            if not shortname:
+                # No name in the JSON, or only non-alphanumerics; falling
+                # back to the full-package marker is fine, just lose the
+                # readable form.
+                skipped["no_shortname"] += 1
+
             spec = {
                 "package":    pkg,
+                "shortname":  shortname or None,
                 "component":  normalize_component(parsed["component"], pkg),
                 "action":     parsed["action"],
                 "category":   parsed["category"],
@@ -193,12 +247,52 @@ def collect_presets(sha: str) -> tuple[list[dict], dict]:
             }
 
             if pkg in presets:
-                # First-occurrence wins; alphabetical platform order makes it
-                # deterministic. Conflicts are rare and almost always cosmetic
-                # (MAIN vs VIEW with the same extras).
-                skipped["duplicate"] += 1
+                # Prefer the candidate with a cleaner shortname.
+                # Daijishou's per-platform entries vary in quality —
+                # "atomiswave - com.flycast.emulator" yields the noisy
+                # shortname `comflycastemulator` while
+                # "dreamcast - Flycast" yields the clean `flycast`.
+                # Tie-breaker: shorter shortname wins (flycast < comflycastemulator).
+                # Only matters when both candidates are shortname-bearing.
+                cur = presets[pkg]
+                cur_sn = cur.get("shortname") or ""
+                new_sn = spec.get("shortname") or ""
+                cur_is_pkg = cur_sn == re.sub(r"[^a-z0-9]", "", pkg.lower())
+                new_is_pkg = new_sn == re.sub(r"[^a-z0-9]", "", pkg.lower())
+                better = False
+                if new_sn and not cur_sn:
+                    better = True
+                elif new_sn and cur_is_pkg and not new_is_pkg:
+                    # Current shortname is just the sanitised package
+                    # (the noisy form); new one is something cleaner.
+                    better = True
+                elif new_sn and cur_sn and not cur_is_pkg and not new_is_pkg \
+                        and len(new_sn) < len(cur_sn):
+                    # Both are "clean", prefer shorter (more memorable).
+                    better = True
+                if better:
+                    presets[pkg] = spec
+                else:
+                    skipped["duplicate"] += 1
                 continue
             presets[pkg] = spec
+
+    # Shortname collision check.  Today (with 94 deduped presets) this should
+    # report zero; if a future sync introduces a duplicate the warning lets us
+    # decide whether to disambiguate at sync time or to add runtime install-
+    # check fallback in the C lookup.
+    by_shortname: dict[str, list[str]] = {}
+    for spec in presets.values():
+        sn = spec["shortname"]
+        if sn:
+            by_shortname.setdefault(sn, []).append(spec["package"])
+    collisions = {k: v for k, v in by_shortname.items() if len(v) > 1}
+    if collisions:
+        print(f"WARNING: {len(collisions)} shortname collision(s) — "
+              f"users typing one of these will get the first-listed package; "
+              f"consider hand-curating an alias override.", file=sys.stderr)
+        for sn, pkgs in sorted(collisions.items()):
+            print(f"  {sn!r}: {pkgs}", file=sys.stderr)
 
     return list(presets.values()), skipped
 
@@ -219,6 +313,7 @@ def emit_header(presets: list[dict], sha: str, skipped: dict) -> str:
         rows.append(
             f"   {{  /* {p['_source']} */\n"
             f"      {c_str(p['package'])},\n"
+            f"      {c_str(p['shortname'])},\n"
             f"      {c_str(p['component'])},\n"
             f"      {c_str(p['action'])},\n"
             f"      {c_str(p['category'])},\n"
@@ -239,7 +334,8 @@ def emit_header(presets: list[dict], sha: str, skipped: dict) -> str:
         f" * Filtered:  {skipped['retroarch']} RetroArch players,\n"
         f" *            {skipped['raw_path_or_bool']} raw-path/bool-extra entries,\n"
         f" *            {skipped['no_package']} malformed,\n"
-        f" *            {skipped['duplicate']} package duplicates.\n"
+        f" *            {skipped['duplicate']} package duplicates,\n"
+        f" *            {skipped['no_shortname']} without a derivable shortname.\n"
         f" * Kept:      {len(presets_sorted)} entries.\n"
         " *\n"
         " * Daijishou is MIT-licensed (Copyright (c) 2022 TapiocaFox / Yves Chen).\n"

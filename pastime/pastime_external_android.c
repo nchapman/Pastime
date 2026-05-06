@@ -42,9 +42,14 @@ extern jobject pastime_jni_get_activity_clazz(void);
    "Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;" \
    "ZLjava/lang/String;)V"
 
+#define PASTIME_INSTALLED_METHOD_NAME "pastimeIsPackageInstalled"
+#define PASTIME_INSTALLED_METHOD_SIG  "(Ljava/lang/String;)Z"
+
 static jmethodID g_method_id;     /* cached after first successful resolve */
 static bool      g_method_missing; /* true means stop trying — Java side
                                     * doesn't define the helper */
+static jmethodID g_installed_id;
+static bool      g_installed_missing;
 
 /* Helper: build a jstring or NULL, since CallVoidMethod accepts NULL
  * for object args and the Java side checks for null per field.
@@ -158,4 +163,62 @@ cleanup:
     * (package not installed, etc.) as a Toast, so the menu driver no
     * longer needs to. */
    return posted;
+}
+
+/* Synchronous install-check.  Called per external folder during menu
+ * list build, so it has to be cheap — no UI hop, no Toast, just a JNI
+ * round-trip to PackageManager.getPackageInfo (catch-NameNotFound).
+ * Returns false on any failure path (missing helper, JNI error, OOM)
+ * which conservatively *hides* the folder.  That matches the libretro
+ * convention: when in doubt, hide rather than show a broken row. */
+bool pastime_external_android_is_installed(const char *package)
+{
+   JNIEnv  *env;
+   jobject  activity;
+   jclass   activity_class;
+   jstring  j_pkg = NULL;
+   jboolean result = JNI_FALSE;
+
+   if (!package || !*package)
+      return false;
+   if (g_installed_missing)
+      return false;
+   if (!(activity = pastime_jni_get_activity_clazz()))
+      return false;
+   if (!(env = jni_thread_getenv()))
+      return false;
+
+   if (!g_installed_id)
+   {
+      activity_class = (*env)->GetObjectClass(env, activity);
+      if (!activity_class)
+         return false;
+      g_installed_id = (*env)->GetMethodID(env, activity_class,
+            PASTIME_INSTALLED_METHOD_NAME, PASTIME_INSTALLED_METHOD_SIG);
+      (*env)->DeleteLocalRef(env, activity_class);
+      if (!g_installed_id)
+      {
+         if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+         g_installed_missing = true;
+         RARCH_ERR("[Pastime] Java helper "
+               PASTIME_INSTALLED_METHOD_NAME " not found on the activity "
+               "(stale APK?). External folders will be hidden.\n");
+         return false;
+      }
+   }
+
+   if (!make_jstring_checked(env, package, &j_pkg))
+      return false;
+
+   result = (*env)->CallBooleanMethod(env, activity, g_installed_id, j_pkg);
+   if ((*env)->ExceptionCheck(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+      result = JNI_FALSE;
+   }
+
+   (*env)->DeleteLocalRef(env, j_pkg);
+   return result == JNI_TRUE;
 }

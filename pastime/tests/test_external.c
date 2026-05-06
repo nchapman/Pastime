@@ -70,6 +70,7 @@ static void test_parse_marker_accepts_well_formed_packages(void)
    const char *out = NULL;
    ASSERT_TRUE(pastime_external_parse_marker("ext-com.flycast.emulator", &out));
    ASSERT_STREQ(out, "com.flycast.emulator");
+   ASSERT_FALSE(pastime_external_payload_is_shortname(out));
 
    out = NULL;
    ASSERT_TRUE(pastime_external_parse_marker("ext-org.dolphinemu.dolphinemu",
@@ -81,6 +82,33 @@ static void test_parse_marker_accepts_well_formed_packages(void)
    ASSERT_TRUE(pastime_external_parse_marker("ext-io.github.Lime3DS_v2.app",
          &out));
    ASSERT_STREQ(out, "io.github.Lime3DS_v2.app");
+}
+
+static void test_parse_marker_accepts_shortnames(void)
+{
+   const char *out = NULL;
+   ASSERT_TRUE(pastime_external_parse_marker("ext-duckstation", &out));
+   ASSERT_STREQ(out, "duckstation");
+   ASSERT_TRUE(pastime_external_payload_is_shortname(out));
+
+   out = NULL;
+   ASSERT_TRUE(pastime_external_parse_marker("ext-ppssppgold", &out));
+   ASSERT_STREQ(out, "ppssppgold");
+   ASSERT_TRUE(pastime_external_payload_is_shortname(out));
+
+   /* Digits in shortname (e.g. aethersx2). */
+   out = NULL;
+   ASSERT_TRUE(pastime_external_parse_marker("ext-aethersx2", &out));
+   ASSERT_STREQ(out, "aethersx2");
+}
+
+static void test_parse_marker_rejects_uppercase_shortnames(void)
+{
+   /* Shortnames are always lowercased at sync time; mixed-case dotless
+    * input is a parse error to fail fast rather than silently miss. */
+   const char *out = NULL;
+   ASSERT_FALSE(pastime_external_parse_marker("ext-DuckStation", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-Flycast", &out));
 }
 
 static void test_parse_marker_rejects_non_ext_prefix(void)
@@ -100,12 +128,19 @@ static void test_parse_marker_rejects_non_ext_prefix(void)
    ASSERT_FALSE(pastime_external_parse_marker(NULL, &out));
 }
 
-static void test_parse_marker_requires_dot(void)
+static void test_parse_marker_shortname_alphabet(void)
 {
    const char *out = NULL;
-   /* Single-segment "package" is a libretro-style ident, not an Android
-    * package — caller must fall through to the existing parser. */
-   ASSERT_FALSE(pastime_external_parse_marker("ext-standalone", &out));
+   /* Bare lowercase alphanumerics parse as shortnames now (lookup may
+    * miss; that's the next layer's problem). */
+   ASSERT_TRUE(pastime_external_parse_marker("ext-standalone", &out));
+   ASSERT_STREQ(out, "standalone");
+   ASSERT_TRUE(pastime_external_payload_is_shortname(out));
+
+   /* Underscore is only valid inside a full package (which requires a
+    * dot); a dotless underscore-bearing token is rejected to match the
+    * sync script's strict [a-z0-9] shortname output. */
+   out = NULL;
    ASSERT_FALSE(pastime_external_parse_marker("ext-nodot_here", &out));
 }
 
@@ -155,6 +190,44 @@ static void test_lookup_is_case_sensitive(void)
     * with a wrong-cased package should miss rather than silently match. */
    ASSERT_TRUE(pastime_external_lookup("COM.FLYCAST.EMULATOR") == NULL);
    ASSERT_TRUE(pastime_external_lookup("Com.Flycast.Emulator") == NULL);
+}
+
+static void test_lookup_shortname_resolves_curated_overrides(void)
+{
+   /* Shortnames the user is realistically going to type — these are
+    * either auto-derived from Daijishou's `name` or hand-curated in the
+    * sync-script override map.  If a sync regen ever drops one of these,
+    * the test fails and we notice before shipping. */
+   const pastime_external_spec_t *s;
+
+   s = pastime_external_lookup_shortname("duckstation");
+   ASSERT_TRUE(s != NULL);
+   if (s) ASSERT_STREQ(s->package, "com.github.stenzek.duckstation");
+
+   s = pastime_external_lookup_shortname("flycast");
+   ASSERT_TRUE(s != NULL);
+   if (s) ASSERT_STREQ(s->package, "com.flycast.emulator");
+
+   s = pastime_external_lookup_shortname("dolphin");
+   ASSERT_TRUE(s != NULL);
+   if (s) ASSERT_STREQ(s->package, "org.dolphinemu.dolphinemu");
+
+   s = pastime_external_lookup_shortname("ppsspp");
+   ASSERT_TRUE(s != NULL);
+   if (s) ASSERT_STREQ(s->package, "org.ppsspp.ppsspp");
+
+   s = pastime_external_lookup_shortname("ppssppgold");
+   ASSERT_TRUE(s != NULL);
+   if (s) ASSERT_STREQ(s->package, "org.ppsspp.ppssppgold");
+}
+
+static void test_lookup_shortname_misses(void)
+{
+   ASSERT_TRUE(pastime_external_lookup_shortname("nopesuchapp") == NULL);
+   ASSERT_TRUE(pastime_external_lookup_shortname("") == NULL);
+   ASSERT_TRUE(pastime_external_lookup_shortname(NULL) == NULL);
+   /* Case-sensitive — sync emits lowercase exclusively. */
+   ASSERT_TRUE(pastime_external_lookup_shortname("DuckStation") == NULL);
 }
 
 static void test_preset_fields_are_populated(void)
@@ -212,13 +285,17 @@ static void test_launch_validates_inputs(void)
 int main(void)
 {
    RUN_TEST(test_parse_marker_accepts_well_formed_packages);
+   RUN_TEST(test_parse_marker_accepts_shortnames);
+   RUN_TEST(test_parse_marker_rejects_uppercase_shortnames);
    RUN_TEST(test_parse_marker_rejects_non_ext_prefix);
-   RUN_TEST(test_parse_marker_requires_dot);
+   RUN_TEST(test_parse_marker_shortname_alphabet);
    RUN_TEST(test_parse_marker_rejects_bad_chars);
    RUN_TEST(test_parse_marker_rejects_empty_payload);
    RUN_TEST(test_lookup_finds_known_packages);
    RUN_TEST(test_lookup_misses_return_null);
    RUN_TEST(test_lookup_is_case_sensitive);
+   RUN_TEST(test_lookup_shortname_resolves_curated_overrides);
+   RUN_TEST(test_lookup_shortname_misses);
    RUN_TEST(test_preset_fields_are_populated);
 #ifndef ANDROID
    RUN_TEST(test_launch_is_noop_on_desktop);

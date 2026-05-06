@@ -22,19 +22,23 @@ extern void pastime_external_test_log(const char *fmt, ...);
 /* Real device: dispatch to the JNI bridge in pastime_external_android.c. */
 extern bool pastime_external_android_launch(
       const pastime_external_spec_t *spec, const char *rom_path);
+extern bool pastime_external_android_is_installed(const char *package);
 #endif
 
 bool pastime_external_parse_marker(const char *inside_parens,
-      const char **package_out)
+      const char **payload_out)
 {
-   const char *pkg;
+   const char *payload;
    bool        has_dot = false;
+   bool        has_upper = false;
    size_t      i;
    size_t      len;
 
    if (!inside_parens)
       return false;
-   /* Marker form: "ext-<package>".  Dash specifically because:
+   /* Marker form: "ext-<payload>" where <payload> is either a full
+    * Android package ("com.github.stenzek.duckstation") or a shortname
+    * ("duckstation").  Dash specifically because:
     *   - colon is illegal on exFAT/FAT32 (the universal SD card formats
     *     and the way users will stage portable libraries from a desktop)
     *   - tilde is shell-expansion-prone and ugly in folder names
@@ -48,30 +52,56 @@ bool pastime_external_parse_marker(const char *inside_parens,
     * a folder rename. */
    if (strncmp(inside_parens, "ext-", 4) != 0)
       return false;
-   pkg = inside_parens + 4;
-   len = strlen(pkg);
+   payload = inside_parens + 4;
+   len = strlen(payload);
    if (len == 0)
       return false;
 
-   /* Android package names are dot-separated Java identifiers — the
-    * conservative subset we need to accept here is [A-Za-z0-9._]+ with
-    * at least one dot.  We don't enforce the per-segment "starts with
-    * a letter" rule; preset lookup is the real guardrail. */
+   /* Validate as the union of the two accepted alphabets:
+    *   - full package: [A-Za-z0-9._]+ with at least one '.'
+    *   - shortname:    [a-z0-9]+ with no '.'
+    * Two-pass: first sweep classifies the chars and detects any '.',
+    * then re-validates the body against the chosen alphabet.  Strict
+    * shortname alphabet matches what the sync script actually emits
+    * (`re.sub('[^a-z0-9]','', ...)`), so a folder like
+    * `(ext-nodot_here)` fails parse rather than silently looking up an
+    * impossible shortname. */
    for (i = 0; i < len; i++)
    {
-      char c = pkg[i];
+      char c = payload[i];
       if (c == '.')
          has_dot = true;
-      else if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+      else if (c >= 'A' && c <= 'Z')
+         has_upper = true;
+      else if (!((c >= 'a' && c <= 'z')
               || (c >= '0' && c <= '9') || c == '_'))
          return false;
    }
    if (!has_dot)
-      return false;
+   {
+      /* Shortname form: strict [a-z0-9]+, no upper, no underscore. */
+      if (has_upper)
+         return false;
+      for (i = 0; i < len; i++)
+      {
+         if (payload[i] == '_')
+            return false;
+      }
+   }
 
-   if (package_out)
-      *package_out = pkg;
+   if (payload_out)
+      *payload_out = payload;
    return true;
+}
+
+bool pastime_external_payload_is_shortname(const char *payload)
+{
+   if (!payload)
+      return false;
+   /* The parser already guarantees: dot iff full package, no dot iff
+    * shortname.  This is a O(len) check called once per folder so it's
+    * fine; would be worth caching if it ever showed up in a profile. */
+   return strchr(payload, '.') == NULL;
 }
 
 const pastime_external_spec_t *pastime_external_lookup(const char *package)
@@ -86,6 +116,36 @@ const pastime_external_spec_t *pastime_external_lookup(const char *package)
          return &pastime_external_presets[i];
    }
    return NULL;
+}
+
+const pastime_external_spec_t *pastime_external_lookup_shortname(
+      const char *shortname)
+{
+   size_t i;
+
+   if (!shortname)
+      return NULL;
+   for (i = 0; i < pastime_external_presets_count; i++)
+   {
+      const char *sn = pastime_external_presets[i].shortname;
+      if (sn && strcmp(sn, shortname) == 0)
+         return &pastime_external_presets[i];
+   }
+   return NULL;
+}
+
+bool pastime_external_is_installed(const char *package)
+{
+   if (!package || !*package)
+      return false;
+#if defined(ANDROID) && !defined(PASTIME_EXTERNAL_TEST_BUILD)
+   return pastime_external_android_is_installed(package);
+#else
+   /* Desktop / test build: pretend everything's installed so external
+    * folders stay visible for development.  Real launches are still
+    * a no-op (handled in pastime_external_launch). */
+   return true;
+#endif
 }
 
 bool pastime_external_launch(const pastime_external_spec_t *spec,
