@@ -944,7 +944,7 @@ static pastime_rom_t *pastime_scan_roms(const char *system_path,
       fill_pathname_base(base, full, sizeof(base));
       if (!*base || base[0] == '.')
          continue;
-      path_remove_extension(base);
+      pastime_display_name_strip_rom_extension(base);
       if (!*base)
          continue;
 
@@ -1106,7 +1106,7 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
       else if (entry->path && *entry->path)
       {
          fill_pathname_base(buf, entry->path, sizeof(buf));
-         path_remove_extension(buf);
+         pastime_display_name_strip_rom_extension(buf);
          if (!*buf)
             continue;
          src = buf;
@@ -2438,7 +2438,7 @@ static void pastime_draw_title_pill(gfx_display_t *p_disp, void *userdata,
    if (!content || !*content)
       return;
    fill_pathname_base(title, content, sizeof(title));
-   path_remove_extension(title);
+   pastime_display_name_strip_rom_extension(title);
    if (!*title)
       return;
    /* Same cleanup as the system list rows: strip "(USA) (Rev 1) [!]"

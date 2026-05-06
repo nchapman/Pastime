@@ -19,9 +19,14 @@
 #include <string.h>
 
 #include <features/features_cpu.h>
+#include <file/archive_file.h>
+#include <file/file_path.h>
+#include <streams/file_stream.h>
 
 #include "pastime_cores.h"
+#include "pastime_cores_extras.h"
 
+#include "../command.h"
 #include "../core_info.h"
 #include "../core_updater_list.h"
 #include "../configuration.h"
@@ -122,6 +127,196 @@ static const core_updater_list_entry_t *pastime_cores_find_entry(
 static void pastime_cores_install_done_cb(retro_task_t *task,
       void *task_data, void *user_data, const char *err);
 
+/* ---------- extras (non-buildbot) install path ---------- */
+
+/* Build "<archive>#<inner>" — the path-with-fragment form that
+ * file_archive_compressed_read uses to address a single zip entry. */
+static void pastime_cores_extras_join_inner(char *out, size_t out_len,
+      const char *archive, const char *inner)
+{
+   size_t n = strlcpy(out, archive, out_len);
+   if (n + 1 < out_len)
+   {
+      out[n] = '#';
+      strlcpy(out + n + 1, inner, out_len - n - 1);
+   }
+}
+
+/* Pull one entry out of an on-disk zip and write it to dest_path under
+ * its canonical name.  Returns true on success. */
+static bool pastime_cores_extras_extract_one(const char *archive_path,
+      const char *inner_path, const char *dest_path)
+{
+   char    addr[PATH_MAX_LENGTH];
+   void   *buf = NULL;
+   int64_t len = 0;
+   bool    ok;
+
+   pastime_cores_extras_join_inner(addr, sizeof(addr),
+         archive_path, inner_path);
+   if (!file_archive_compressed_read(addr, &buf, NULL, &len) || !buf
+         || len <= 0)
+   {
+      RARCH_WARN("[Pastime] extras: extract failed for %s\n", inner_path);
+      if (buf)
+         free(buf);
+      return false;
+   }
+
+   /* Ensure parent dir exists.  path_basedir mutates its buffer. */
+   {
+      char parent[PATH_MAX_LENGTH];
+      strlcpy(parent, dest_path, sizeof(parent));
+      path_basedir_wrapper(parent);
+      if (*parent && !path_is_directory(parent) && !path_mkdir(parent))
+      {
+         RARCH_WARN("[Pastime] extras: mkdir failed: %s\n", parent);
+         free(buf);
+         return false;
+      }
+   }
+
+   ok = filestream_write_file(dest_path, buf, (int64_t)len);
+   free(buf);
+   if (!ok)
+      RARCH_WARN("[Pastime] extras: write failed: %s\n", dest_path);
+   return ok;
+}
+
+/* http callback for an extras zip download.  Stages the zip to disk,
+ * extracts the .so + .info under their canonical names, refreshes core
+ * info, then advances the install queue.  user_data is the static
+ * extras-table entry pointer (no lifetime concerns).
+ *
+ * On any failure we still advance — same policy as the buildbot path
+ * (lazy launch fallback retries individual missing cores later). */
+static void pastime_cores_extras_http_cb(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   const pastime_cores_extra_t *extra =
+         (const pastime_cores_extra_t*)user_data;
+   http_transfer_data_t        *data  = (http_transfer_data_t*)task_data;
+   settings_t                  *settings = config_get_ptr();
+   char                         tmp_zip[PATH_MAX_LENGTH];
+   char                         dest_so[PATH_MAX_LENGTH];
+   char                         dest_info[PATH_MAX_LENGTH];
+   char                         tmp_basename[256];
+   char                         so_basename[256];
+   char                         info_basename[256];
+   bool                         have_zip = false;
+   bool                         install_ok = false;
+
+   (void)task;
+
+   if (!extra || !settings)
+      goto advance;
+
+   if (g_state.cancelled)
+      goto advance;
+
+   if (err && *err)
+   {
+      RARCH_WARN("[Pastime] extras http failed for %s: %s\n",
+            extra->ident, err);
+      goto advance;
+   }
+   if (!data || !data->data || data->len <= 0)
+   {
+      RARCH_WARN("[Pastime] extras http empty for %s\n", extra->ident);
+      goto advance;
+   }
+   if (!settings->paths.directory_libretro[0]
+         || !settings->paths.path_libretro_info[0])
+   {
+      RARCH_WARN("[Pastime] extras: core dirs unset; skipping %s\n",
+            extra->ident);
+      goto advance;
+   }
+
+   /* Stage the zip in directory_libretro under a per-ident temp name.
+    * Same dir as the eventual .so, so any leftover after a crash sits
+    * next to the install and is easy to spot. */
+   snprintf(tmp_basename, sizeof(tmp_basename),
+         "%s_libretro.tmp.zip", extra->ident);
+   fill_pathname_join_special(tmp_zip,
+         settings->paths.directory_libretro, tmp_basename, sizeof(tmp_zip));
+
+   if (!path_is_directory(settings->paths.directory_libretro)
+         && !path_mkdir(settings->paths.directory_libretro))
+   {
+      RARCH_WARN("[Pastime] extras: libretro dir missing: %s\n",
+            settings->paths.directory_libretro);
+      goto advance;
+   }
+   if (!filestream_write_file(tmp_zip, data->data, data->len))
+   {
+      RARCH_WARN("[Pastime] extras: stage write failed: %s\n", tmp_zip);
+      goto advance;
+   }
+   have_zip = true;
+
+   /* Canonical install names — see pastime_cores_extras.h.  The .so
+    * filename must yield core_info ID "<ident>_libretro" via the scanner
+    * rule (last underscore segment != "_libretro" → truncated).
+    * "<ident>_libretro_android.so" satisfies that and mirrors the
+    * buildbot's Android filenames. */
+   snprintf(so_basename, sizeof(so_basename),
+         "%s_libretro_android.so", extra->ident);
+   snprintf(info_basename, sizeof(info_basename),
+         "%s_libretro.info", extra->ident);
+   fill_pathname_join_special(dest_so,
+         settings->paths.directory_libretro, so_basename, sizeof(dest_so));
+   fill_pathname_join_special(dest_info,
+         settings->paths.path_libretro_info, info_basename,
+         sizeof(dest_info));
+
+   if (!pastime_cores_extras_extract_one(tmp_zip,
+         extra->zip_so_path, dest_so))
+      goto advance;
+   if (extra->zip_info_path && *extra->zip_info_path
+         && !pastime_cores_extras_extract_one(tmp_zip,
+               extra->zip_info_path, dest_info))
+   {
+      /* .so already on disk — leave it; without the .info the scanner
+       * won't match it to a core, but a future run that ships the .info
+       * will recover.  Fall through to refresh anyway. */
+      RARCH_WARN("[Pastime] extras: .info missing for %s, core may be hidden\n",
+            extra->ident);
+   }
+
+   install_ok = true;
+   RARCH_LOG("[Pastime] extras installed: %s\n", extra->ident);
+
+advance:
+   if (have_zip && filestream_exists(tmp_zip))
+      filestream_delete(tmp_zip);
+
+   if (install_ok)
+      command_event(CMD_EVENT_CORE_INFO_INIT, NULL);
+
+   /* Reuse the buildbot completion path so progress UI + cancel handling
+    * stay single-sourced.  err is propagated for logging parity. */
+   pastime_cores_install_done_cb(NULL, NULL, NULL, err);
+}
+
+/* Queue a download for an extras entry.  Returns false if the http push
+ * was refused (caller should skip the ident, same as buildbot). */
+static bool pastime_cores_extras_queue(const pastime_cores_extra_t *extra)
+{
+   if (!extra || !extra->zip_url || !*extra->zip_url)
+      return false;
+   RARCH_LOG("[Pastime] downloading extras core: %s (%s)\n",
+         extra->ident, extra->zip_url);
+   if (!task_push_http_transfer(extra->zip_url, true /* mute */,
+         NULL /* type */,
+         pastime_cores_extras_http_cb, (void*)extra))
+   {
+      RARCH_WARN("[Pastime] extras http push refused: %s\n", extra->ident);
+      return false;
+   }
+   return true;
+}
+
 /* Walk the queue from cursor forward, skipping idents that aren't on the
  * buildbot, and queue the first one that is.  Lands in DONE when the
  * queue is exhausted. */
@@ -143,10 +338,21 @@ static void pastime_cores_queue_next(void)
             pastime_cores_find_entry(list, ident);
       if (!entry)
       {
-         /* Not on the buildbot — silently skip per PLAN ("no broken
-          * folder UX").  System-folder visibility filtering will hide
-          * the corresponding row separately. */
-         RARCH_LOG("[Pastime] core not on buildbot: %s\n", ident);
+         /* Not on the buildbot — try the curated extras table for
+          * cores we ship via GitHub releases (e.g. fake-08 for PICO-8).
+          * Miss in both = silently skip per PLAN ("no broken folder
+          * UX"); system-folder visibility filtering hides the row. */
+         const pastime_cores_extra_t *extra =
+               pastime_cores_extras_lookup(ident);
+         if (extra && pastime_cores_extras_queue(extra))
+         {
+            g_state.state = PASTIME_CORES_INSTALLING;
+            return;
+         }
+         if (extra)
+            RARCH_WARN("[Pastime] extras queue refused: %s\n", ident);
+         else
+            RARCH_LOG("[Pastime] core not on buildbot: %s\n", ident);
          g_state.cursor++;
          continue;
       }

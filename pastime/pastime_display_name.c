@@ -134,6 +134,39 @@ static void dp_strip_brackets(char *s)
    *w = '\0';
 }
 
+void pastime_display_name_strip_rom_extension(char *name)
+{
+   size_t n;
+   size_t i;
+   /* Find the last '.' after the last path separator (defensive — the
+    * caller passes a basename, but stay safe in case of stray slashes).
+    * Truncate there; that handles the common single-extension case
+    * (.smc, .nes, .p8, .png, ...). */
+   if (!name || !*name)
+      return;
+   n = strlen(name);
+   for (i = n; i > 0; i--)
+   {
+      char c = name[i - 1];
+      if (c == '/' || c == '\\')
+         break;
+      if (c == '.')
+      {
+         name[i - 1] = '\0';
+         n = i - 1;
+         break;
+      }
+   }
+   /* Second peel for ".p8" — PICO-8 PNG-encoded cartridges (.p8.png).
+    * Anchored to that exact string so we never strip an arbitrary short
+    * extension off non-PICO-8 names. */
+   if (n >= 3
+         && name[n - 3] == '.'
+         && name[n - 2] == 'p'
+         && name[n - 1] == '8')
+      name[n - 3] = '\0';
+}
+
 void pastime_display_name_clean(const char *raw,
       char *out, size_t out_size)
 {

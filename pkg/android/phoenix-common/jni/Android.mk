@@ -65,6 +65,7 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/griffin/griffin.c \
 ifeq ($(HAVE_PASTIME),1)
 LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/pastime.c \
 							$(RARCH_DIR)/pastime/pastime_cores.c \
+							$(RARCH_DIR)/pastime/pastime_cores_extras.c \
 							$(RARCH_DIR)/pastime/pastime_defaults.c \
 							$(RARCH_DIR)/pastime/pastime_bootstrap.c \
 							$(RARCH_DIR)/pastime/pastime_setup.c \

@@ -221,6 +221,58 @@ static void test_sort_truncates_oversize_input(void)
    ASSERT_STR_EQ(tight, "legend ");
 }
 
+static void strip_eq(const char *raw, const char *want)
+{
+   char buf[64];
+   size_t n = strlen(raw);
+   if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+   memcpy(buf, raw, n);
+   buf[n] = '\0';
+   pastime_display_name_strip_rom_extension(buf);
+   ASSERT_STR_EQ(buf, want);
+}
+
+static void test_strip_rom_extension(void)
+{
+   /* Common single-extension cases. */
+   strip_eq("Tetris.nes",            "Tetris");
+   strip_eq("Mario.smc",             "Mario");
+   strip_eq("game.zip",              "game");
+   /* PICO-8 PNG-encoded cart — the case this exists for. */
+   strip_eq("Celeste.p8.png",        "Celeste");
+   /* PICO-8 plain-text cart — single ext drop hits ".p8" directly,
+    * second peel must NOT fire (no leftover ".p8"). */
+   strip_eq("Celeste.p8",            "Celeste");
+   /* No extension at all — leave alone. */
+   strip_eq("README",                "README");
+   /* Hidden-file leading dot is fine — strip removes the trailing
+    * extension only. */
+   strip_eq("Game.Name.With.Dots.smc", "Game.Name.With.Dots");
+   /* The ".p8" peel is anchored — a name that *happens* to end in
+    * ".p8" only because the first peel removed something else IS the
+    * intended target.  But "snippet.snip" → "snippet" must not
+    * spuriously pop more. */
+   strip_eq("snippet.snip",          "snippet");
+   /* No false positive on names that legitimately end in 'p8' without
+    * a preceding dot (the anchor requires a literal '.'). */
+   strip_eq("up8.bin",               "up8");
+   /* Documenting current behavior: the second peel is anchored to a
+    * literal trailing ".p8", not gated on the system context.  A name
+    * like "foo.p8.nds" (.p8 sandwiched between a base name and another
+    * system's extension) WILL strip to "foo".  Acceptable today since
+    * .p8 inside a non-PICO-8 ROM file would be an extremely odd
+    * collision, but flag this when adding a second double-extension
+    * core (e.g. another system that also uses ".p8.something"). */
+   strip_eq("foo.p8.nds",            "foo");
+   /* NULL / empty safety. */
+   pastime_display_name_strip_rom_extension(NULL);
+   {
+      char empty[4] = "";
+      pastime_display_name_strip_rom_extension(empty);
+      ASSERT_STR_EQ(empty, "");
+   }
+}
+
 int main(void)
 {
    test_clean_strips_parens();
@@ -242,6 +294,7 @@ int main(void)
    test_sort_null_out_does_not_crash();
    test_sort_zero_size_does_not_crash();
    test_sort_truncates_oversize_input();
+   test_strip_rom_extension();
 
    printf("test_display_name: %d passed, %d failed\n", g_pass, g_fail);
    return g_fail ? 1 : 0;

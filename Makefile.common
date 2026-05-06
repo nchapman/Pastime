@@ -1085,6 +1085,7 @@ ifeq ($(HAVE_MENU), 1)
    ifeq ($(HAVE_PASTIME), 1)
       OBJ += menu/drivers/pastime.o
       OBJ += pastime/pastime_cores.o
+      OBJ += pastime/pastime_cores_extras.o
       OBJ += pastime/pastime_setup.o
       OBJ += pastime/pastime_defaults.o
       OBJ += pastime/pastime_bootstrap.o

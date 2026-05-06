@@ -50,6 +50,13 @@ $CC $CFLAGS $INC \
     -o test_display_name
 BUILT+=(test_display_name)
 
+# --- cores extras table ---
+echo "== building test_cores_extras"
+$CC $CFLAGS $INC \
+    test_cores_extras.c ../pastime_cores_extras.c \
+    -o test_cores_extras
+BUILT+=(test_cores_extras)
+
 # --- thumbnail match cascade ---
 # Pure side only: pastime_thumbs_index.c carries the parse + match
 # cascade with no HTTP/IO/log dependencies, so we link it directly

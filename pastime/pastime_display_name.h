@@ -32,6 +32,12 @@ extern "C" {
 void pastime_display_name_clean(const char *raw,
       char *out, size_t out_size);
 
+/* Strip the file extension from a ROM basename in place.  Removes the
+ * trailing ".<ext>", and additionally peels a residual ".p8" so that
+ * PICO-8 PNG-encoded carts ("Celeste.p8.png") collapse to "Celeste"
+ * rather than "Celeste.p8".  Safe with NULL or empty input. */
+void pastime_display_name_strip_rom_extension(char *name);
+
 /* Build a sort key for `display`.  Lowercased; leading article
  * ("the ", "a ", "an ") removed.  Result is for ordering only — never
  * shown to the user.  Safe with display == NULL or empty. */

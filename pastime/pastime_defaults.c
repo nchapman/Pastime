@@ -140,6 +140,14 @@ void pastime_defaults_apply(void)
     * disabled" from "never set". */
    settings->bools.network_on_demand_thumbnails = true;
 
+   /* Disable the builtin image viewer.  RA's main init (retroarch.c
+    * ~8200) rewrites any ".png"/.jpg" content load to CORE_TYPE_IMAGEVIEWER
+    * regardless of the libretro core path the menu picked — which
+    * hijacks PICO-8 cartridges (".p8.png" — PNG-encoded carts) when
+    * launched via fake-08.  We never want the builtin viewer in the
+    * launcher path; toggle it off unconditionally. */
+   settings->bools.multimedia_builtin_imageviewer_enable = false;
+
    /* Log to file by default.  On Android, post-init RARCH_LOG goes to
     * stderr which is invisible — without this, every diagnostic we
     * emit (and every upstream RA warning we'd want to see) just
