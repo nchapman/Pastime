@@ -12,8 +12,8 @@ HAVE_FILE_LOGGER := 1
 HAVE_GFX_WIDGETS := 1
 HAVE_SAF := 1
 HAVE_BUILTINSMBCLIENT := 1
-# DOWNPLAY: matches the Makefile.common toggle so an `HAVE_DOWNPLAY=0` ndk-build invocation drops the menu driver entirely.
-HAVE_DOWNPLAY ?= 1
+# PASTIME: matches the Makefile.common toggle so an `HAVE_PASTIME=0` ndk-build invocation drops the menu driver entirely.
+HAVE_PASTIME ?= 1
 
 INCFLAGS    :=
 DEFINES     :=
@@ -61,20 +61,20 @@ LOCAL_MODULE := retroarch-activity
 LOCAL_SRC_FILES  +=	$(RARCH_DIR)/griffin/griffin.c \
 							$(RARCH_DIR)/griffin/griffin_cpp.cpp
 
-# DOWNPLAY: compile downplay menu driver + helper modules alongside griffin.
-ifeq ($(HAVE_DOWNPLAY),1)
-LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/downplay.c \
-							$(RARCH_DIR)/downplay/downplay_cores.c \
-							$(RARCH_DIR)/downplay/downplay_defaults.c \
-							$(RARCH_DIR)/downplay/downplay_bootstrap.c \
-							$(RARCH_DIR)/downplay/downplay_setup.c \
-							$(RARCH_DIR)/downplay/downplay_nav.c \
-							$(RARCH_DIR)/downplay/downplay_metadata_disambig.c \
-							$(RARCH_DIR)/downplay/downplay_display_name.c \
-							$(RARCH_DIR)/downplay/downplay_thumbs.c \
-							$(RARCH_DIR)/downplay/downplay_thumbs_index.c \
-							$(RARCH_DIR)/downplay/downplay_thumbhash.c \
-							$(RARCH_DIR)/downplay/downplay_webp.c
+# PASTIME: compile pastime menu driver + helper modules alongside griffin.
+ifeq ($(HAVE_PASTIME),1)
+LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/pastime.c \
+							$(RARCH_DIR)/pastime/pastime_cores.c \
+							$(RARCH_DIR)/pastime/pastime_defaults.c \
+							$(RARCH_DIR)/pastime/pastime_bootstrap.c \
+							$(RARCH_DIR)/pastime/pastime_setup.c \
+							$(RARCH_DIR)/pastime/pastime_nav.c \
+							$(RARCH_DIR)/pastime/pastime_metadata_disambig.c \
+							$(RARCH_DIR)/pastime/pastime_display_name.c \
+							$(RARCH_DIR)/pastime/pastime_thumbs.c \
+							$(RARCH_DIR)/pastime/pastime_thumbs_index.c \
+							$(RARCH_DIR)/pastime/pastime_thumbhash.c \
+							$(RARCH_DIR)/pastime/pastime_webp.c
 # Vendored libwebp decoder.  Decoder-only subset; arch-specific
 # (neon/sse2/sse41/mips/msa) variants are gated internally on compiler
 # defines — including all of them is safe across ABIs.
@@ -141,11 +141,7 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/deps/libwebp/src/dec/alpha_dec.c \
 							$(RARCH_DIR)/deps/libwebp/src/utils/rescaler_utils.c \
 							$(RARCH_DIR)/deps/libwebp/src/utils/thread_utils.c \
 							$(RARCH_DIR)/deps/libwebp/src/utils/utils.c
-# HAVE_DOWNPLAY_WEBP is currently Android-only.  Desktop builds via
-# Makefile.common silently fall back to .jpg (still correct — both are
-# available on the server).  Wire into Makefile.common when desktop
-# builds need format parity.
-DEFINES          += -DHAVE_DOWNPLAY_WEBP
+DEFINES          += -DHAVE_PASTIME_WEBP
 endif
 
 ifeq ($(HAVE_BUILTINSMBCLIENT),1)
@@ -251,9 +247,9 @@ DEFINES += -DRARCH_MOBILE \
 	   -DHAVE_CORE_INFO_CACHE \
 	   -DHAVE_BUILTINMBEDTLS -DHAVE_SSL
 
-# DOWNPLAY: enable the Downplay menu driver in the Android build.
-ifeq ($(HAVE_DOWNPLAY),1)
-DEFINES += -DHAVE_DOWNPLAY
+# PASTIME: enable the Pastime menu driver in the Android build.
+ifeq ($(HAVE_PASTIME),1)
+DEFINES += -DHAVE_PASTIME
 endif
 
 ifeq ($(HAVE_GFX_WIDGETS),1)
@@ -310,10 +306,10 @@ INCLUDE_DIRS     := \
 		    -I$(LOCAL_PATH)/$(DEPS_DIR)/zstd/lib/ \
 		    -I$(LOCAL_PATH)/$(DEPS_DIR)/libFLAC/include
 
-# DOWNPLAY: vendored libwebp decoder include path (must come after the
+# PASTIME: vendored libwebp decoder include path (must come after the
 # INCLUDE_DIRS := reset above).  libwebp internal sources use
 # `#include "src/webp/decode.h"` style paths that resolve against this.
-ifeq ($(HAVE_DOWNPLAY),1)
+ifeq ($(HAVE_PASTIME),1)
 INCLUDE_DIRS += -I$(LOCAL_PATH)/$(DEPS_DIR)/libwebp
 endif
 

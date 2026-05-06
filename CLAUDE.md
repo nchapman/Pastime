@@ -4,18 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-This is **Downplay**, a long-lived fork of RetroArch that delivers a MinUI-style experience (no config, folder-based content, minimalist launcher UX) on modern Android handhelds. Upstream is `libretro/RetroArch`. Read **`PLAN.md`** before starting non-trivial work — it owns the architectural strategy, the roadmap, and the list of allowed upstream patch points.
+This is **Pastime**, a long-lived fork of RetroArch that delivers a MinUI-style experience (no config, folder-based content, minimalist launcher UX) on modern Android handhelds. Upstream is `libretro/RetroArch`. Read **`PLAN.md`** before starting non-trivial work — it owns the architectural strategy, the roadmap, and the list of allowed upstream patch points.
 
 The codebase is otherwise still RetroArch: cores are loaded dynamically as shared libraries implementing `libretro.h` (`libretro-common/include/libretro.h`); the runloop, drivers, and libretro ABI are unchanged.
 
-## Patch discipline (Downplay-specific)
+## Patch discipline (Pastime-specific)
 
 Maintainability of the fork depends on keeping our delta against upstream small and legible. When making changes:
 
-- **New code goes in `downplay/` or `menu/drivers/downplay.c`.** Both are Downplay-owned; edit freely.
-- **Edits to any other file are "patch points"** and are tightly controlled. The current allowed set is enumerated in `PLAN.md` ("Allowed patch points"). Adding a new patch point is a deliberate decision — pause and consider whether the work belongs in `downplay/` or the menu driver instead.
-- **Every line of patched upstream code gets a marker comment**: `/* DOWNPLAY: <one-line rationale> */`. `git grep DOWNPLAY` should enumerate the fork delta in upstream files. The marker survives rebases and tells the next reader why the line is different.
-- **Defaults**: do not edit `config.def.h` to change Downplay defaults. Add to `downplay_defaults_apply()` instead, called once after `config_load()` inside `retroarch_main_init()` — i.e., after upstream defaults *and* on-disk config have been applied, but before CLI args override.
+- **New code goes in `pastime/` or `menu/drivers/pastime.c`.** Both are Pastime-owned; edit freely.
+- **Edits to any other file are "patch points"** and are tightly controlled. The current allowed set is enumerated in `PLAN.md` ("Allowed patch points"). Adding a new patch point is a deliberate decision — pause and consider whether the work belongs in `pastime/` or the menu driver instead.
+- **Every line of patched upstream code gets a marker comment**: `/* PASTIME: <one-line rationale> */`. `git grep PASTIME` should enumerate the fork delta in upstream files. The marker survives rebases and tells the next reader why the line is different.
+- **Defaults**: do not edit `config.def.h` to change Pastime defaults. Add to `pastime_defaults_apply()` instead, called once after `config_load()` inside `retroarch_main_init()` — i.e., after upstream defaults *and* on-disk config have been applied, but before CLI args override.
 - **Rebase, don't merge.** This fork tracks upstream master via rebase. Avoid commits that would be painful to rebase (sweeping reformatting, accidental upstream-file edits).
 
 ## Build
@@ -29,11 +29,11 @@ The build system is a hand-rolled `./configure` + GNU make (scripts in `qb/`), n
 - Platform builds use a per-platform Makefile, e.g. `make -f Makefile.win`, `Makefile.emscripten`, `Makefile.ctr`, `Makefile.libnx`, `Makefile.vita`, `Makefile.wiiu`, `Makefile.ps2`, `Makefile.griffin`, `Makefile.apple`, `Makefile.msvc`, etc. `Makefile.common` is shared object/source rules included by the platform makefiles.
 - "Griffin" build (`griffin/griffin.c` and friends) is a single-translation-unit unity build used for some console targets — when adding new `.c` files used on those platforms, ensure they get picked up by `griffin.c` or the appropriate platform Makefile.
 - macOS / iOS / tvOS: use the Xcode projects under `pkg/apple/` (or `Makefile.apple` for command-line builds).
-- Android (primary Downplay target): `pkg/android/build-and-install.sh [debug|release]` is the daily iteration loop. It runs `mise exec -- ./gradlew assembleAarch64Debug` (mise activates JDK 11 from `pkg/android/phoenix/.mise.toml`), `adb install -r`s the APK, and `adb shell am force-stop com.retroarch.aarch64`s the running process so the new code actually loads. Set `ANDROID_SERIAL` if multiple devices are attached. The Android build uses `ndk-build` via `pkg/android/phoenix-common/jni/Android.mk`, *not* `Makefile.common`. Note: sideloading on a device that ships with stock RetroArch (most Anbernic handhelds) fails first time with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — `adb uninstall com.retroarch.aarch64` first.
+- Android (primary Pastime target): `pkg/android/build-and-install.sh [debug|release]` is the daily iteration loop. It runs `mise exec -- ./gradlew assembleAarch64Debug` (mise activates JDK 11 from `pkg/android/phoenix/.mise.toml`), `adb install -r`s the APK, and `adb shell am force-stop gg.pastime.aarch64`s the running process so the new code actually loads. Set `ANDROID_SERIAL` if multiple devices are attached. The Android build uses `ndk-build` via `pkg/android/phoenix-common/jni/Android.mk`, *not* `Makefile.common`. The Pastime applicationId is `gg.pastime.aarch64` (and `.ra32` / bare `gg.pastime` for the other flavors), so it installs alongside any pre-existing stock RetroArch (`com.retroarch.aarch64`) without signature conflicts.
 
 ## Tests
 
-**Downplay-owned code has unit tests** under `downplay/tests/`. Run them with `bash downplay/tests/run_tests.sh` — each binary builds standalone via `cc` against the real production source (no carbon copies), with a small `DOWNPLAY_*_TEST_BUILD` define swapping heavy RA dependencies (verbosity, HTTP/IO, etc.) for test stubs. Tests use a tiny in-file framework (`ASSERT_TRUE` / `ASSERT_EQ` / `RUN_TEST`); add new tests here as new Downplay-owned modules land. Coverage today: `downplay_nav.c` (full), `downplay_display_name.c`, `downplay_metadata_disambig.c` (resolver — table + fallback semantics), `downplay_thumbs.c` (index parse + match cascade — the pure side; the manager's HTTP/queue/IO is stubbed out via `DOWNPLAY_THUMBS_TEST_BUILD`). The async manager paths (HTTP downloads, file I/O, gfx_thumbnail integration, WebP decode) are intentionally not unit-tested; they're verified end-to-end on Android via `pkg/android/build-and-install.sh`.
+**Pastime-owned code has unit tests** under `pastime/tests/`. Run them with `bash pastime/tests/run_tests.sh` — each binary builds standalone via `cc` against the real production source (no carbon copies), with a small `PASTIME_*_TEST_BUILD` define swapping heavy RA dependencies (verbosity, HTTP/IO, etc.) for test stubs. Tests use a tiny in-file framework (`ASSERT_TRUE` / `ASSERT_EQ` / `RUN_TEST`); add new tests here as new Pastime-owned modules land. Coverage today: `pastime_nav.c` (full), `pastime_display_name.c`, `pastime_metadata_disambig.c` (resolver — table + fallback semantics), `pastime_thumbs.c` (index parse + match cascade — the pure side; the manager's HTTP/queue/IO is stubbed out via `PASTIME_THUMBS_TEST_BUILD`). The async manager paths (HTTP downloads, file I/O, gfx_thumbnail integration, WebP decode) are intentionally not unit-tested; they're verified end-to-end on Android via `pkg/android/build-and-install.sh`.
 
 The **upstream RA codebase** has no unit tests. `tests-other/` contains integration-style assets (`.ratst` replay/test files, `.cfg` input fixtures) used to exercise input/replay paths — those are run by external CI infrastructure, not via a `make test` target. Don't invent a `make check` invocation for upstream code; if you need to verify changes, build and run `./retroarch -v` against a core.
 
@@ -55,21 +55,21 @@ RetroArch is mostly C89-compatible C with a thin C++/Obj-C/Obj-C++ veneer for so
 - **libretro-common.** `libretro-common/` is a vendored copy of shared libretro utility code (file I/O, formats, compat shims, networking, encodings, streams). **Prefer its APIs over Qt/POSIX equivalents when touching cross-platform code** — the recent Qt cleanup commits have been moving in that direction.
 - **Database / playlists.** `libretro-db/` is a small key/value DB used for content metadata; `playlist.c` and `core_info.c` build on top of it. `database_info.c` glues them to the menu.
 
-### Downplay-owned code
+### Pastime-owned code
 
-Downplay's delta lives in two places — both safe to edit freely:
+Pastime's delta lives in two places — both safe to edit freely:
 
-- `menu/drivers/downplay.c` — the launcher itself, registered as the `"downplay"` menu driver. Single-file driver; navigation is mode-driven via `enum downplay_view` (`DOWNPLAY_VIEW_TOP` / `SYSTEM` / `RECENTS` / `INGAME` / `SAVE_PICKER` / `SETTINGS` / `CONFIRM`). The `frame` callback dispatches to a per-view renderer; `entry_action` (overrides `generic_menu_entry_action`) handles input. Settings views use a small stack-based push/pop model so submenus (Frontend, Emulator, Save Changes…) don't need their own view enums.
-- `downplay/` — self-contained C modules called from a small number of upstream patch points:
-  - `downplay_bootstrap.{c,h}` — first-run: ensure `Downplay/{Roms,Bios,Saves,States}` exist and seed `Roms/README.txt`.
-  - `downplay_defaults.{c,h}` — defaults overlay applied after `config_load()` (sets `menu_driver = "downplay"`, paths, save/state UX flags, session-only persistence, Vulkan-on-Android, gamepad menu combo, etc.). Also owns `downplay_paths_get_root` (Android storage-tier walker → `Downplay/` root).
-  - `downplay_cores.{c,h}` — buildbot list cache + sequential install queue. Powers both the boot splash and the lazy "core not installed at launch time" fallback.
-  - `downplay_setup.{c,h}` — first-run sequential bucket downloader (core info, assets, joypad autoconfigs, databases, overlays, slang shaders). Reuses RA's online-updater download + decompress task plumbing.
-  - `downplay_nav.{c,h}` — pure helpers for the menu driver's navigation model (view stacks, focus persistence, list-cursor math). Heavily unit-tested.
-  - `downplay_display_name.{c,h}` — folder-name → display-name normalization (the "Display Name (core_ident)" convention strip + presentation rules).
-  - `downplay_metadata.{c,h}` + `downplay_metadata_disambig.c` — per-system metadata index (cached labels, art-state flags) + the disambiguation resolver that maps a Downplay folder name to a canonical thumbnails/db system name. Filename-driven; the old CRC/RDB matching path was removed (commit 8ac1f15c94).
-  - `downplay_thumbs.{c,h}` — custom thumbnail manager replacing RA's playlist/gfx_thumbnail download path. Per-system `index.json.gz` from `thumbnails.pastime.gg`, deterministic two-phase match cascade, bounded image fetch queue with active/prefetch priorities, atomic on-disk caching. See the file header for the design contract.
-  - `downplay_webp.{c,h}` — vendored libwebp wrapper for synchronous WebP decode into a `gfx_thumbnail_t`. Used when the thumbnail index reports a `.webp` is available (smaller than `.jpg` at indistinguishable quality).
+- `menu/drivers/pastime.c` — the launcher itself, registered as the `"pastime"` menu driver. Single-file driver; navigation is mode-driven via `enum pastime_view` (`PASTIME_VIEW_TOP` / `SYSTEM` / `RECENTS` / `INGAME` / `SAVE_PICKER` / `SETTINGS` / `CONFIRM`). The `frame` callback dispatches to a per-view renderer; `entry_action` (overrides `generic_menu_entry_action`) handles input. Settings views use a small stack-based push/pop model so submenus (Frontend, Emulator, Save Changes…) don't need their own view enums.
+- `pastime/` — self-contained C modules called from a small number of upstream patch points:
+  - `pastime_bootstrap.{c,h}` — first-run: ensure `Pastime/{Roms,Bios,Saves,States}` exist and seed `Roms/README.txt`.
+  - `pastime_defaults.{c,h}` — defaults overlay applied after `config_load()` (sets `menu_driver = "pastime"`, paths, save/state UX flags, session-only persistence, Vulkan-on-Android, gamepad menu combo, etc.). Also owns `pastime_paths_get_root` (Android storage-tier walker → `Pastime/` root).
+  - `pastime_cores.{c,h}` — buildbot list cache + sequential install queue. Powers both the boot splash and the lazy "core not installed at launch time" fallback.
+  - `pastime_setup.{c,h}` — first-run sequential bucket downloader (core info, assets, joypad autoconfigs, databases, overlays, slang shaders). Reuses RA's online-updater download + decompress task plumbing.
+  - `pastime_nav.{c,h}` — pure helpers for the menu driver's navigation model (view stacks, focus persistence, list-cursor math). Heavily unit-tested.
+  - `pastime_display_name.{c,h}` — folder-name → display-name normalization (the "Display Name (core_ident)" convention strip + presentation rules).
+  - `pastime_metadata.{c,h}` + `pastime_metadata_disambig.c` — per-system metadata index (cached labels, art-state flags) + the disambiguation resolver that maps a Pastime folder name to a canonical thumbnails/db system name. Filename-driven; the old CRC/RDB matching path was removed (commit 8ac1f15c94).
+  - `pastime_thumbs.{c,h}` — custom thumbnail manager replacing RA's playlist/gfx_thumbnail download path. Per-system `index.json.gz` from `thumbnails.pastime.gg`, deterministic two-phase match cascade, bounded image fetch queue with active/prefetch priorities, atomic on-disk caching. See the file header for the design contract.
+  - `pastime_webp.{c,h}` — vendored libwebp wrapper for synchronous WebP decode into a `gfx_thumbnail_t`. Used when the thumbnail index reports a `.webp` is available (smaller than `.jpg` at indistinguishable quality).
 
 The single source of truth for what is and isn't a sanctioned modification is **`PLAN.md`'s "Allowed patch points" table**.
 
@@ -89,10 +89,10 @@ The full rules are in `CODING-GUIDELINES`; the ones that bite most often:
 
 ## Working dirs
 
-The repo is checked out in two places: `/Users/nchapman/Drive/Code/Downplay` (primary) and `/Users/nchapman/Code/Downplay`. Default to the primary unless told otherwise.
+The repo is checked out in two places: `/Users/nchapman/Drive/Code/Pastime` (primary) and `/Users/nchapman/Code/Pastime`. Default to the primary unless told otherwise.
 
 ## When in doubt
 
 - **Read `PLAN.md`** for the project's intent, milestone targets, and patch-point boundaries.
-- **Read `CODING-GUIDELINES`** for upstream RetroArch's C89 / brace / struct-ordering rules. They apply to Downplay code too.
-- **Prefer the menu driver.** If a feature can be implemented in `menu/drivers/downplay.c` instead of by patching upstream code, do that.
+- **Read `CODING-GUIDELINES`** for upstream RetroArch's C89 / brace / struct-ordering rules. They apply to Pastime code too.
+- **Prefer the menu driver.** If a feature can be implemented in `menu/drivers/pastime.c` instead of by patching upstream code, do that.

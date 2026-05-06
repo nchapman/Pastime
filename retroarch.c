@@ -217,11 +217,11 @@
 
 #include "retroarch.h"
 
-#ifdef HAVE_DOWNPLAY
-/* DOWNPLAY: defaults overlay + on-disk bootstrap, called once after
+#ifdef HAVE_PASTIME
+/* PASTIME: defaults overlay + on-disk bootstrap, called once after
  * config_load() inside retroarch_main_init. */
-#include "downplay/downplay_defaults.h"
-#include "downplay/downplay_bootstrap.h"
+#include "pastime/pastime_defaults.h"
+#include "pastime/pastime_bootstrap.h"
 #endif
 
 #include "accessibility.h"
@@ -7502,14 +7502,14 @@ static bool retroarch_parse_input_and_config(
          path_set(RARCH_PATH_CONFIG_DEFAULT,
                path_get(RARCH_PATH_CONFIG));
 
-#ifdef HAVE_DOWNPLAY
-      /* DOWNPLAY: overlay opinionated defaults (menu_driver, paths,
+#ifdef HAVE_PASTIME
+      /* PASTIME: overlay opinionated defaults (menu_driver, paths,
        * gamepad combo) onto the just-loaded config, then ensure the
-       * Downplay/{Roms,Bios,Saves,States} layout exists on disk.  Runs
+       * Pastime/{Roms,Bios,Saves,States} layout exists on disk.  Runs
        * after upstream defaults + on-disk config but before the CLI
        * second pass — see PLAN.md "Allowed patch points". */
-      downplay_defaults_apply();
-      downplay_bootstrap();
+      pastime_defaults_apply();
+      pastime_bootstrap();
 #endif
    }
 

@@ -1,30 +1,30 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* HTTP/IO manager for the thumbnail subsystem.  See
- * downplay_thumbs.h for the public API contract; the on-disk binary
+ * pastime_thumbs.h for the public API contract; the on-disk binary
  * index format and the pure match cascade live in
- * downplay_thumbs_index.c.  This file owns:
+ * pastime_thumbs_index.c.  This file owns:
  *
  *   - on-disk index TTL refresh + atomic write
  *   - per-entry attempt-state tracking
  *   - HTTP task dispatch (index + image)
  *   - background prefetch of indexes for the system list
- *   - the recents-thumbnail companion (downplay_thumbs_recents_*)
+ *   - the recents-thumbnail companion (pastime_thumbs_recents_*)
  *
  * Single-threaded: every callback runs on the main thread via
  * task_queue_check.  Coding rules: C89-style declarations, Allman
@@ -56,10 +56,10 @@
 #include <retro_miscellaneous.h>
 #include <queues/task_queue.h>
 
-#include "downplay_thumbs.h"
-#include "downplay_thumbs_internal.h"
-#include "downplay_display_name.h"
-#include "downplay_defaults.h"
+#include "pastime_thumbs.h"
+#include "pastime_thumbs_internal.h"
+#include "pastime_display_name.h"
+#include "pastime_defaults.h"
 #include "../verbosity.h"
 #include "../msg_hash.h"
 #include "../tasks/task_file_transfer.h"
@@ -78,7 +78,7 @@ enum
    DP_LOAD_FAILED       /* HTTP/parse failed; queries answer UNKNOWN */
 };
 
-struct downplay_thumbs
+struct pastime_thumbs
 {
    char system[256];
    char idx_path[DP_THUMBS_PATH_MAX];
@@ -87,7 +87,7 @@ struct downplay_thumbs
    int  load_state;
    bool index_task_pushed;
 
-   downplay_thumbs_index_t *index;
+   pastime_thumbs_index_t *index;
 
    /* Per-canonical fetch tracking.  Parallel to the binary index's
     * ENTRIES section; an entry's status drives _request return values
@@ -111,7 +111,7 @@ struct downplay_thumbs
    /* Diagnostic miss log.  Appended on first definitive miss
     * (index loaded, no match) for a given basename; in-memory set
     * prevents per-frame spam.  Path:
-    *   <root>/Downplay/Thumbs/misses.log
+    *   <root>/Pastime/Thumbs/misses.log
     * Pull off-device with `adb pull` to triage real-world misses. */
    char     log_path[DP_THUMBS_PATH_MAX];
    char   **logged_misses;
@@ -131,7 +131,7 @@ enum
  * context for the HTTP completion callback to write the manager's
  * `attempt[e_idx]` directly, instead of relying on a polling
  * path_is_valid() sweep that never sees failed fetches.  `mgr` is
- * nulled by downplay_thumbs_close() before the manager is freed, so
+ * nulled by pastime_thumbs_close() before the manager is freed, so
  * a callback that fires after close drops its writes safely.
  *
  * Defined here (rather than alongside dp_pf_transfer_t below) so it's
@@ -140,7 +140,7 @@ enum
 typedef struct dp_img_transfer
 {
    file_transfer_t      base;     /* must be first; .path is the on-disk dest */
-   downplay_thumbs_t   *mgr;      /* NULL after manager close — see above */
+   pastime_thumbs_t   *mgr;      /* NULL after manager close — see above */
    uint32_t             e_idx;    /* index into mgr->index entries */
 } dp_img_transfer_t;
 
@@ -148,7 +148,7 @@ typedef struct dp_img_transfer
 
 /* Compute <root>/Thumbs/index/<system>.idx into `out`.  Single source
  * of truth for the on-disk binary-format index location: both
- * `downplay_thumbs_open` and the boot-time prefetch share this so
+ * `pastime_thumbs_open` and the boot-time prefetch share this so
  * they cannot disagree on where the file lives.  Returns false if
  * the filesystem root can't be resolved.
  *
@@ -166,7 +166,7 @@ static bool dp_thumbs_index_path(const char *system,
    char fname[256];
    if (!system || !*system || !out || out_size == 0)
       return false;
-   if (!downplay_paths_get_root(root, sizeof(root)))
+   if (!pastime_paths_get_root(root, sizeof(root)))
       return false;
    fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
    fill_pathname_join_special(idx_dir, base, "index", sizeof(idx_dir));
@@ -180,7 +180,7 @@ static bool dp_thumbs_index_path(const char *system,
  * the No-Intro safe form (no path separators, since it's the title
  * of a game).  We always use `.webp` since the server is guaranteed
  * to publish WebP for every entry. */
-static void dp_build_image_path(downplay_thumbs_t *t,
+static void dp_build_image_path(pastime_thumbs_t *t,
       const char *canonical, char *out, size_t out_size)
 {
    char tmp[DP_THUMBS_PATH_MAX];
@@ -192,9 +192,9 @@ static void dp_build_image_path(downplay_thumbs_t *t,
  * write the path and return true.  We no longer need a webp→jpg
  * sibling fallback: the manager always writes `.webp` and the
  * server always publishes `.webp`.  Pre-WebP `.jpg` siblings from
- * old Downplay versions are simply ignored (they sit on disk
+ * old Pastime versions are simply ignored (they sit on disk
  * orphaned until manual cleanup; harmless). */
-static bool dp_resolve_local_image(downplay_thumbs_t *t,
+static bool dp_resolve_local_image(pastime_thumbs_t *t,
       uint32_t e_idx, char *out, size_t out_size)
 {
    const char *canonical = dp_idx_canonical(t->index, e_idx);
@@ -203,7 +203,7 @@ static bool dp_resolve_local_image(downplay_thumbs_t *t,
 }
 
 /* Build the remote URL for an image of canonical key `canonical`. */
-static void dp_build_image_url(downplay_thumbs_t *t,
+static void dp_build_image_url(pastime_thumbs_t *t,
       const char *canonical, char *out, size_t out_size)
 {
    char raw[2048];
@@ -424,10 +424,10 @@ static void dp_idx_emit_worker(void *userdata)
 
 out:
    if (werr && *werr)
-      RARCH_WARN("[Downplay] thumbs index worker \"%s\" failed: %s\n",
+      RARCH_WARN("[Pastime] thumbs index worker \"%s\" failed: %s\n",
             job->idx_path, werr);
    else
-      RARCH_LOG("[Downplay] thumbs index -> %s\n", job->idx_path);
+      RARCH_LOG("[Pastime] thumbs index -> %s\n", job->idx_path);
    free(json);
    free(idx_buf);
    free(job->gz_data);
@@ -507,7 +507,7 @@ static void dp_cb_index_download(retro_task_t *task, void *task_data,
 
 finish:
    if (err && *err)
-      RARCH_WARN("[Downplay] thumbs index \"%s\" failed: %s\n",
+      RARCH_WARN("[Pastime] thumbs index \"%s\" failed: %s\n",
             transf->path, err);
    free(transf);
 }
@@ -589,7 +589,7 @@ static void dp_cb_image_download(retro_task_t *task, void *task_data,
 
 finish:
    if (err && *err)
-      RARCH_WARN("[Downplay] thumbs image \"%s\" failed: %s\n",
+      RARCH_WARN("[Pastime] thumbs image \"%s\" failed: %s\n",
             transf->path, err);
    /* Settle manager state directly from the callback.  Failed fetches
     * used to leave entries permanently pinned at DP_ATT_FETCHING — the
@@ -598,13 +598,13 @@ finish:
     * Now the callback writes the terminal state and frees its slot. */
    if (ctx->mgr && ctx->mgr->index && ctx->mgr->attempt)
    {
-      downplay_thumbs_t *t     = ctx->mgr;
+      pastime_thumbs_t *t     = ctx->mgr;
       uint32_t           e_idx = ctx->e_idx;
       int                i;
       /* err is set by every failure branch above (non-200, magic-byte
        * mismatch, mkdir/write/rename failure), so an empty err here
        * means the rename succeeded and the canonical file is on disk. */
-      if (e_idx < downplay_thumbs_index_count(t->index))
+      if (e_idx < pastime_thumbs_index_count(t->index))
          t->attempt[e_idx] = (err && *err) ? DP_ATT_FAILED : DP_ATT_ON_DISK;
       for (i = 0; i < t->inflight; i++)
       {
@@ -621,11 +621,11 @@ finish:
 /* ---- internal: miss log ----
  *
  * Records definitive misses (index loaded, basename matched nothing)
- * to a TSV file under <root>/Downplay/Thumbs/misses.log.  In-memory
+ * to a TSV file under <root>/Pastime/Thumbs/misses.log.  In-memory
  * dedup per manager session avoids per-frame spam on the active row.
  * Diagnostic only — failure to write is silent. */
 
-static bool dp_miss_already_logged(downplay_thumbs_t *t, const char *basename)
+static bool dp_miss_already_logged(pastime_thumbs_t *t, const char *basename)
 {
    size_t i;
    for (i = 0; i < t->logged_misses_count; i++)
@@ -636,7 +636,7 @@ static bool dp_miss_already_logged(downplay_thumbs_t *t, const char *basename)
    return false;
 }
 
-static void dp_log_miss(downplay_thumbs_t *t, const char *basename)
+static void dp_log_miss(pastime_thumbs_t *t, const char *basename)
 {
    FILE      *f;
    char     **r;
@@ -691,7 +691,7 @@ static void dp_log_miss(downplay_thumbs_t *t, const char *basename)
 
 /* Compute index file age in seconds; returns -1 if missing.
  * libretro-common's RFILE wrapper has no portable mtime accessor, so
- * fall back to POSIX stat — every Downplay target (Android, macOS,
+ * fall back to POSIX stat — every Pastime target (Android, macOS,
  * Linux) supports it; on Windows the MS CRT exposes the same API
  * under the same name. */
 static int64_t dp_index_age_seconds(const char *path)
@@ -714,7 +714,7 @@ static int64_t dp_index_age_seconds(const char *path)
  * success (sets load_state=READY).  Leaves state unchanged on
  * failure so caller can decide between FETCHING (still waiting) vs
  * FAILED (give up). */
-static bool dp_try_load_local_index(downplay_thumbs_t *t)
+static bool dp_try_load_local_index(pastime_thumbs_t *t)
 {
    int64_t  size = 0;
    void    *buf  = NULL;
@@ -730,13 +730,13 @@ static bool dp_try_load_local_index(downplay_thumbs_t *t)
    t->index = dp_idx_open((uint8_t*)buf, (size_t)size);
    if (!t->index)
    {
-      RARCH_WARN("[Downplay] thumbs: validate failed for %s\n", t->idx_path);
+      RARCH_WARN("[Pastime] thumbs: validate failed for %s\n", t->idx_path);
       return false;
    }
-   t->attempt = (uint8_t*)calloc(downplay_thumbs_index_count(t->index), 1);
+   t->attempt = (uint8_t*)calloc(pastime_thumbs_index_count(t->index), 1);
    if (!t->attempt)
    {
-      downplay_thumbs_index_free(t->index);
+      pastime_thumbs_index_free(t->index);
       t->index = NULL;
       return false;
    }
@@ -745,7 +745,7 @@ static bool dp_try_load_local_index(downplay_thumbs_t *t)
 }
 
 /* Push the index HTTP fetch.  Caller should set state=FETCHING. */
-static void dp_kick_index_fetch(downplay_thumbs_t *t)
+static void dp_kick_index_fetch(pastime_thumbs_t *t)
 {
    file_transfer_t *transf;
    char raw_url[2048];
@@ -767,11 +767,11 @@ static void dp_kick_index_fetch(downplay_thumbs_t *t)
    transf->enum_idx = MSG_UNKNOWN;
    strlcpy(transf->path, t->idx_path, sizeof(transf->path));
 
-   RARCH_LOG("[Downplay] thumbs index fetch: %s\n", url);
+   RARCH_LOG("[Pastime] thumbs index fetch: %s\n", url);
    if (!task_push_http_transfer_file(url, true /* mute */, NULL,
             dp_cb_index_download, transf))
    {
-      RARCH_WARN("[Downplay] thumbs index task push failed: %s\n", url);
+      RARCH_WARN("[Pastime] thumbs index task push failed: %s\n", url);
       free(transf);
    }
    t->index_task_pushed = true;
@@ -784,7 +784,7 @@ static void dp_kick_index_fetch(downplay_thumbs_t *t)
  * scanning back from the tail) to make room for an active request;
  * a prefetch overflow is dropped silently.  Naive "decrement tail"
  * would corrupt the contents at the new head — see code-review. */
-static void dp_queue_push(downplay_thumbs_t *t, uint32_t entry_idx, uint8_t pri)
+static void dp_queue_push(pastime_thumbs_t *t, uint32_t entry_idx, uint8_t pri)
 {
    int i;
    /* De-dup: skip if already queued. */
@@ -862,7 +862,7 @@ static void dp_queue_push(downplay_thumbs_t *t, uint32_t entry_idx, uint8_t pri)
  * `dp_img_transfer_t` in t->outstanding[].  The HTTP completion
  * callback writes the terminal attempt state (ON_DISK or FAILED) and
  * compacts itself out of that array.  No polling sweep needed. */
-static void dp_drain_queue(downplay_thumbs_t *t)
+static void dp_drain_queue(pastime_thumbs_t *t)
 {
    uint32_t e_idx;
    const char *canonical;
@@ -880,7 +880,7 @@ static void dp_drain_queue(downplay_thumbs_t *t)
    e_idx = t->queue[t->queue_head];
    t->queue_head = (t->queue_head + 1) % DP_THUMBS_QUEUE_CAP;
 
-   if (e_idx >= downplay_thumbs_index_count(t->index))
+   if (e_idx >= pastime_thumbs_index_count(t->index))
       return;
    /* Re-check state: row may have transitioned to ON_DISK since enqueue. */
    if (t->attempt[e_idx] != DP_ATT_UNTRIED
@@ -965,7 +965,7 @@ typedef struct
  * — they'd silently truncate our `g_pf_inflight` keys (kernel terminates
  * at NUL) and let two concurrent fetches dodge dedup with different
  * effective names but the same ToS prefix.  Single source of truth:
- * downplay_thumbs_open / recents API / prefetch all funnel through
+ * pastime_thumbs_open / recents API / prefetch all funnel through
  * this validator — they treat `system` as both a URL component and a
  * filesystem directory name, so the rules are the same for all three. */
 static bool dp_system_safe(const char *system)
@@ -1128,7 +1128,7 @@ static void dp_cb_pf_index_download(retro_task_t *task, void *task_data,
 
 finish:
    if (err && *err)
-      RARCH_WARN("[Downplay] thumbs prefetch \"%s\" failed: %s\n",
+      RARCH_WARN("[Pastime] thumbs prefetch \"%s\" failed: %s\n",
             pf->system, err);
    dp_pf_inflight_remove(pf->system);
    free(pf);
@@ -1186,11 +1186,11 @@ static void dp_pf_drain(void)
          free(pf);
          continue;
       }
-      RARCH_LOG("[Downplay] thumbs prefetch fetch: %s\n", url);
+      RARCH_LOG("[Pastime] thumbs prefetch fetch: %s\n", url);
       if (!task_push_http_transfer_file(url, true /* mute */, NULL,
                dp_cb_pf_index_download, &pf->base))
       {
-         RARCH_WARN("[Downplay] thumbs prefetch task push failed: %s\n",
+         RARCH_WARN("[Pastime] thumbs prefetch task push failed: %s\n",
                url);
          dp_pf_inflight_remove(system);
          free(pf);
@@ -1198,7 +1198,7 @@ static void dp_pf_drain(void)
    }
 }
 
-void downplay_thumbs_prefetch_indexes(
+void pastime_thumbs_prefetch_indexes(
       const char * const *systems, size_t count)
 {
    size_t i;
@@ -1236,7 +1236,7 @@ void downplay_thumbs_prefetch_indexes(
           * unusual.  Warn once so we have a bread crumb in logcat. */
          if (!g_pf_overflow_warned)
          {
-            RARCH_WARN("[Downplay] thumbs prefetch queue full at %d; "
+            RARCH_WARN("[Pastime] thumbs prefetch queue full at %d; "
                   "remaining systems will not be prefetched\n",
                   DP_THUMBS_PF_PENDING_CAP);
             g_pf_overflow_warned = true;
@@ -1252,9 +1252,9 @@ void downplay_thumbs_prefetch_indexes(
 
 /* ---- public manager API ---- */
 
-downplay_thumbs_t *downplay_thumbs_open(const char *system)
+pastime_thumbs_t *pastime_thumbs_open(const char *system)
 {
-   downplay_thumbs_t *t;
+   pastime_thumbs_t *t;
    char root[DP_THUMBS_PATH_MAX];
    char base[DP_THUMBS_PATH_MAX];
 
@@ -1264,10 +1264,10 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
     * the core_info `database` fallback is third-party content. */
    if (!dp_system_safe(system))
       return NULL;
-   if (!downplay_paths_get_root(root, sizeof(root)))
+   if (!pastime_paths_get_root(root, sizeof(root)))
       return NULL;
 
-   t = (downplay_thumbs_t*)calloc(1, sizeof(*t));
+   t = (pastime_thumbs_t*)calloc(1, sizeof(*t));
    if (!t)
       return NULL;
 
@@ -1316,7 +1316,7 @@ downplay_thumbs_t *downplay_thumbs_open(const char *system)
    return t;
 }
 
-void downplay_thumbs_close(downplay_thumbs_t *t)
+void pastime_thumbs_close(pastime_thumbs_t *t)
 {
    int i;
    if (!t)
@@ -1329,7 +1329,7 @@ void downplay_thumbs_close(downplay_thumbs_t *t)
       if (t->outstanding[i])
          t->outstanding[i]->mgr = NULL;
    t->inflight = 0;
-   downplay_thumbs_index_free(t->index);
+   pastime_thumbs_index_free(t->index);
    free(t->attempt);
    {
       size_t i;
@@ -1340,9 +1340,9 @@ void downplay_thumbs_close(downplay_thumbs_t *t)
    free(t);
 }
 
-void downplay_thumbs_request(downplay_thumbs_t *t,
+void pastime_thumbs_request(pastime_thumbs_t *t,
       const char *rom_basename,
-      downplay_thumb_result_t *out)
+      pastime_thumb_result_t *out)
 {
    int e_idx;
 
@@ -1425,7 +1425,7 @@ void downplay_thumbs_request(downplay_thumbs_t *t,
    /* status stays UNKNOWN — next frame will see ON_DISK once landed. */
 }
 
-bool downplay_thumbs_peek(downplay_thumbs_t *t,
+bool pastime_thumbs_peek(pastime_thumbs_t *t,
       const char *rom_basename,
       uint16_t *out_w, uint16_t *out_h,
       const uint8_t **out_thumbhash, size_t *out_thumbhash_len)
@@ -1463,7 +1463,7 @@ bool downplay_thumbs_peek(downplay_thumbs_t *t,
    return true;
 }
 
-void downplay_thumbs_prefetch(downplay_thumbs_t *t,
+void pastime_thumbs_prefetch(pastime_thumbs_t *t,
       const char * const *basenames, size_t count)
 {
    size_t i;
@@ -1483,7 +1483,7 @@ void downplay_thumbs_prefetch(downplay_thumbs_t *t,
    }
 }
 
-void downplay_thumbs_pump(downplay_thumbs_t *t)
+void pastime_thumbs_pump(pastime_thumbs_t *t)
 {
    int budget;
    if (!t)
@@ -1528,24 +1528,24 @@ void downplay_thumbs_pump(downplay_thumbs_t *t)
 typedef struct
 {
    char                    *system;     /* heap, owned */
-   downplay_thumbs_index_t *index;      /* NULL on miss/parse-fail */
+   pastime_thumbs_index_t *index;      /* NULL on miss/parse-fail */
    bool                     tried;      /* don't retry the load every frame */
 } dp_recents_slot_t;
 
-struct downplay_thumbs_recents
+struct pastime_thumbs_recents
 {
    dp_recents_slot_t *slots;
    size_t             count;
    size_t             cap;
 };
 
-downplay_thumbs_recents_t *downplay_thumbs_recents_open(void)
+pastime_thumbs_recents_t *pastime_thumbs_recents_open(void)
 {
-   return (downplay_thumbs_recents_t*)calloc(1,
-         sizeof(downplay_thumbs_recents_t));
+   return (pastime_thumbs_recents_t*)calloc(1,
+         sizeof(pastime_thumbs_recents_t));
 }
 
-void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r)
+void pastime_thumbs_recents_close(pastime_thumbs_recents_t *r)
 {
    size_t i;
    if (!r)
@@ -1553,7 +1553,7 @@ void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r)
    for (i = 0; i < r->count; i++)
    {
       free(r->slots[i].system);
-      downplay_thumbs_index_free(r->slots[i].index);
+      pastime_thumbs_index_free(r->slots[i].index);
    }
    free(r->slots);
    free(r);
@@ -1564,7 +1564,7 @@ void downplay_thumbs_recents_close(downplay_thumbs_recents_t *r)
  * fine here — distinct-systems count is in the single digits in
  * practice.  Returns NULL on allocation failure. */
 static dp_recents_slot_t *dp_recents_get_slot(
-      downplay_thumbs_recents_t *r, const char *system)
+      pastime_thumbs_recents_t *r, const char *system)
 {
    size_t i;
    dp_recents_slot_t *s;
@@ -1613,7 +1613,7 @@ static bool dp_recents_slot_load(dp_recents_slot_t *slot)
    return true;
 }
 
-void downplay_thumbs_recents_seed(downplay_thumbs_recents_t *r,
+void pastime_thumbs_recents_seed(pastime_thumbs_recents_t *r,
       const char *system)
 {
    if (!r || !dp_system_safe(system))
@@ -1624,7 +1624,7 @@ void downplay_thumbs_recents_seed(downplay_thumbs_recents_t *r,
    (void)dp_recents_get_slot(r, system);
 }
 
-bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r)
+bool pastime_thumbs_recents_pump(pastime_thumbs_recents_t *r)
 {
    size_t i;
    if (!r)
@@ -1639,7 +1639,7 @@ bool downplay_thumbs_recents_pump(downplay_thumbs_recents_t *r)
    return false;
 }
 
-bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
+bool pastime_thumbs_recents_peek(pastime_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
       uint16_t *out_w, uint16_t *out_h,
       const uint8_t **out_thumbhash, size_t *out_thumbhash_len)
@@ -1678,7 +1678,7 @@ bool downplay_thumbs_recents_peek(downplay_thumbs_recents_t *r,
    return true;
 }
 
-bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
+bool pastime_thumbs_recents_resolve(pastime_thumbs_recents_t *r,
       const char *system, const char *rom_basename,
       char *out, size_t out_size)
 {
@@ -1711,7 +1711,7 @@ bool downplay_thumbs_recents_resolve(downplay_thumbs_recents_t *r,
    if (mi == (size_t)-1)
       return false;
 
-   if (!downplay_paths_get_root(root, sizeof(root)))
+   if (!pastime_paths_get_root(root, sizeof(root)))
       return false;
    fill_pathname_join_special(base, root, "Thumbs", sizeof(base));
    fill_pathname_join_special(cache_dir, base, system, sizeof(cache_dir));

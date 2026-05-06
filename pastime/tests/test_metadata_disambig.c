@@ -1,4 +1,4 @@
-/* Unit tests for downplay/downplay_metadata_disambig.c — the
+/* Unit tests for pastime/pastime_metadata_disambig.c — the
  * "Display Name (core_ident)" → libretro-thumbnails system-name
  * resolver.
  *
@@ -23,7 +23,7 @@
 
 #include <lists/string_list.h>
 
-#include "../downplay_metadata.h"
+#include "../pastime_metadata.h"
 #include "../../core_info.h"
 
 /* ---------- core_info_find stub ----------
@@ -140,7 +140,7 @@ static const char *resolve(const char *display)
 {
    /* core_ident NULL → table-only path; the stub returns false on the
     * fallback, so misses come back as NULL. */
-   return downplay_metadata_resolve_db_name(display, NULL);
+   return pastime_metadata_resolve_db_name(display, NULL);
 }
 
 /* ============================================================
@@ -362,10 +362,10 @@ static void test_null_or_empty_input(void)
 {
    /* Both NULL and "" should fall through to the core_info fallback,
     * which our stubbed core_info_find returns false for → NULL. */
-   ASSERT_NULL(downplay_metadata_resolve_db_name(NULL, NULL));
-   ASSERT_NULL(downplay_metadata_resolve_db_name("",   NULL));
-   ASSERT_NULL(downplay_metadata_resolve_db_name(NULL, ""));
-   ASSERT_NULL(downplay_metadata_resolve_db_name("",   ""));
+   ASSERT_NULL(pastime_metadata_resolve_db_name(NULL, NULL));
+   ASSERT_NULL(pastime_metadata_resolve_db_name("",   NULL));
+   ASSERT_NULL(pastime_metadata_resolve_db_name(NULL, ""));
+   ASSERT_NULL(pastime_metadata_resolve_db_name("",   ""));
 }
 
 static void test_unknown_display_returns_null(void)
@@ -379,9 +379,9 @@ static void test_unknown_display_returns_null(void)
 static void test_unknown_display_with_unknown_core(void)
 {
    /* Falls through to core_info_find which is stubbed to false. */
-   ASSERT_NULL(downplay_metadata_resolve_db_name(
+   ASSERT_NULL(pastime_metadata_resolve_db_name(
          "FloofyVision 9000", "totally_made_up_core"));
-   ASSERT_NULL(downplay_metadata_resolve_db_name(
+   ASSERT_NULL(pastime_metadata_resolve_db_name(
          "Random Folder", "snes9x"));   /* even with a real core ident */
 }
 
@@ -390,7 +390,7 @@ static void test_table_path_short_circuits_core_info(void)
    /* When the display_name is in the table, core_ident is irrelevant.
     * Pass a deliberately wrong core_ident: the SNES table entry should
     * still win, the stubbed core_info_find should never matter. */
-   ASSERT_STR_EQ(downplay_metadata_resolve_db_name(
+   ASSERT_STR_EQ(pastime_metadata_resolve_db_name(
          "SNES", "totally_wrong_core_ident"),
          "Nintendo - Super Nintendo Entertainment System");
 }
@@ -423,7 +423,7 @@ static void test_fallback_returns_first_db_from_core_info(void)
     * Advance|Nintendo - Game Boy Color|Nintendo - Game Boy", and the
     * resolver returns the first entry as the best-effort guess. */
    stub_set_first_db("Nintendo - Game Boy Advance");
-   ASSERT_STR_EQ(downplay_metadata_resolve_db_name(
+   ASSERT_STR_EQ(pastime_metadata_resolve_db_name(
          "Random Folder Name", "mgba"),
          "Nintendo - Game Boy Advance");
 }
@@ -434,7 +434,7 @@ static void test_fallback_with_empty_databases_list(void)
     * whose .info file has no `database = ...` line).  Must NULL out
     * cleanly, not deref elems[0]. */
    stub_set_empty_dbs();
-   ASSERT_NULL(downplay_metadata_resolve_db_name(
+   ASSERT_NULL(pastime_metadata_resolve_db_name(
          "Random Folder", "weird_core"));
 }
 
@@ -443,7 +443,7 @@ static void test_fallback_with_null_databases_list(void)
    /* core_info_find says yes, but info->databases_list itself is
     * NULL.  Same expected outcome — return NULL, don't crash. */
    stub_set_null_dbs();
-   ASSERT_NULL(downplay_metadata_resolve_db_name(
+   ASSERT_NULL(pastime_metadata_resolve_db_name(
          "Random Folder", "weird_core"));
 }
 
@@ -453,7 +453,7 @@ static void test_fallback_skipped_when_table_hits(void)
     * display name "SNES" hits the table first — table must win, the
     * fallback must not even be consulted. */
    stub_set_first_db("Nintendo - Game Boy Advance");
-   ASSERT_STR_EQ(downplay_metadata_resolve_db_name("SNES", "snes9x"),
+   ASSERT_STR_EQ(pastime_metadata_resolve_db_name("SNES", "snes9x"),
          "Nintendo - Super Nintendo Entertainment System");
 }
 
@@ -488,7 +488,7 @@ static void test_coverage_for_common_cores(void)
 
 int main(void)
 {
-   printf("=== downplay metadata disambiguation tests ===\n");
+   printf("=== pastime metadata disambiguation tests ===\n");
 
    RUN_TEST(test_canonical_full_names);
    RUN_TEST(test_short_form_abbreviations);

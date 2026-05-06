@@ -142,7 +142,7 @@ void task_push_update_installed_cores(
       const char *path_dir_libretro,
       const char *path_dir_core_assets);
 
-/* DOWNPLAY: register a single-shot completion callback that fires after
+/* PASTIME: register a single-shot completion callback that fires after
  * the next core-updater download finishes (success or failure).  The hook
  * is automatically cleared after firing, so chained sequential installs
  * must re-register inside the callback.  err is non-NULL on failure. */

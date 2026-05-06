@@ -1,18 +1,18 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* Thumbhash decoder.  See header for the contract.
@@ -49,7 +49,7 @@
 
 #include <boolean.h>
 
-#include "downplay_thumbhash.h"
+#include "pastime_thumbhash.h"
 
 #ifndef DP_TH_PI
 #define DP_TH_PI 3.14159265358979323846f
@@ -115,7 +115,7 @@ static uint8_t dp_th_to_byte(float v)
    return (uint8_t)n;
 }
 
-bool downplay_thumbhash_decode(
+bool pastime_thumbhash_decode(
       const uint8_t *hash, size_t hash_len,
       unsigned target_w, unsigned target_h,
       uint8_t *out_bgra)
@@ -284,7 +284,7 @@ bool downplay_thumbhash_decode(
          r = (3.0f * l - b + qv) * 0.5f;
          g = r - qv;
 
-         /* Output BGRA byte order (matches downplay_webp.c).  Vulkan
+         /* Output BGRA byte order (matches pastime_webp.c).  Vulkan
           * wants B8G8R8A8; supports_rgba=false on texture upload. */
          *p++ = dp_th_to_byte(b);
          *p++ = dp_th_to_byte(g);

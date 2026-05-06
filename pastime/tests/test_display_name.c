@@ -1,4 +1,4 @@
-/* Unit tests for downplay/downplay_display_name.c.
+/* Unit tests for pastime/pastime_display_name.c.
  *
  * Pure string transforms — no stubs needed.  Build line in run_tests.sh.
  */
@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../downplay_display_name.h"
+#include "../pastime_display_name.h"
 
 static int g_pass;
 static int g_fail;
@@ -24,14 +24,14 @@ static int g_fail;
 static void clean_eq(const char *raw, const char *want)
 {
    char buf[128];
-   downplay_display_name_clean(raw, buf, sizeof(buf));
+   pastime_display_name_clean(raw, buf, sizeof(buf));
    ASSERT_STR_EQ(buf, want);
 }
 
 static void sort_eq(const char *display, const char *want)
 {
    char buf[128];
-   downplay_display_name_sort_key(display, buf, sizeof(buf));
+   pastime_display_name_sort_key(display, buf, sizeof(buf));
    ASSERT_STR_EQ(buf, want);
 }
 
@@ -79,9 +79,9 @@ static void test_clean_idempotent(void)
     * — the header explicitly promises idempotence. */
    char first[128];
    char second[128];
-   downplay_display_name_clean(
+   pastime_display_name_clean(
          "Legend of Zelda, The (USA)", first, sizeof(first));
-   downplay_display_name_clean(first, second, sizeof(second));
+   pastime_display_name_clean(first, second, sizeof(second));
    ASSERT_STR_EQ(first,  "The Legend of Zelda");
    ASSERT_STR_EQ(second, "The Legend of Zelda");
    /* Already-canonical inputs round-trip too. */
@@ -99,7 +99,7 @@ static void test_clean_null_input(void)
 {
    /* Header explicitly promises NULL safety. */
    char buf[16] = "preserved";
-   downplay_display_name_clean(NULL, buf, sizeof(buf));
+   pastime_display_name_clean(NULL, buf, sizeof(buf));
    ASSERT_STR_EQ(buf, "");
 }
 
@@ -108,7 +108,7 @@ static void test_clean_null_out_does_not_crash(void)
    /* NULL out with nonzero out_size — guard at the top of _clean
     * must short-circuit without dereferencing.  No buffer to inspect;
     * reaching the sentinel proves we returned cleanly. */
-   downplay_display_name_clean("Foo (USA)", NULL, 16);
+   pastime_display_name_clean("Foo (USA)", NULL, 16);
    clean_eq("Foo",                            "Foo");
 }
 
@@ -118,7 +118,7 @@ static void test_clean_zero_size_does_not_crash(void)
     * but the size is zero, so writing out[0] would also be invalid.
     * Sentinel byte must remain untouched. */
    char buf[4] = "ok";
-   downplay_display_name_clean("Foo (USA)", buf, 0);
+   pastime_display_name_clean("Foo (USA)", buf, 0);
    ASSERT_STR_EQ(buf, "ok");
 }
 
@@ -133,7 +133,7 @@ static void test_clean_rotation_at_buffer_boundary(void)
    {
       /* tight[9]: source fits exactly → rotation runs → "The Foo". */
       char tight[9];
-      downplay_display_name_clean("Foo, The", tight, sizeof(tight));
+      pastime_display_name_clean("Foo, The", tight, sizeof(tight));
       ASSERT_STR_EQ(tight, "The Foo");
    }
    {
@@ -141,7 +141,7 @@ static void test_clean_rotation_at_buffer_boundary(void)
        * see a complete article token, so the source-form survives
        * (truncated) rather than the rotated form. */
       char tight[8];
-      downplay_display_name_clean("Foo, The", tight, sizeof(tight));
+      pastime_display_name_clean("Foo, The", tight, sizeof(tight));
       ASSERT_STR_EQ(tight, "Foo, Th");
    }
 }
@@ -152,7 +152,7 @@ static void test_clean_truncates_oversize_input(void)
     * — must truncate, not overrun.  Bracket-strip then runs over the
     * truncated copy; that's by design. */
    char tight[8];
-   downplay_display_name_clean(
+   pastime_display_name_clean(
          "Super Mario Bros. 3", tight, sizeof(tight));
    /* First 7 chars of the source, NUL terminated.  Bracket-strip
     * touches nothing here since there's no '(' or '['. */
@@ -193,20 +193,20 @@ static void test_sort_null_input(void)
 {
    /* Header explicitly promises NULL safety. */
    char buf[16] = "preserved";
-   downplay_display_name_sort_key(NULL, buf, sizeof(buf));
+   pastime_display_name_sort_key(NULL, buf, sizeof(buf));
    ASSERT_STR_EQ(buf, "");
 }
 
 static void test_sort_null_out_does_not_crash(void)
 {
-   downplay_display_name_sort_key("The Legend of Zelda", NULL, 16);
+   pastime_display_name_sort_key("The Legend of Zelda", NULL, 16);
    sort_eq("Tetris",                          "tetris");
 }
 
 static void test_sort_zero_size_does_not_crash(void)
 {
    char buf[4] = "ok";
-   downplay_display_name_sort_key("The Legend of Zelda", buf, 0);
+   pastime_display_name_sort_key("The Legend of Zelda", buf, 0);
    ASSERT_STR_EQ(buf, "ok");
 }
 
@@ -215,7 +215,7 @@ static void test_sort_truncates_oversize_input(void)
    /* The i + 1 < out_size cap in _sort_key — must NUL-terminate at
     * the boundary, not overrun. */
    char tight[8];
-   downplay_display_name_sort_key(
+   pastime_display_name_sort_key(
          "The Legend of Zelda", tight, sizeof(tight));
    /* Article "The " stripped, then 7 lowercase chars + NUL. */
    ASSERT_STR_EQ(tight, "legend ");

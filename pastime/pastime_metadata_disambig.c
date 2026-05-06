@@ -1,22 +1,22 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* Disambiguation table + db_name resolver.  Split out from
- * downplay_metadata.c so the unit tests at downplay/tests/ can link
+ * pastime_metadata.c so the unit tests at pastime/tests/ can link
  * against this file alone — the rest of the metadata module pulls in
  * libretrodb, rjson, the HTTP task system, and gfx_thumbnail, all of
  * which are too heavy to drag into a standalone test binary. */
@@ -28,7 +28,7 @@
 #include <retro_miscellaneous.h>
 #include <string/stdstring.h>
 
-#include "downplay_metadata.h"
+#include "pastime_metadata.h"
 
 #include "../core_info.h"
 
@@ -129,7 +129,7 @@ static const struct dp_disambig dp_disambig_table[] = {
 #define DP_DISAMBIG_COUNT \
    ((int)(sizeof(dp_disambig_table) / sizeof(dp_disambig_table[0])))
 
-const char *downplay_metadata_resolve_db_name(
+const char *pastime_metadata_resolve_db_name(
       const char *display_name, const char *core_ident)
 {
    int                       i;

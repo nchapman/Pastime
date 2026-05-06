@@ -1,18 +1,18 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* Standalone WebP loader for the thumbnail pipeline.
@@ -29,8 +29,8 @@
  * (caller-owned) and the file is *not* deleted from disk — the
  * caller can decide whether a corrupt cache entry is worth retrying. */
 
-#ifndef DOWNPLAY_WEBP_H
-#define DOWNPLAY_WEBP_H
+#ifndef PASTIME_WEBP_H
+#define PASTIME_WEBP_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -40,7 +40,7 @@
 
 RETRO_BEGIN_DECLS
 
-bool downplay_webp_load_texture(
+bool pastime_webp_load_texture(
       const char *path,
       uintptr_t  *out_id,
       unsigned   *out_width,

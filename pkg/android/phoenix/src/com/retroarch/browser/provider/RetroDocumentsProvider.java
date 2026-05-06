@@ -86,7 +86,8 @@ public class RetroDocumentsProvider extends DocumentsProvider {
             core.add(Root.COLUMN_AVAILABLE_BYTES, CORE_DIR.getFreeSpace());
             core.add(Root.COLUMN_ICON, R.mipmap.ic_launcher);
 
-            final File USER_DIR = new File(Environment.getExternalStorageDirectory().getAbsolutePath() + "/Android/data/" + getContext().getPackageName() + "/files/RetroArch");
+            /* PASTIME: rebrand User Data root from "RetroArch" to "Pastime" so SAF surfaces our name. */
+            final File USER_DIR = new File(Environment.getExternalStorageDirectory().getAbsolutePath() + "/Android/data/" + getContext().getPackageName() + "/files/Pastime");
             final MatrixCursor.RowBuilder user = result.newRow();
             user.add(Root.COLUMN_ROOT_ID, getDocIdForFile(USER_DIR));
             user.add(Root.COLUMN_DOCUMENT_ID, getDocIdForFile(USER_DIR));

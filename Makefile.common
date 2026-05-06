@@ -1080,21 +1080,105 @@ ifeq ($(HAVE_MENU), 1)
       HAVE_MENU_SCREENSAVER = 1
    endif
 
-   # DOWNPLAY: custom menu driver, on by default
-   HAVE_DOWNPLAY ?= 1
-   ifeq ($(HAVE_DOWNPLAY), 1)
-      OBJ += menu/drivers/downplay.o
-      OBJ += downplay/downplay_cores.o
-      OBJ += downplay/downplay_setup.o
-      OBJ += downplay/downplay_defaults.o
-      OBJ += downplay/downplay_bootstrap.o
-      OBJ += downplay/downplay_nav.o
-      OBJ += downplay/downplay_metadata_disambig.o
-      OBJ += downplay/downplay_display_name.o
-      OBJ += downplay/downplay_thumbs.o
-      OBJ += downplay/downplay_thumbs_index.o
-      OBJ += downplay/downplay_thumbhash.o
-      DEFINES += -DHAVE_DOWNPLAY
+   # PASTIME: custom menu driver, on by default
+   HAVE_PASTIME ?= 1
+   ifeq ($(HAVE_PASTIME), 1)
+      OBJ += menu/drivers/pastime.o
+      OBJ += pastime/pastime_cores.o
+      OBJ += pastime/pastime_setup.o
+      OBJ += pastime/pastime_defaults.o
+      OBJ += pastime/pastime_bootstrap.o
+      OBJ += pastime/pastime_nav.o
+      OBJ += pastime/pastime_metadata_disambig.o
+      OBJ += pastime/pastime_display_name.o
+      OBJ += pastime/pastime_thumbs.o
+      OBJ += pastime/pastime_thumbs_index.o
+      OBJ += pastime/pastime_thumbhash.o
+      OBJ += pastime/pastime_webp.o
+      DEFINES += -DHAVE_PASTIME
+
+      # Vendored libwebp decoder.  Decoder-only subset; arch-specific
+      # (neon/sse2/sse41/mips/msa) variants are gated internally on
+      # compiler defines, so listing them all is safe across hosts.
+      # libwebp internal sources use `#include "src/..."` style, so
+      # deps/libwebp must be on the include path.
+      # Mirrors pkg/android/phoenix-common/jni/Android.mk.
+      INCLUDE_DIRS += -I$(DEPS_DIR)/libwebp
+      OBJ += deps/libwebp/src/dec/alpha_dec.o
+      OBJ += deps/libwebp/src/dec/buffer_dec.o
+      OBJ += deps/libwebp/src/dec/frame_dec.o
+      OBJ += deps/libwebp/src/dec/idec_dec.o
+      OBJ += deps/libwebp/src/dec/io_dec.o
+      OBJ += deps/libwebp/src/dec/quant_dec.o
+      OBJ += deps/libwebp/src/dec/tree_dec.o
+      OBJ += deps/libwebp/src/dec/vp8_dec.o
+      OBJ += deps/libwebp/src/dec/vp8l_dec.o
+      OBJ += deps/libwebp/src/dec/webp_dec.o
+      OBJ += deps/libwebp/src/dsp/alpha_processing.o
+      OBJ += deps/libwebp/src/dsp/alpha_processing_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/alpha_processing_neon.o
+      OBJ += deps/libwebp/src/dsp/alpha_processing_sse2.o
+      OBJ += deps/libwebp/src/dsp/alpha_processing_sse41.o
+      OBJ += deps/libwebp/src/dsp/cpu.o
+      OBJ += deps/libwebp/src/dsp/dec.o
+      OBJ += deps/libwebp/src/dsp/dec_clip_tables.o
+      OBJ += deps/libwebp/src/dsp/dec_mips32.o
+      OBJ += deps/libwebp/src/dsp/dec_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/dec_msa.o
+      OBJ += deps/libwebp/src/dsp/dec_neon.o
+      OBJ += deps/libwebp/src/dsp/dec_sse2.o
+      OBJ += deps/libwebp/src/dsp/dec_sse41.o
+      OBJ += deps/libwebp/src/dsp/filters.o
+      OBJ += deps/libwebp/src/dsp/filters_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/filters_msa.o
+      OBJ += deps/libwebp/src/dsp/filters_neon.o
+      OBJ += deps/libwebp/src/dsp/filters_sse2.o
+      OBJ += deps/libwebp/src/dsp/lossless.o
+      OBJ += deps/libwebp/src/dsp/lossless_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/lossless_msa.o
+      OBJ += deps/libwebp/src/dsp/lossless_neon.o
+      OBJ += deps/libwebp/src/dsp/lossless_sse2.o
+      OBJ += deps/libwebp/src/dsp/lossless_sse41.o
+      OBJ += deps/libwebp/src/dsp/rescaler.o
+      OBJ += deps/libwebp/src/dsp/rescaler_mips32.o
+      OBJ += deps/libwebp/src/dsp/rescaler_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/rescaler_msa.o
+      OBJ += deps/libwebp/src/dsp/rescaler_neon.o
+      OBJ += deps/libwebp/src/dsp/rescaler_sse2.o
+      OBJ += deps/libwebp/src/dsp/upsampling.o
+      OBJ += deps/libwebp/src/dsp/upsampling_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/upsampling_msa.o
+      OBJ += deps/libwebp/src/dsp/upsampling_neon.o
+      OBJ += deps/libwebp/src/dsp/upsampling_sse2.o
+      OBJ += deps/libwebp/src/dsp/upsampling_sse41.o
+      OBJ += deps/libwebp/src/dsp/yuv.o
+      OBJ += deps/libwebp/src/dsp/yuv_mips32.o
+      OBJ += deps/libwebp/src/dsp/yuv_mips_dsp_r2.o
+      OBJ += deps/libwebp/src/dsp/yuv_neon.o
+      OBJ += deps/libwebp/src/dsp/yuv_sse2.o
+      OBJ += deps/libwebp/src/dsp/yuv_sse41.o
+      OBJ += deps/libwebp/src/utils/bit_reader_utils.o
+      OBJ += deps/libwebp/src/utils/color_cache_utils.o
+      OBJ += deps/libwebp/src/utils/filters_utils.o
+      OBJ += deps/libwebp/src/utils/huffman_utils.o
+      OBJ += deps/libwebp/src/utils/palette.o
+      OBJ += deps/libwebp/src/utils/quant_levels_dec_utils.o
+      OBJ += deps/libwebp/src/utils/random_utils.o
+      OBJ += deps/libwebp/src/utils/rescaler_utils.o
+      OBJ += deps/libwebp/src/utils/thread_utils.o
+      OBJ += deps/libwebp/src/utils/utils.o
+      DEFINES += -DHAVE_PASTIME_WEBP
+
+      # RA defines -DHAVE_CONFIG_H globally so its own translation
+      # units pick up `config.h`.  libwebp uses the same autoconf
+      # macro to gate `src/webp/config.h`, which is normally produced
+      # by libwebp's own configure step and is not part of our
+      # vendored decoder subset.  Strip the flag from libwebp objects
+      # so they fall through to libwebp's compile-time feature
+      # detection (`#if defined(__GNUC__)`, `__APPLE__`, `__SSE2__`,
+      # etc.) — the same behavior as the Android build, which never
+      # passes -DHAVE_CONFIG_H to begin with.
+      $(OBJDIR)/deps/libwebp/%.o: DEFINES := $(filter-out -DHAVE_CONFIG_H,$(DEFINES))
    endif
 
    ifeq ($(HAVE_MENU_SCREENSAVER), 1)

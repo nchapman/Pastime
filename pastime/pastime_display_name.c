@@ -1,11 +1,11 @@
-/* See downplay_display_name.h for intent. */
+/* See pastime_display_name.h for intent. */
 
 #include <ctype.h>
 #include <stddef.h>
 #include <string.h>
 #include <strings.h>
 
-#include "downplay_display_name.h"
+#include "pastime_display_name.h"
 
 /* Only called after dp_strip_brackets.  Trims trailing whitespace, plus
  * a single trailing ',' or '-' if it sits immediately after whitespace
@@ -134,7 +134,7 @@ static void dp_strip_brackets(char *s)
    *w = '\0';
 }
 
-void downplay_display_name_clean(const char *raw,
+void pastime_display_name_clean(const char *raw,
       char *out, size_t out_size)
 {
    size_t len;
@@ -156,7 +156,7 @@ void downplay_display_name_clean(const char *raw,
    dp_rotate_article(out, out_size);
 }
 
-void downplay_display_name_sort_key(const char *display,
+void pastime_display_name_sort_key(const char *display,
       char *out, size_t out_size)
 {
    const char *src;

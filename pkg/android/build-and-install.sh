@@ -45,4 +45,4 @@ adb ${ADB_TARGET[@]+"${ADB_TARGET[@]}"} install -r "$APK"
 # process untouched, which means re-foregrounding the app keeps the OLD
 # binary mapped and the freshly installed code is silently ignored.
 # Bit us when iterating on debug logging.
-adb ${ADB_TARGET[@]+"${ADB_TARGET[@]}"} shell am force-stop com.retroarch.aarch64
+adb ${ADB_TARGET[@]+"${ADB_TARGET[@]}"} shell am force-stop gg.pastime.aarch64

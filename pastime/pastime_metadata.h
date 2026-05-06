@@ -1,22 +1,22 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef DOWNPLAY_METADATA_H
-#define DOWNPLAY_METADATA_H
+#ifndef PASTIME_METADATA_H
+#define PASTIME_METADATA_H
 
 #include <retro_common_api.h>
 
@@ -44,7 +44,7 @@ RETRO_BEGIN_DECLS
  * out before the pastime.gg pipeline; the art_state cache became
  * redundant once the thumbnail index started shipping per-entry
  * dimensions.  Only the disambiguation resolver remains.) */
-const char *downplay_metadata_resolve_db_name(
+const char *pastime_metadata_resolve_db_name(
       const char *display_name, const char *core_ident);
 
 RETRO_END_DECLS

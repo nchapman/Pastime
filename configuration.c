@@ -55,9 +55,9 @@
 
 #include "tasks/task_content.h"
 
-/* DOWNPLAY: re-apply our defaults overlay on every live cfg reload —
+/* PASTIME: re-apply our defaults overlay on every live cfg reload —
  * see the hook at the bottom of config_load_file for the rationale. */
-#include "downplay/downplay_defaults.h"
+#include "pastime/pastime_defaults.h"
 #include "tasks/tasks_internal.h"
 #include "accessibility.h"
 
@@ -4713,7 +4713,7 @@ static bool config_load_file(global_t *global,
       free(path_settings);
    if (size_settings)
       free(size_settings);
-   /* DOWNPLAY: re-apply our defaults overlay on every reload of the
+   /* PASTIME: re-apply our defaults overlay on every reload of the
     * live settings.  config_save_on_exit is forced off so retroarch.cfg
     * never reflects our defaults; without this hook, any path that
     * reloads the cfg mid-session (config_unload_override on game exit,
@@ -4723,11 +4723,11 @@ static bool config_load_file(global_t *global,
     * visible symptom: modern widget toasts re-appear after game exit.
     *
     * Skipped on first_load — the boot path is already wired to call
-    * downplay_defaults_apply explicitly in retroarch_main_init,
-    * paired with downplay_bootstrap.  Skipped when loading into a
+    * pastime_defaults_apply explicitly in retroarch_main_init,
+    * paired with pastime_bootstrap.  Skipped when loading into a
     * scratch settings_t (e.g. config_save_overrides's diff source). */
    if (!first_load && settings == config_st)
-      downplay_defaults_apply();
+      pastime_defaults_apply();
    first_load = false;
    return true;
 }

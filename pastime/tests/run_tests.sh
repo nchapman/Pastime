@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Build and run the Downplay menu-driver unit tests.
+# Build and run the Pastime menu-driver unit tests.
 #
 # Standalone — does not go through ./configure + make.  Each test
 # binary is built directly via the host C compiler against the
 # real production source files (no carbon copies).  Production
 # headers (boolean.h, retro_common_api.h) come from
 # libretro-common/include/.  Production source files use
-# DOWNPLAY_NAV_TEST_BUILD to swap RA's full verbosity macros for
+# PASTIME_NAV_TEST_BUILD to swap RA's full verbosity macros for
 # the test stubs defined in the test file.
 #
 # Usage:
-#   bash downplay/tests/run.sh
+#   bash pastime/tests/run.sh
 #
 # Exits non-zero if any test fails.
 
@@ -21,7 +21,7 @@ cd "$(dirname "$0")"
 CC="${CC:-cc}"
 PROJECT_ROOT="$(cd ../.. && pwd)"
 INC="-I${PROJECT_ROOT}/libretro-common/include"
-DEFS="-DDOWNPLAY_NAV_TEST_BUILD"
+DEFS="-DPASTIME_NAV_TEST_BUILD"
 CFLAGS="${CFLAGS:--std=c99 -Wall -Wextra -Wpedantic -Wno-unused-function -O0 -g}"
 
 # Track binaries we build this run; only those get executed below.
@@ -32,32 +32,32 @@ BUILT=()
 # --- nav stack ---
 echo "== building test_nav"
 $CC $CFLAGS $DEFS $INC \
-    test_nav.c ../downplay_nav.c \
+    test_nav.c ../pastime_nav.c \
     -o test_nav
 BUILT+=(test_nav)
 
 # --- metadata disambiguation table ---
 echo "== building test_metadata_disambig"
 $CC $CFLAGS $INC \
-    test_metadata_disambig.c ../downplay_metadata_disambig.c \
+    test_metadata_disambig.c ../pastime_metadata_disambig.c \
     -o test_metadata_disambig
 BUILT+=(test_metadata_disambig)
 
 # --- display-name cleaner ---
 echo "== building test_display_name"
 $CC $CFLAGS $INC \
-    test_display_name.c ../downplay_display_name.c \
+    test_display_name.c ../pastime_display_name.c \
     -o test_display_name
 BUILT+=(test_display_name)
 
 # --- thumbnail match cascade ---
-# Pure side only: downplay_thumbs_index.c carries the parse + match
+# Pure side only: pastime_thumbs_index.c carries the parse + match
 # cascade with no HTTP/IO/log dependencies, so we link it directly
-# (no DOWNPLAY_THUMBS_TEST_BUILD stub dance — the manager file isn't
+# (no PASTIME_THUMBS_TEST_BUILD stub dance — the manager file isn't
 # linked in).
 echo "== building test_thumbs"
 $CC $CFLAGS $INC \
-    test_thumbs.c ../downplay_thumbs_index.c \
+    test_thumbs.c ../pastime_thumbs_index.c \
     "${PROJECT_ROOT}/libretro-common/formats/json/rjson.c" \
     -o test_thumbs
 BUILT+=(test_thumbs)

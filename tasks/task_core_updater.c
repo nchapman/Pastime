@@ -508,19 +508,19 @@ error:
 /* Download core */
 /*****************/
 
-/* DOWNPLAY: single-shot completion hook so Downplay's core installer can
+/* PASTIME: single-shot completion hook so Pastime's core installer can
  * react to download finish (success or failure) without polling.  The
  * existing callback below stays the source of truth for core info reload
  * and contentless-cores reset; this slot is invoked after that work and
  * cleared so a stale registration can't fire on a later download. */
-static retro_task_callback_t downplay_download_done_cb   = NULL;
-static void                 *downplay_download_done_user = NULL;
+static retro_task_callback_t pastime_download_done_cb   = NULL;
+static void                 *pastime_download_done_user = NULL;
 
 void task_core_updater_set_download_callback(
       retro_task_callback_t cb, void *user_data)
 {
-   downplay_download_done_cb   = cb;
-   downplay_download_done_user = user_data;
+   pastime_download_done_cb   = cb;
+   pastime_download_done_user = user_data;
 }
 
 static void cb_task_core_updater_download(
@@ -536,15 +536,15 @@ static void cb_task_core_updater_download(
    menu_contentless_cores_free();
 #endif
 
-   /* DOWNPLAY: forward completion to the registered hook (if any) and
+   /* PASTIME: forward completion to the registered hook (if any) and
     * clear it.  Cleared before the call so the callee can re-register
     * for the next sequential download in a chain. */
-   if (downplay_download_done_cb)
+   if (pastime_download_done_cb)
    {
-      retro_task_callback_t cb = downplay_download_done_cb;
-      void                 *u  = downplay_download_done_user;
-      downplay_download_done_cb   = NULL;
-      downplay_download_done_user = NULL;
+      retro_task_callback_t cb = pastime_download_done_cb;
+      void                 *u  = pastime_download_done_user;
+      pastime_download_done_cb   = NULL;
+      pastime_download_done_user = NULL;
       cb(task, task_data, u, err);
    }
 }

@@ -1,22 +1,22 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* Pure parse + match side of the thumbnail index.  See
- * downplay_thumbs.h for the public intent and downplay_thumbs.c for
+ * pastime_thumbs.h for the public intent and pastime_thumbs.c for
  * the HTTP/IO manager that consumes this code.
  *
  * Module layout:
@@ -30,10 +30,10 @@
  *     - string pool + sort comparators + buffer emit
  *
  *   Section 3: binary index struct + match cascade (T0..T4)
- *     - downplay_thumbs_index_open / _free / _count / _match
+ *     - pastime_thumbs_index_open / _free / _count / _match
  *
  * This file is also linked directly into the unit-test binary
- * (see downplay/tests/run_tests.sh): no HTTP, no log, no manager
+ * (see pastime/tests/run_tests.sh): no HTTP, no log, no manager
  * dependencies — purely deterministic string code.  Coding rules:
  * C89-style declarations, Allman braces, libretro-common helpers
  * for any cross-platform string/path work. */
@@ -50,8 +50,8 @@
 #include <formats/rjson.h>
 #include <string/stdstring.h>
 
-#include "downplay_thumbs.h"
-#include "downplay_thumbs_internal.h"
+#include "pastime_thumbs.h"
+#include "pastime_thumbs_internal.h"
 
 /* Hard upper bound on parsed entries.  Real No-Intro / Redump
  * indexes are 5k–20k entries per system; 100k gives generous
@@ -141,7 +141,7 @@
 /* ---------------------------------------------------------------- */
 
 /* Transient struct used during JSON parse only.  Does NOT survive
- * past `downplay_thumbs_index_parse` — we emit a binary buffer from
+ * past `pastime_thumbs_index_parse` — we emit a binary buffer from
  * a temp array of these and free them.  Tiebreak data is derived
  * from `canonical` on demand at cascade time; width / height /
  * thumbhash, by contrast, are persisted to the binary format because
@@ -399,7 +399,7 @@ static void dp_fold_latin(char *s)
 }
 
 /* Strip every "(...)" and "[...]" block in `s` in place; same shape
- * as the brackets-strip in downplay_display_name.c but inlined here
+ * as the brackets-strip in pastime_display_name.c but inlined here
  * to keep this module self-contained.  Doesn't handle nesting (No-
  * Intro / Redump don't nest). */
 static void dp_strip_parens(char *s)
@@ -613,9 +613,9 @@ static int dp_score_region(const char *canonical)
 /* ---------------------------------------------------------------- */
 
 /* Parse-time temporary index.  Lives only across one
- * `downplay_thumbs_index_parse` call: rjson handlers populate it,
+ * `pastime_thumbs_index_parse` call: rjson handlers populate it,
  * then dp_idx_emit_buffer serialises it to the on-disk binary
- * format and frees it.  The public-API `downplay_thumbs_index_t`
+ * format and frees it.  The public-API `pastime_thumbs_index_t`
  * (defined later) wraps the resulting binary buffer. */
 typedef struct
 {
@@ -1127,7 +1127,7 @@ consume:
 static bool dp_h_bool(void *ctx, bool v) { dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx; (void)v; c->last_member[0] = '\0'; return true; }
 static bool dp_h_null(void *ctx) { dp_parse_ctx_t *c = (dp_parse_ctx_t*)ctx; c->last_member[0] = '\0'; return true; }
 
-#ifdef DOWNPLAY_THUMBS_TEST_BUILD
+#ifdef PASTIME_THUMBS_TEST_BUILD
 static void dp_h_error(void *ctx, int line, int col, const char *err)
 {
    (void)ctx;
@@ -1380,7 +1380,7 @@ static bool dp_idx_emit_buffer(const dp_thumb_entry_t *entries, size_t n,
       goto out;
 
    /* Header.  All multibyte fields written as little-endian via
-    * memcpy of host u32 — Downplay ships only on LE targets. */
+    * memcpy of host u32 — Pastime ships only on LE targets. */
    {
       uint32_t v;
       v = DP_IDX_MAGIC;              memcpy(buf +  0, &v, 4);
@@ -1504,7 +1504,7 @@ out:
  * No allocations during query, no string copies — all string returns
  * are pointers into `buf`'s string pool, valid for the lifetime of
  * the handle. */
-struct downplay_thumbs_index
+struct pastime_thumbs_index
 {
    uint8_t  *buf;          /* owned, freed on _index_free */
    size_t    buf_len;
@@ -1540,9 +1540,9 @@ static uint32_t dp_idx_read_u32(const uint8_t *base, size_t off)
  * code (the writer never produces an out-of-range offset).  The
  * dp_idx_str accessor returns "" on out-of-bounds offsets as a
  * defensive fallback against post-validation memory corruption. */
-downplay_thumbs_index_t *dp_idx_open(uint8_t *buf, size_t buf_len)
+pastime_thumbs_index_t *dp_idx_open(uint8_t *buf, size_t buf_len)
 {
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    uint32_t magic, version, entry_count, strings_size, thumbhash_size;
    uint32_t entries_off, bcanon_off, bheavy_off, strings_off, thumbhash_off;
    uint64_t entries_sz, bcanon_sz, bheavy_sz, footer_off, expected;
@@ -1600,7 +1600,7 @@ downplay_thumbs_index_t *dp_idx_open(uint8_t *buf, size_t buf_len)
        || fcount   != entry_count)
       goto fail;
 
-   idx = (downplay_thumbs_index_t*)calloc(1, sizeof(*idx));
+   idx = (pastime_thumbs_index_t*)calloc(1, sizeof(*idx));
    if (!idx)
       goto fail;
    idx->buf            = buf;
@@ -1620,7 +1620,7 @@ fail:
    return NULL;
 }
 
-void downplay_thumbs_index_free(downplay_thumbs_index_t *idx)
+void pastime_thumbs_index_free(pastime_thumbs_index_t *idx)
 {
    if (!idx)
       return;
@@ -1628,7 +1628,7 @@ void downplay_thumbs_index_free(downplay_thumbs_index_t *idx)
    free(idx);
 }
 
-size_t downplay_thumbs_index_count(const downplay_thumbs_index_t *idx)
+size_t pastime_thumbs_index_count(const pastime_thumbs_index_t *idx)
 {
    return idx ? idx->entry_count : 0;
 }
@@ -1638,7 +1638,7 @@ size_t downplay_thumbs_index_count(const downplay_thumbs_index_t *idx)
  * NUL-terminated, so strcmp on the returned pointer is safe.  Out-of-
  * bounds offsets (post-validation memory corruption — not reachable
  * via the file format) return "" defensively. */
-static const char *dp_idx_str(const downplay_thumbs_index_t *idx, uint32_t off)
+static const char *dp_idx_str(const pastime_thumbs_index_t *idx, uint32_t off)
 {
    if (off >= idx->strings_size)
       return "";
@@ -1646,20 +1646,20 @@ static const char *dp_idx_str(const downplay_thumbs_index_t *idx, uint32_t off)
 }
 
 const char *dp_idx_canonical(
-      const downplay_thumbs_index_t *idx, uint32_t e)
+      const pastime_thumbs_index_t *idx, uint32_t e)
 {
    return dp_idx_str(idx, dp_idx_read_u32(idx->buf,
          idx->entries_off + (size_t)e * DP_IDX_REC_SZ + 0));
 }
 
 static const char *dp_idx_heavy(
-      const downplay_thumbs_index_t *idx, uint32_t e)
+      const pastime_thumbs_index_t *idx, uint32_t e)
 {
    return dp_idx_str(idx, dp_idx_read_u32(idx->buf,
          idx->entries_off + (size_t)e * DP_IDX_REC_SZ + 4));
 }
 
-void dp_idx_dims(const downplay_thumbs_index_t *idx, uint32_t e,
+void dp_idx_dims(const pastime_thumbs_index_t *idx, uint32_t e,
       uint16_t *out_w, uint16_t *out_h)
 {
    const uint8_t *rec;
@@ -1679,7 +1679,7 @@ void dp_idx_dims(const downplay_thumbs_index_t *idx, uint32_t e,
  * on absence (or post-validation corruption that produces an OOB
  * offset) returns NULL with *out_len = 0.  Centralises the 1-based
  * offset math so call sites never open-code the `-1`. */
-void dp_idx_thumbhash(const downplay_thumbs_index_t *idx, uint32_t e,
+void dp_idx_thumbhash(const pastime_thumbs_index_t *idx, uint32_t e,
       const uint8_t **out_ptr, size_t *out_len)
 {
    uint32_t       off;
@@ -1708,13 +1708,13 @@ void dp_idx_thumbhash(const downplay_thumbs_index_t *idx, uint32_t e,
 }
 
 static uint32_t dp_idx_bcanon_at(
-      const downplay_thumbs_index_t *idx, size_t i)
+      const pastime_thumbs_index_t *idx, size_t i)
 {
    return dp_idx_read_u32(idx->buf,
          idx->bcanon_off + i * DP_IDX_BCAN_SZ);
 }
 
-static void dp_idx_bheavy_at(const downplay_thumbs_index_t *idx, size_t i,
+static void dp_idx_bheavy_at(const pastime_thumbs_index_t *idx, size_t i,
       uint32_t *out_hash, uint32_t *out_idx)
 {
    *out_hash = dp_idx_read_u32(idx->buf,
@@ -1742,7 +1742,7 @@ static char *dp_strip_ext(const char *in, char *out, size_t out_size)
 /* Phase 1: bsearch BY_CANONICAL for an exact match.  Returns the
  * entry index or SIZE_MAX on miss. */
 static size_t dp_lookup_exact_canonical(
-      const downplay_thumbs_index_t *idx, const char *stem)
+      const pastime_thumbs_index_t *idx, const char *stem)
 {
    size_t lo = 0, hi = idx->entry_count;
    while (lo < hi)
@@ -1761,7 +1761,7 @@ static size_t dp_lookup_exact_canonical(
 /* Phase 2 helper: bsearch BY_HEAVY by (hash, then strcmp on tie).
  * Returns the smallest BY_HEAVY index whose key is >= (needle_hash,
  * needle), or entry_count if all keys are smaller. */
-static size_t dp_lower_bound_heavy(const downplay_thumbs_index_t *idx,
+static size_t dp_lower_bound_heavy(const pastime_thumbs_index_t *idx,
       const char *needle, uint32_t needle_hash)
 {
    size_t lo = 0, hi = idx->entry_count;
@@ -1816,7 +1816,7 @@ static int dp_score_canonical(const char *canonical, const char *user_disc)
  * equal the needle, pick the best candidate by dp_score_canonical.
  * Canonical lex order breaks score ties for full determinism.
  * Returns SIZE_MAX if no candidate matched. */
-static size_t dp_pick_best(const downplay_thumbs_index_t *idx,
+static size_t dp_pick_best(const pastime_thumbs_index_t *idx,
       size_t start, uint32_t needle_hash, const char *needle_heavy,
       const char *user_disc)
 {
@@ -1851,7 +1851,7 @@ static size_t dp_pick_best(const downplay_thumbs_index_t *idx,
 /* Internal lookup returning the entry index (or SIZE_MAX).  Used
  * directly by the manager; the public `_match` wraps it for tests. */
 size_t dp_idx_match(
-      const downplay_thumbs_index_t *idx,
+      const pastime_thumbs_index_t *idx,
       const char *rom_basename)
 {
    char        stem[512];
@@ -1893,8 +1893,8 @@ size_t dp_idx_match(
    return dp_pick_best(idx, lo, needle_hash, heavy_user, user_disc);
 }
 
-const char *downplay_thumbs_index_match(
-      const downplay_thumbs_index_t *idx,
+const char *pastime_thumbs_index_match(
+      const pastime_thumbs_index_t *idx,
       const char *rom_basename)
 {
    size_t hit_idx = dp_idx_match(idx, rom_basename);
@@ -1950,7 +1950,7 @@ bool dp_idx_parse_json_to_buffer(const char *json, size_t json_len,
          dp_h_start_object, dp_h_end_object,
          dp_h_start_array, dp_h_end_array,
          dp_h_bool, dp_h_null,
-#ifdef DOWNPLAY_THUMBS_TEST_BUILD
+#ifdef PASTIME_THUMBS_TEST_BUILD
          dp_h_error
 #else
          NULL /* error_handler */
@@ -1972,7 +1972,7 @@ bool dp_idx_parse_json_to_buffer(const char *json, size_t json_len,
    return emitted;
 }
 
-downplay_thumbs_index_t *downplay_thumbs_index_parse(
+pastime_thumbs_index_t *pastime_thumbs_index_parse(
       const char *json, size_t json_len)
 {
    uint8_t *buf     = NULL;

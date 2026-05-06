@@ -1,18 +1,18 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* Thumbhash decoder.
@@ -24,16 +24,16 @@
  * beyond <math.h>; safe to call on the menu thread (sub-millisecond
  * for the 32x32 sizes we use here).
  *
- * Output is BGRA byte order to match downplay_webp_load_texture and
+ * Output is BGRA byte order to match pastime_webp_load_texture and
  * the rest of the thumbnail pipeline — `video_driver_texture_load`
  * is configured with `supports_rgba=false`.
  *
- * The decoder is the only thumbhash code in Downplay; we don't
+ * The decoder is the only thumbhash code in Pastime; we don't
  * encode (the server publishes encoded thumbhashes inside the
- * per-system index.json that downplay_thumbs_index.c parses). */
+ * per-system index.json that pastime_thumbs_index.c parses). */
 
-#ifndef DOWNPLAY_THUMBHASH_H
-#define DOWNPLAY_THUMBHASH_H
+#ifndef PASTIME_THUMBHASH_H
+#define PASTIME_THUMBHASH_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -54,7 +54,7 @@ RETRO_BEGIN_DECLS
  * real image lands) target dims of 32 on the long edge are enough;
  * the GPU scales to the eventual image rect via the existing
  * gfx_display_draw_quad path. */
-bool downplay_thumbhash_decode(
+bool pastime_thumbhash_decode(
       const uint8_t *hash, size_t hash_len,
       unsigned target_w, unsigned target_h,
       uint8_t *out_bgra);

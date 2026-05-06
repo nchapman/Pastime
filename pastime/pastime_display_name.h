@@ -1,4 +1,4 @@
-/* Downplay display-name + sort-key helpers.
+/* Pastime display-name + sort-key helpers.
  *
  * Pure string transforms — no I/O, no allocation.  The launcher feeds
  * raw filenames (or DB labels) through here at scan time to produce:
@@ -16,8 +16,8 @@
  * (Disc N), pull from the DB label, collapse roman numerals, etc.) so
  * callers don't grow their own private rules. */
 
-#ifndef DOWNPLAY_DISPLAY_NAME_H
-#define DOWNPLAY_DISPLAY_NAME_H
+#ifndef PASTIME_DISPLAY_NAME_H
+#define PASTIME_DISPLAY_NAME_H
 
 #include <stddef.h>
 
@@ -29,13 +29,13 @@ extern "C" {
  * string to `out`.  out_size must be >= 1.  Safe with raw == NULL or
  * empty: produces "".  Idempotent — passing an already-clean name
  * leaves it unchanged. */
-void downplay_display_name_clean(const char *raw,
+void pastime_display_name_clean(const char *raw,
       char *out, size_t out_size);
 
 /* Build a sort key for `display`.  Lowercased; leading article
  * ("the ", "a ", "an ") removed.  Result is for ordering only — never
  * shown to the user.  Safe with display == NULL or empty. */
-void downplay_display_name_sort_key(const char *display,
+void pastime_display_name_sort_key(const char *display,
       char *out, size_t out_size);
 
 #ifdef __cplusplus

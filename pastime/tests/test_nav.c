@@ -1,8 +1,8 @@
-/* Unit tests for downplay/downplay_nav.{c,h}.
+/* Unit tests for pastime/pastime_nav.{c,h}.
  *
  * Links against the real production source — there is no copy of
  * the nav helpers here.  See run.sh for the build line; the source
- * file detects DOWNPLAY_NAV_TEST_BUILD and routes RARCH_WARN
+ * file detects PASTIME_NAV_TEST_BUILD and routes RARCH_WARN
  * through dp_nav_test_warn (defined below) so we don't have to
  * drag RA's full verbosity / logger infrastructure into the link.
  */
@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../downplay_nav.h"
+#include "../pastime_nav.h"
 
 /* ---------- warning capture for the production source ---------- */
 
@@ -67,10 +67,10 @@ static int g_test_fail_at_start;
 typedef struct
 {
    int                  recompute_calls;
-   enum downplay_view   view_at_recompute;
+   enum pastime_view   view_at_recompute;
    int                  dispose_calls;
    void                *last_disposed_side;
-   enum downplay_view   view_at_dispose;
+   enum pastime_view   view_at_dispose;
    /* dp_nav_state_t snapshot at dispose-fire time, so tests can
     * assert on internal ordering (e.g. selection clamp visibility
     * before/after dispose). */
@@ -99,7 +99,7 @@ static void recording_dispose(void *user, void *side)
    test_user_t    user; \
    memset(&user, 0, sizeof(user)); \
    user.state_ref = &state; \
-   dp_nav_init(&state, DOWNPLAY_VIEW_TOP, test_after_change, &user); \
+   dp_nav_init(&state, PASTIME_VIEW_TOP, test_after_change, &user); \
    g_warn_count = 0; \
    g_last_warn[0] = '\0'; \
    g_test_pass_at_start = g_pass; \
@@ -121,7 +121,7 @@ static void test_init_seed(dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
    ASSERT_EQ(s->nav_depth, 1);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(s->selection, 0);
    ASSERT_PTR_EQ(dp_nav_top(s), &s->nav[0]);
 }
@@ -142,10 +142,10 @@ static void test_push_increments_depth_and_caches_view(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    ASSERT_EQ(s->nav_depth, 2);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_SYSTEM);
-   ASSERT_EQ(dp_nav_top(s)->view, DOWNPLAY_VIEW_SYSTEM);
+   ASSERT_EQ(s->view, PASTIME_VIEW_SYSTEM);
+   ASSERT_EQ(dp_nav_top(s)->view, PASTIME_VIEW_SYSTEM);
 }
 
 static void test_push_resets_selection_to_zero(
@@ -153,7 +153,7 @@ static void test_push_resets_selection_to_zero(
 {
    (void)u;
    dp_nav_set_selection(s, 5);
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    ASSERT_EQ(s->selection, 0);
    ASSERT_EQ(dp_nav_top(s)->selection, 0);
 }
@@ -163,7 +163,7 @@ static void test_push_records_side_and_dispose(
 {
    int marker = 42;
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, &marker, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, &marker, recording_dispose);
    ASSERT_PTR_EQ(dp_nav_top(s)->side, &marker);
    ASSERT_PTR_EQ(dp_nav_top(s)->dispose, recording_dispose);
 }
@@ -172,9 +172,9 @@ static void test_push_calls_after_change(
       dp_nav_state_t *s, test_user_t *u)
 {
    int before = u->recompute_calls;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    ASSERT_EQ(u->recompute_calls, before + 1);
-   ASSERT_EQ(u->view_at_recompute, DOWNPLAY_VIEW_SYSTEM);
+   ASSERT_EQ(u->view_at_recompute, PASTIME_VIEW_SYSTEM);
 }
 
 static void test_push_overflow_drops_and_disposes_orphan(
@@ -184,11 +184,11 @@ static void test_push_overflow_drops_and_disposes_orphan(
    size_t i;
    /* Fill the stack: depth starts at 1 (TOP); push 7 more = 8. */
    for (i = 0; i < DP_NAV_STACK_MAX - 1; i++)
-      dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, NULL);
+      dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, NULL);
    ASSERT_EQ(s->nav_depth, DP_NAV_STACK_MAX);
 
    /* One more push should be dropped. */
-   dp_nav_push(s, DOWNPLAY_VIEW_CONFIRM, &marker, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_CONFIRM, &marker, recording_dispose);
    ASSERT_EQ(s->nav_depth, DP_NAV_STACK_MAX); /* unchanged */
    ASSERT_EQ(u->dispose_calls, 1);            /* orphan disposed */
    ASSERT_PTR_EQ(u->last_disposed_side, &marker);
@@ -202,17 +202,17 @@ static void test_pop_at_ground_is_noop(dp_nav_state_t *s, test_user_t *u)
    /* Stack starts with just TOP. */
    dp_nav_pop(s);
    ASSERT_EQ(s->nav_depth, 1);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(u->dispose_calls, 0);
 }
 
 static void test_pop_basic_round_trip(dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    dp_nav_pop(s);
    ASSERT_EQ(s->nav_depth, 1);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(s->selection, 0);
 }
 
@@ -220,7 +220,7 @@ static void test_pop_fires_dispose_with_correct_args(
       dp_nav_state_t *s, test_user_t *u)
 {
    int marker = 99;
-   dp_nav_push(s, DOWNPLAY_VIEW_SAVE_PICKER, &marker, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_SAVE_PICKER, &marker, recording_dispose);
    dp_nav_pop(s);
    ASSERT_EQ(u->dispose_calls, 1);
    ASSERT_PTR_EQ(u->last_disposed_side, &marker);
@@ -236,13 +236,13 @@ static void test_pop_dispose_sees_new_top_view(
       dp_nav_state_t *s, test_user_t *u)
 {
    /* Stack: TOP → INGAME → SAVE_PICKER */
-   dp_nav_push(s, DOWNPLAY_VIEW_INGAME, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_SAVE_PICKER, NULL, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_INGAME, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SAVE_PICKER, NULL, recording_dispose);
 
    /* Pop the picker.  Inside dispose, s->view should already be
     * INGAME (the new top), not SAVE_PICKER (the popped one). */
    dp_nav_pop(s);
-   ASSERT_EQ(u->view_at_dispose, DOWNPLAY_VIEW_INGAME);
+   ASSERT_EQ(u->view_at_dispose, PASTIME_VIEW_INGAME);
 }
 
 /* after_change fires AFTER dispose so any state mutations done by
@@ -262,7 +262,7 @@ static void test_pop_after_change_runs_after_dispose(
       dp_nav_state_t *s, test_user_t *u)
 {
    int recompute_before;
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, snapshot_dispose);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, snapshot_dispose);
    recompute_before = u->recompute_calls;
    g_after_change_calls_seen_in_dispose = -1;
 
@@ -270,7 +270,7 @@ static void test_pop_after_change_runs_after_dispose(
 
    ASSERT_EQ(g_after_change_calls_seen_in_dispose, recompute_before);
    ASSERT_EQ(u->recompute_calls, recompute_before + 1);
-   ASSERT_EQ(u->view_at_recompute, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(u->view_at_recompute, PASTIME_VIEW_TOP);
 }
 
 static void test_pop_clears_frame_pointers(
@@ -278,7 +278,7 @@ static void test_pop_clears_frame_pointers(
 {
    int marker = 1;
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, &marker, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, &marker, recording_dispose);
    dp_nav_pop(s);
    ASSERT_PTR_EQ(s->nav[1].side, NULL);
    ASSERT_PTR_EQ(s->nav[1].dispose, NULL);
@@ -288,7 +288,7 @@ static void test_pop_with_null_dispose_does_not_crash(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    dp_nav_pop(s);
    ASSERT_EQ(s->nav_depth, 1);
 }
@@ -299,12 +299,12 @@ static void test_pop_to_existing_target(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_INGAME, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_CONFIRM, NULL, NULL);
-   dp_nav_pop_to(s, DOWNPLAY_VIEW_INGAME);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_INGAME);
+   dp_nav_push(s, PASTIME_VIEW_INGAME, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_CONFIRM, NULL, NULL);
+   dp_nav_pop_to(s, PASTIME_VIEW_INGAME);
+   ASSERT_EQ(s->view, PASTIME_VIEW_INGAME);
    ASSERT_EQ(s->nav_depth, 2);
    ASSERT_EQ(g_warn_count, 0);
 }
@@ -312,9 +312,9 @@ static void test_pop_to_existing_target(
 static void test_pop_to_target_already_top_is_noop(
       dp_nav_state_t *s, test_user_t *u)
 {
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
-   dp_nav_pop_to(s, DOWNPLAY_VIEW_SYSTEM);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_SYSTEM);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_pop_to(s, PASTIME_VIEW_SYSTEM);
+   ASSERT_EQ(s->view, PASTIME_VIEW_SYSTEM);
    ASSERT_EQ(s->nav_depth, 2);
    ASSERT_EQ(u->dispose_calls, 0);
 }
@@ -322,11 +322,11 @@ static void test_pop_to_target_already_top_is_noop(
 static void test_pop_to_top_collapses_multiple_frames(
       dp_nav_state_t *s, test_user_t *u)
 {
-   dp_nav_push(s, DOWNPLAY_VIEW_INGAME, NULL, recording_dispose);
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, recording_dispose);
-   dp_nav_push(s, DOWNPLAY_VIEW_CONFIRM, NULL, recording_dispose);
-   dp_nav_pop_to(s, DOWNPLAY_VIEW_TOP);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   dp_nav_push(s, PASTIME_VIEW_INGAME, NULL, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, recording_dispose);
+   dp_nav_push(s, PASTIME_VIEW_CONFIRM, NULL, recording_dispose);
+   dp_nav_pop_to(s, PASTIME_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(s->nav_depth, 1);
    ASSERT_EQ(u->dispose_calls, 3);
 }
@@ -335,12 +335,12 @@ static void test_pop_to_absent_target_flattens_and_warns(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, NULL);
    /* INGAME isn't anywhere on the stack. */
-   dp_nav_pop_to(s, DOWNPLAY_VIEW_INGAME);
+   dp_nav_pop_to(s, PASTIME_VIEW_INGAME);
    ASSERT_EQ(s->nav_depth, 1);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(g_warn_count, 1);
 }
 
@@ -350,15 +350,15 @@ static void test_root_view_only_ground_returns_top(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   ASSERT_EQ(dp_nav_root_view(s), DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(dp_nav_root_view(s), PASTIME_VIEW_TOP);
 }
 
 static void test_root_view_with_one_frame(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_INGAME, NULL, NULL);
-   ASSERT_EQ(dp_nav_root_view(s), DOWNPLAY_VIEW_INGAME);
+   dp_nav_push(s, PASTIME_VIEW_INGAME, NULL, NULL);
+   ASSERT_EQ(dp_nav_root_view(s), PASTIME_VIEW_INGAME);
 }
 
 /* root_view answers "what's the user actually doing here?" — it's
@@ -369,10 +369,10 @@ static void test_root_view_deep_stack(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_INGAME, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, NULL);
-   dp_nav_push(s, DOWNPLAY_VIEW_CONFIRM, NULL, NULL);
-   ASSERT_EQ(dp_nav_root_view(s), DOWNPLAY_VIEW_INGAME);
+   dp_nav_push(s, PASTIME_VIEW_INGAME, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_CONFIRM, NULL, NULL);
+   ASSERT_EQ(dp_nav_root_view(s), PASTIME_VIEW_INGAME);
 }
 
 /* ---- set_selection ---- */
@@ -381,7 +381,7 @@ static void test_set_selection_updates_cache_and_frame(
       dp_nav_state_t *s, test_user_t *u)
 {
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    dp_nav_set_selection(s, 7);
    ASSERT_EQ(s->selection, 7);
    ASSERT_EQ(dp_nav_top(s)->selection, 7);
@@ -396,7 +396,7 @@ static void test_set_selection_does_not_fire_after_change(
       dp_nav_state_t *s, test_user_t *u)
 {
    int before;
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    before = u->recompute_calls;
    dp_nav_set_selection(s, 3);
    ASSERT_EQ(u->recompute_calls, before);
@@ -412,10 +412,10 @@ static void test_pop_restores_parent_selection(
 {
    (void)u;
    dp_nav_set_selection(s, 4);
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    dp_nav_set_selection(s, 9);
    dp_nav_pop(s);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(s->selection, 4);
 }
 
@@ -424,17 +424,17 @@ static void test_nested_push_pop_preserves_each_parent(
 {
    (void)u;
    dp_nav_set_selection(s, 2);
-   dp_nav_push(s, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SYSTEM, NULL, NULL);
    dp_nav_set_selection(s, 5);
-   dp_nav_push(s, DOWNPLAY_VIEW_SETTINGS, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_SETTINGS, NULL, NULL);
    dp_nav_set_selection(s, 1);
 
    dp_nav_pop(s);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_SYSTEM);
+   ASSERT_EQ(s->view, PASTIME_VIEW_SYSTEM);
    ASSERT_EQ(s->selection, 5);
 
    dp_nav_pop(s);
-   ASSERT_EQ(s->view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(s->view, PASTIME_VIEW_TOP);
    ASSERT_EQ(s->selection, 2);
 }
 
@@ -445,10 +445,10 @@ static void test_top_returns_correct_frame(
 {
    dp_nav_frame_t *t;
    (void)u;
-   dp_nav_push(s, DOWNPLAY_VIEW_RECENTS, NULL, NULL);
+   dp_nav_push(s, PASTIME_VIEW_RECENTS, NULL, NULL);
    t = dp_nav_top(s);
    ASSERT_TRUE(t != NULL);
-   ASSERT_EQ(t->view, DOWNPLAY_VIEW_RECENTS);
+   ASSERT_EQ(t->view, PASTIME_VIEW_RECENTS);
    ASSERT_PTR_EQ(t, &s->nav[1]);
 }
 
@@ -463,17 +463,17 @@ static void test_null_after_change_is_safe(void)
    int            pass_at_start = g_pass;
    int            fail_at_start = g_fail;
 
-   dp_nav_init(&state, DOWNPLAY_VIEW_TOP, NULL, NULL);
+   dp_nav_init(&state, PASTIME_VIEW_TOP, NULL, NULL);
    ASSERT_EQ(state.nav_depth, 1);
 
    /* Push then pop with no callback wired — must not crash. */
-   dp_nav_push(&state, DOWNPLAY_VIEW_SYSTEM, NULL, NULL);
+   dp_nav_push(&state, PASTIME_VIEW_SYSTEM, NULL, NULL);
    ASSERT_EQ(state.nav_depth, 2);
-   ASSERT_EQ(state.view, DOWNPLAY_VIEW_SYSTEM);
+   ASSERT_EQ(state.view, PASTIME_VIEW_SYSTEM);
 
    dp_nav_pop(&state);
    ASSERT_EQ(state.nav_depth, 1);
-   ASSERT_EQ(state.view, DOWNPLAY_VIEW_TOP);
+   ASSERT_EQ(state.view, PASTIME_VIEW_TOP);
 
    /* set_selection has no after_change side effect by contract; just
     * confirm it still mutates state cleanly. */
@@ -493,7 +493,7 @@ static void test_null_after_change_is_safe(void)
 
 int main(void)
 {
-   printf("=== downplay nav stack tests ===\n");
+   printf("=== pastime nav stack tests ===\n");
 
    RUN_TEST(test_init_seed);
    RUN_TEST(test_init_skips_after_change);

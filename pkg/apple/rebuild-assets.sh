@@ -140,12 +140,12 @@ if [ -n "$include_shaders" ] ; then
     mkdir shaders ; mv glsl-shaders shaders/shaders_glsl ; mv slang-shaders shaders/shaders_slang
 fi
 
-# DOWNPLAY: overlay our bundled assets (e.g. assets/downplay/InterTight-Bold.ttf)
+# PASTIME: overlay our bundled assets (e.g. assets/pastime/InterTight-Bold.ttf)
 # on top of the upstream tree before zipping, so the .app ships our font.
-downplay_assets="$WD/../../downplay/assets"
-if [ -d "$downplay_assets" ] ; then
-    echo "Packaging Downplay assets"
-    cp -R "$downplay_assets"/. .
+pastime_assets="$WD/../../pastime/assets"
+if [ -d "$pastime_assets" ] ; then
+    echo "Packaging Pastime assets"
+    cp -R "$pastime_assets"/. .
 fi
 
 rm -f $assets_zip

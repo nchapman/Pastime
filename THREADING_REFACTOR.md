@@ -1,9 +1,9 @@
-# Threading refactor — `downplay_metadata` worker
+# Threading refactor — `pastime_metadata` worker
 
 ## Context
 
-`downplay_metadata`'s current design (`89a3a70529`) runs CRC32 + libretrodb
-queries synchronously inside `downplay_drive_system_thumbnails`, which is
+`pastime_metadata`'s current design (`89a3a70529`) runs CRC32 + libretrodb
+queries synchronously inside `pastime_drive_system_thumbnails`, which is
 called every frame from the menu's render callback. The pump's `max_ops`
 parameter caps the *count* of operations per frame, not the *time*. A
 single multi-hundred-MB ROM CRC blows past the frame budget regardless:
@@ -33,13 +33,13 @@ non-obvious and the code-review will check for them.
 ## Goals
 
 1. **The menu thread never blocks on file I/O or libretrodb queries.**
-   `downplay_drive_system_thumbnails` becomes a bounded-time operation
+   `pastime_drive_system_thumbnails` becomes a bounded-time operation
    regardless of ROM size or storage performance.
 
-2. **The public API is unchanged.** `downplay_index_open`,
-   `downplay_index_lookup`, `downplay_index_note_present`,
-   `downplay_index_finish_scan`, `downplay_index_set_art_state`,
-   `downplay_index_pump`, `downplay_index_close` keep their existing
+2. **The public API is unchanged.** `pastime_index_open`,
+   `pastime_index_lookup`, `pastime_index_note_present`,
+   `pastime_index_finish_scan`, `pastime_index_set_art_state`,
+   `pastime_index_pump`, `pastime_index_close` keep their existing
    signatures and behaviours from the menu driver's perspective. Only
    the *internals* and *timing* change.
 
@@ -110,7 +110,7 @@ non-obvious and the code-review will check for them.
 ### Shared-state ownership zones
 
 ```c
-struct downplay_index
+struct pastime_index
 {
    /* === main-thread-only === */
    char *json_path;
@@ -167,7 +167,7 @@ typedef struct
    char                      basename[NAME_MAX_LENGTH];   /* canonical key */
    int64_t                   mtime;                       /* validity stamp */
    int64_t                   size;
-   enum downplay_match_kind  kind;
+   enum pastime_match_kind  kind;
    char                      match_value[64];             /* hex CRC or serial */
    char                      label[NAME_MAX_LENGTH];      /* "" if unmatched */
 } dp_result_t;
@@ -235,7 +235,7 @@ irrelevant at our scale.
 
 None. Implementation-detail changes only.
 
-The `max_ops` parameter on `downplay_index_pump` keeps its name but
+The `max_ops` parameter on `pastime_index_pump` keeps its name but
 its meaning shifts from "do up to N CRC+query cycles synchronously"
 to "drain up to N results from the worker's queue and apply them to
 entries". Behaviour from the caller's perspective is the same: bounded
@@ -250,7 +250,7 @@ from `slock_new`, and `slock_lock(NULL)` is a documented no-op).
 
 This means we get a single code path:
 
-- `downplay_index_open` calls `slock_new` / `scond_new` / `sthread_create`.
+- `pastime_index_open` calls `slock_new` / `scond_new` / `sthread_create`.
   When HAVE_THREADS is undefined, `worker` ends up NULL.
 - `note_present` always calls `slock_lock` (no-op when no thread) and
   `scond_signal` (no-op).
@@ -328,10 +328,10 @@ mutated. The SME explicitly flagged `finish_scan`'s compaction and
 
 ### Important: lifetime of the libretrodb handle across thread handoff
 
-The handle is opened on main thread in `downplay_index_open` BEFORE
+The handle is opened on main thread in `pastime_index_open` BEFORE
 `sthread_create`, which is a full memory barrier (POSIX requires
 `pthread_create` to synchronise-with the new thread's first
-instruction). The worker uses it freely. On `downplay_index_close`,
+instruction). The worker uses it freely. On `pastime_index_close`,
 the main thread signals shutdown, joins the worker (another full
 barrier), then closes the handle. Single-threaded use throughout.
 
@@ -369,9 +369,9 @@ doesn't try to "fix" it without understanding the tradeoff.
 
 ### Unit (mandatory, must pass before commit at each step)
 
-- `downplay/tests/test_metadata_disambig.c` — 95 assertions, no
+- `pastime/tests/test_metadata_disambig.c` — 95 assertions, no
   threading involvement, must keep passing through every step.
-- `downplay/tests/test_nav.c` — 61 assertions, unrelated but in the
+- `pastime/tests/test_nav.c` — 61 assertions, unrelated but in the
   same suite, must keep passing.
 
 The metadata index itself is harder to unit-test because its real-
@@ -403,7 +403,7 @@ Run through these on the connected handheld:
 4. **High-churn navigation.** Rapidly enter/exit several system views
    in <2 s each. Workers spawn, get told to shut down, join. No
    crashes, no leaks (Valgrind / ASan if available; otherwise just
-   monitor `adb shell dumpsys meminfo com.retroarch.aarch64`).
+   monitor `adb shell dumpsys meminfo gg.pastime.aarch64`).
 
 5. **HAVE_THREADS=0.** Build a desktop variant with threads disabled
    (`./configure --disable-threads`) and confirm the synchronous
@@ -420,14 +420,14 @@ Run through these on the connected handheld:
 
 Anticipated diff (subject to implementation):
 
-- `downplay/downplay_metadata.c` — substantial rework
-- `downplay/downplay_metadata.h` — possibly unchanged; if doc comments
+- `pastime/pastime_metadata.c` — substantial rework
+- `pastime/pastime_metadata.h` — possibly unchanged; if doc comments
   on the API need to clarify "now async", update there too
 - No changes to `Makefile.common` / `Android.mk` — `rthreads.h` is
   already linked transitively
-- No changes to `menu/drivers/downplay.c` — the public API is
+- No changes to `menu/drivers/pastime.c` — the public API is
   unchanged, the menu driver's drive function continues to call
-  `downplay_index_pump` per frame as today
+  `pastime_index_pump` per frame as today
 - `THREADING_REFACTOR.md` — this file; delete or move to
   `docs/archive/` once the refactor lands
 
@@ -440,5 +440,5 @@ Anticipated diff (subject to implementation):
   - `gfx/video_thread_wrapper.c` — same shape, more state.
 - libretro-common primitives: `libretro-common/include/rthreads/rthreads.h`,
   `libretro-common/rthreads/rthreads.c`.
-- Synchronous baseline: commit `89a3a70529` "Downplay: per-system
+- Synchronous baseline: commit `89a3a70529` "Pastime: per-system
   metadata index + box-art on hover".

@@ -1,18 +1,18 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /* M1: render a static MinUI-style list — header row pill, several body
@@ -53,38 +53,38 @@
 #include "../../tasks/task_content.h"
 #include "../../verbosity.h"
 
-#include "../../downplay/downplay_cores.h"
-#include "../../downplay/downplay_display_name.h"
-#include "../../downplay/downplay_metadata.h"
-#include "../../downplay/downplay_nav.h"
-#include "../../downplay/downplay_setup.h"
-#include "../../downplay/downplay_thumbs.h"
-#include "../../downplay/downplay_thumbhash.h"
-#ifdef HAVE_DOWNPLAY_WEBP
-#include "../../downplay/downplay_webp.h"
+#include "../../pastime/pastime_cores.h"
+#include "../../pastime/pastime_display_name.h"
+#include "../../pastime/pastime_metadata.h"
+#include "../../pastime/pastime_nav.h"
+#include "../../pastime/pastime_setup.h"
+#include "../../pastime/pastime_thumbs.h"
+#include "../../pastime/pastime_thumbhash.h"
+#ifdef HAVE_PASTIME_WEBP
+#include "../../pastime/pastime_webp.h"
 #endif
 
 #include <features/features_cpu.h>
 
 /* Reference design height in pixels — the mockup was drawn at this size,
  * and every dimension below is a fraction of it.  Scaling to any actual
- * screen height = video_height / DOWNPLAY_REF_HEIGHT. */
-#define DOWNPLAY_REF_HEIGHT 480.0f
+ * screen height = video_height / PASTIME_REF_HEIGHT. */
+#define PASTIME_REF_HEIGHT 480.0f
 
 /* Base font size at scale = 1.0.  Re-loaded whenever scale changes so
  * glyphs stay crisp instead of being scaled at draw time. */
-#define DOWNPLAY_FONT_BASE_SIZE 28.0f
+#define PASTIME_FONT_BASE_SIZE 28.0f
 
-#define DOWNPLAY_FONT_FILE "InterTight-Bold.ttf"
+#define PASTIME_FONT_FILE "InterTight-Bold.ttf"
 
-#define DOWNPLAY_RECENTS_LABEL "Recently Played"
+#define PASTIME_RECENTS_LABEL "Recently Played"
 
 /* One Roms/<folder> that conformed to the "Display Name (core_ident)"
  * convention.  Folders without that suffix are dropped during scan, so
- * by the time a downplay_system_t exists, display_name + core_ident +
+ * by the time a pastime_system_t exists, display_name + core_ident +
  * full_path are non-empty.  db_name is the canonical system name (e.g.
  * "Nintendo - Super Nintendo Entertainment System"), used to key the
- * Downplay thumbnail index + cache subdir.  May be NULL when
+ * Pastime thumbnail index + cache subdir.  May be NULL when
  * the user's folder name doesn't hit the disambiguation table AND no
  * matching core_info entry is loaded. */
 typedef struct
@@ -93,14 +93,14 @@ typedef struct
    char *core_ident;
    char *full_path;
    char *db_name;
-} downplay_system_t;
+} pastime_system_t;
 
 /* One ROM file inside a system folder, expanded for the system view.
  *
  * thumbnail is owned by this struct.  Initialized to blank in scan,
- * loaded on hover (WebP via downplay_webp_load_texture, JPG/PNG via
- * gfx_thumbnail_request_file once downplay_thumbs_request returns a
- * local path), freed by gfx_thumbnail_reset in downplay_roms_free.
+ * loaded on hover (WebP via pastime_webp_load_texture, JPG/PNG via
+ * gfx_thumbnail_request_file once pastime_thumbs_request returns a
+ * local path), freed by gfx_thumbnail_reset in pastime_roms_free.
  * Callers MUST have called gfx_thumbnail_cancel_pending_requests()
  * before any reset to avoid a callback racing onto freed memory. */
 typedef struct
@@ -116,10 +116,10 @@ typedef struct
     * The row drawer treats (a) and (b) identically — full-width text,
     * no art slot reserved.  Non-zero pair → row narrows the text by
     * the actual image width derived from its aspect ratio against
-    * the right-pane height budget (see downplay_image_pane_width). */
+    * the right-pane height budget (see pastime_image_pane_width). */
    uint16_t         image_w;
    uint16_t         image_h;
-} downplay_rom_t;
+} pastime_rom_t;
 
 /* One row in the recents view.  pl_idx is the entry's index in
  * g_defaults.content_history at build time — kept around because we
@@ -127,7 +127,7 @@ typedef struct
  * the array index would otherwise drift from the playlist index.
  *
  * db_name + rom_basename are populated at build time when both can
- * be derived from the playlist entry (ROM path inside a Downplay-
+ * be derived from the playlist entry (ROM path inside a Pastime-
  * convention system folder, resolvable via the disambig table).  If
  * either is NULL the row simply renders without art — recents never
  * kicks downloads, so an unresolvable system is silently artless. */
@@ -142,7 +142,7 @@ typedef struct
     * pixels.  0/0 means either: (a) the row's system index isn't on
     * disk yet (recents pump hasn't loaded it; populated when it does)
     * or (b) the cascade misses on this ROM.  Same semantics as
-    * downplay_rom_t.image_w/h. */
+    * pastime_rom_t.image_w/h. */
    uint16_t        image_w;
    uint16_t        image_h;
    /* True once the per-system resolver confirms the image file is on
@@ -154,12 +154,12 @@ typedef struct
     * into the system view that downloads the image self-heals the
     * recents layout when the user comes back. */
    bool            image_cached;
-} downplay_recent_t;
+} pastime_recent_t;
 /* No sort_key on recents — they're presented in chronological order
  * straight from g_defaults.content_history, never alphabetized. */
 
-/* enum downplay_view, dp_nav_frame_t, dp_nav_state_t and the
- * dp_nav_* helpers all live in downplay/downplay_nav.h (included
+/* enum pastime_view, dp_nav_frame_t, dp_nav_state_t and the
+ * dp_nav_* helpers all live in pastime/pastime_nav.h (included
  * above).  The handle below embeds a dp_nav_state_t — every screen
  * the user navigates into is a frame on that stack, with the bottom
  * always being TOP.  Reads of the active view + cursor go through
@@ -167,16 +167,16 @@ typedef struct
  * frame).  Mutations all go through the dp_nav_* helpers so the
  * cache can't drift. */
 
-/* downplay_handle_t is referenced as a forward decl in nav.h dispose
+/* pastime_handle_t is referenced as a forward decl in nav.h dispose
  * hook signatures (typed via void* there), but defined below. */
-typedef struct downplay_handle_s downplay_handle_t;
+typedef struct pastime_handle_s pastime_handle_t;
 
 /* INGAME row composition is conditional: Save hidden when the core
  * doesn't support savestates; Load hidden when no manual saves exist
  * yet.  We build this small action array on view enter so row labels
  * and OK dispatch share one source of truth (no parallel arrays
  * drifting). */
-enum downplay_ingame_action
+enum pastime_ingame_action
 {
    DP_INGAME_CONTINUE = 0,
    DP_INGAME_SAVE,
@@ -188,8 +188,8 @@ enum downplay_ingame_action
 /* Save-state UX (M7).  RetroArch supports slots 0..999 but 10 manual
  * slots is the MinUI cap — comfortably fits a list of thumbnails on
  * one screen and keeps flash wear bounded for handhelds. */
-#define DOWNPLAY_MAX_MANUAL_SLOTS  10
-#define DOWNPLAY_MAX_SAVE_ENTRIES (DOWNPLAY_MAX_MANUAL_SLOTS + 1) /* +1 for .auto */
+#define PASTIME_MAX_MANUAL_SLOTS  10
+#define PASTIME_MAX_SAVE_ENTRIES (PASTIME_MAX_MANUAL_SLOTS + 1) /* +1 for .auto */
 
 typedef struct
 {
@@ -211,7 +211,7 @@ typedef struct
    /* Pre-formatted relative-time label, e.g. "5 minutes ago" or
     * "Auto".  Built once on enumeration; the picker just draws it. */
    char       label[40];
-} downplay_save_entry_t;
+} pastime_save_entry_t;
 
 /* Settings-style list (M8).  A second list aesthetic — denser rows,
  * smaller font, optional value-cycler on the right, optional
@@ -238,35 +238,35 @@ typedef struct
    void              (*on_change)(int delta, void *userdata);
    void              (*on_confirm)(void *userdata);
    void               *userdata;
-} downplay_settings_row_t;
+} pastime_settings_row_t;
 
 /* Forward decl so on_close can name the typedef. */
-typedef struct downplay_settings_list downplay_settings_list_t;
+typedef struct pastime_settings_list pastime_settings_list_t;
 
-/* Forward decl: defined alongside downplay_draw_right_preview, but
+/* Forward decl: defined alongside pastime_draw_right_preview, but
  * called from the recents/system dispose hooks much earlier in the
  * file. */
-static void dp_free_thumbhash_placeholder(downplay_handle_t *dp);
+static void dp_free_thumbhash_placeholder(pastime_handle_t *dp);
 
 /* One settings list.  Stack-allocated when small / static (root
  * Options); heap-allocated when row count is dynamic (core options). */
-struct downplay_settings_list
+struct pastime_settings_list
 {
    const char              *title;       /* reserved for future header */
-   downplay_settings_row_t *rows;        /* owned: free()d on list dispose */
+   pastime_settings_row_t *rows;        /* owned: free()d on list dispose */
    size_t                   row_count;
    /* Optional userdata pool that backs row->userdata pointers.  Owned;
     * free()d alongside rows.  NULL when no row needs per-row allocated
     * userdata (e.g. root Options list — its on_confirm handlers take
     * dp itself). */
    void                    *userdata_pool;
-   /* Optional flush callback fired by downplay_settings_pop just
+   /* Optional flush callback fired by pastime_settings_pop just
     * before the list is freed.  Used when row changes are staged in
     * row state during navigation and committed once on back-out (the
     * Frontend submenu does this so scrolling Effect doesn't recompile
     * shaders on every L/R press).  on_close_userdata is
     * passed verbatim. */
-   void                   (*on_close)(downplay_settings_list_t *L,
+   void                   (*on_close)(pastime_settings_list_t *L,
                                       void *userdata);
    void                    *on_close_userdata;
    unsigned                 width_pct;   /* % of vid_w */
@@ -286,7 +286,7 @@ struct downplay_settings_list
  *
  * Add new layout knobs by switching on this enum rather than re-deriving
  * thresholds inline. */
-enum downplay_aspect_bp
+enum pastime_aspect_bp
 {
    DP_AR_SQUARE = 0,
    DP_AR_CLASSIC,
@@ -322,7 +322,7 @@ typedef struct
    float scale_factor;
    unsigned vid_w;
    unsigned vid_h;
-   enum downplay_aspect_bp aspect_bp;
+   enum pastime_aspect_bp aspect_bp;
    /* Left edge of the right-pane preview area, in pixels.  Derived from
     * aspect_bp so squarer screens give the rows more horizontal room.
     * The pane spans [pane_left, vid_w - margin_x).  Used by the right-
@@ -347,13 +347,13 @@ typedef struct
    int   settings_row_h;
    float settings_font_size;
    int   settings_value_gap;   /* horizontal gap between title pill and value */
-} downplay_layout_t;
+} pastime_layout_t;
 
-struct downplay_handle_s
+struct pastime_handle_s
 {
-   /* Navigation stack.  nav.nav[0] is seeded with DOWNPLAY_VIEW_TOP
-    * in downplay_menu_init; nav.nav_depth >= 1 always.  Use the
-    * dp_nav_* helpers (downplay_nav.h) to push / pop / change
+   /* Navigation stack.  nav.nav[0] is seeded with PASTIME_VIEW_TOP
+    * in pastime_menu_init; nav.nav_depth >= 1 always.  Use the
+    * dp_nav_* helpers (pastime_nav.h) to push / pop / change
     * selection.  Read nav.view / nav.selection directly — they are
     * cached mirrors of the top frame, kept in sync by the helpers. */
    dp_nav_state_t      nav;
@@ -362,34 +362,34 @@ struct downplay_handle_s
    font_data_t        *chrome_font;
    /* Per-font baseline-from-line-centre offsets, measured once at font
     * load via font_driver_get_line_centre_offset.  Used by
-    * downplay_baseline_y to vertically centre text in a row exactly,
+    * pastime_baseline_y to vertically centre text in a row exactly,
     * rather than the old (font_size * 0.35f) heuristic. */
    int                 font_centre_offset;
    int                 chrome_font_centre_offset;
    /* Sorted (by display_name) array of conforming Roms/ subfolders.
     * NULL when system_count == 0. */
-   downplay_system_t  *systems;
+   pastime_system_t  *systems;
    size_t              system_count;
-   /* Populated only while view == DOWNPLAY_VIEW_SYSTEM. */
-   downplay_rom_t     *roms;
+   /* Populated only while view == PASTIME_VIEW_SYSTEM. */
+   pastime_rom_t     *roms;
    size_t              rom_count;
    size_t              active_system;     /* index into systems */
    uintptr_t           pill_cap_tex;      /* RGBA circle, rounded pill ends */
-   downplay_layout_t   layout;
+   pastime_layout_t   layout;
    /* Number of entries in g_defaults.content_history at last rebuild.
     * 0 hides the "Recently Played" row entirely. */
    size_t              recent_count;
    /* Cached display rows for the RECENTS view.  Populated on drill-in
     * and freed on close so we don't re-format every frame.  Each entry
-    * carries its source playlist index (see downplay_recent_t). */
-   downplay_recent_t  *recents;
+    * carries its source playlist index (see pastime_recent_t). */
+   pastime_recent_t  *recents;
    size_t              recent_row_count;
    /* Cached: rows in the current view (TOP: recents header + systems;
     * SYSTEM: rom_count). */
    size_t              total_rows;
    /* Lazy-install handoff (PLAN.md M3 Flow B): set when the user picks a
     * ROM whose core isn't installed.  The cores module takes over the
-    * frame (splash), and downplay_drive_pending_launch finishes the
+    * frame (splash), and pastime_drive_pending_launch finishes the
     * launch once it returns to DONE.  Empty core[0] means none pending.
     * Sized to PATH_MAX_LENGTH for symmetry with the rom buffer; idents
     * are short, but a single bound keeps the asymmetry from being a
@@ -403,7 +403,7 @@ struct downplay_handle_s
     * [3,5]: Continue + Options + Quit are unconditional, Save and
     * Load are conditional on core_info_current_supports_savestate()
     * and whether manual saves exist on disk. */
-   enum downplay_ingame_action ingame_actions[5];
+   enum pastime_ingame_action ingame_actions[5];
    size_t              ingame_action_count;
 
    /* Dedicated font for settings-list rows (smaller than dp->font).
@@ -425,24 +425,24 @@ struct downplay_handle_s
     * intended to touch. */
    bool                      frontend_effect_dirty;
 
-   /* Save-state picker (DOWNPLAY_VIEW_SAVE_PICKER).  Cached on view
+   /* Save-state picker (PASTIME_VIEW_SAVE_PICKER).  Cached on view
     * enter, freed (textures unloaded) on view exit.  Sorted desc by
     * mtime; entry 0 is always the most recent.  Includes .auto if it
     * exists alongside manual slots. */
-   downplay_save_entry_t save_picker[DOWNPLAY_MAX_SAVE_ENTRIES];
+   pastime_save_entry_t save_picker[PASTIME_MAX_SAVE_ENTRIES];
    size_t              save_picker_count;
 
    /* Per-system thumbnail manager (pastime.gg-backed).  Owns the
     * canonical-key index, on-disk image cache, and the lookahead
     * fetch queue.  Open on system enter, close on system exit. */
-   downplay_thumbs_t  *current_thumbs;
+   pastime_thumbs_t  *current_thumbs;
 
    /* Read-only recents resolver.  Lazy-loads per-system binary
     * indexes on demand.  Does NOT issue HTTP fetches; rows whose
     * system has no cached `.idx` simply render without art until
     * the user opens that system view.  Open on recents enter,
     * close on recents exit. */
-   downplay_thumbs_recents_t *recents_thumbs;
+   pastime_thumbs_recents_t *recents_thumbs;
 
    /* Index of the row whose thumbnail is currently loading or loaded.
     * On selection change we reset the previous row's thumbnail so
@@ -463,7 +463,7 @@ struct downplay_handle_s
    /* Set true after the SYSTEM-view dim warm-up has succeeded (at
     * least one ROM matched the thumbnail index, populating image_w/h
     * for every row in dp->roms).  Reset on system enter; checked each
-    * frame in downplay_drive_system_thumbnails to know whether to
+    * frame in pastime_drive_system_thumbnails to know whether to
     * retry the warm-up (cold first-visit case where the index hadn't
     * landed yet at open_system time). */
    bool                roms_dims_warmed;
@@ -500,7 +500,7 @@ struct downplay_handle_s
    /* Cached "Resume <Game>" availability for the launcher's TOP view.
     * Refreshed on rebuild_lists; if true, a Resume row is prepended
     * above Recents.  Stores the most-recent recents playlist index so
-    * selection dispatches to downplay_launch_recent without re-
+    * selection dispatches to pastime_launch_recent without re-
     * searching. */
    bool                resume_available;
    size_t              resume_pl_idx;
@@ -508,7 +508,7 @@ struct downplay_handle_s
    char                resume_label[NAME_MAX_LENGTH];
 
    /* Top-right status pill text — rebuilt once per frame in
-    * downplay_menu_frame from RA's powerstate + timedate helpers (both
+    * pastime_menu_frame from RA's powerstate + timedate helpers (both
     * internally throttled).  Cached because the value is consumed in
     * three places (the pill draw, the title-pill right limit, and the
     * top-row max-width budget) and we want them all in sync within a
@@ -573,7 +573,7 @@ static float DP_COLOR_PILL_BG_GRAY[16] = {
  * = smoother arc + smaller relative AA fringe = cleaner join with the
  * rect.  256 keeps the malloc tiny (256 KB) while putting the AA
  * falloff well below one output pixel at any real pill height. */
-#define DOWNPLAY_CAP_TEX_DIAMETER 256
+#define PASTIME_CAP_TEX_DIAMETER 256
 
 #define DP_TEXT_LIGHT   0xFFFFFFFF
 #define DP_TEXT_DARK    0x000000FF
@@ -587,17 +587,17 @@ static float DP_COLOR_PILL_BG_GRAY[16] = {
 /* TOP-view only: row 0 is "Recently Played" iff there are recent entries.
  * If a Resume row is present (M7), it sits *above* the Recents row, so
  * the Recents-row index in TOP becomes (resume_available ? 1 : 0). */
-static bool downplay_has_recents_row(const downplay_handle_t *dp)
+static bool pastime_has_recents_row(const pastime_handle_t *dp)
 {
-   return dp->nav.view == DOWNPLAY_VIEW_TOP && dp->recent_count > 0;
+   return dp->nav.view == PASTIME_VIEW_TOP && dp->recent_count > 0;
 }
 
-static bool downplay_has_resume_row(const downplay_handle_t *dp)
+static bool pastime_has_resume_row(const pastime_handle_t *dp)
 {
-   return dp->nav.view == DOWNPLAY_VIEW_TOP && dp->resume_available;
+   return dp->nav.view == PASTIME_VIEW_TOP && dp->resume_available;
 }
 
-static const char *downplay_ingame_label(enum downplay_ingame_action a)
+static const char *pastime_ingame_label(enum pastime_ingame_action a)
 {
    switch (a)
    {
@@ -610,32 +610,32 @@ static const char *downplay_ingame_label(enum downplay_ingame_action a)
    return "";
 }
 
-static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
+static const char *pastime_row_label(const pastime_handle_t *dp, size_t row)
 {
    size_t sys_idx;
 
-   if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
+   if (dp->nav.view == PASTIME_VIEW_INGAME)
    {
       if (row < dp->ingame_action_count)
-         return downplay_ingame_label(dp->ingame_actions[row]);
+         return pastime_ingame_label(dp->ingame_actions[row]);
       return "";
    }
 
-   if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
+   if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER)
    {
       if (row < dp->save_picker_count)
          return dp->save_picker[row].label;
       return "";
    }
 
-   if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
+   if (dp->nav.view == PASTIME_VIEW_SYSTEM)
    {
       if (dp->roms && row < dp->rom_count)
          return dp->roms[row].display_name;
       return "";
    }
 
-   if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
+   if (dp->nav.view == PASTIME_VIEW_RECENTS)
    {
       if (dp->recents && row < dp->recent_row_count)
          return dp->recents[row].display_name;
@@ -646,16 +646,16 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
     * sits above Systems.  Order matters here — both flags are
     * independent, so we walk them in sequence rather than using a
     * single conditional offset. */
-   if (downplay_has_resume_row(dp))
+   if (pastime_has_resume_row(dp))
    {
       if (row == 0)
          return dp->resume_label;
       row--;
    }
-   if (downplay_has_recents_row(dp))
+   if (pastime_has_recents_row(dp))
    {
       if (row == 0)
-         return DOWNPLAY_RECENTS_LABEL;
+         return PASTIME_RECENTS_LABEL;
       sys_idx = row - 1;
    }
    else
@@ -673,7 +673,7 @@ static const char *downplay_row_label(const downplay_handle_t *dp, size_t row)
  * heap-allocates display_name and core_ident (caller frees) and returns
  * true.  Folders that don't match the pattern are silently rejected —
  * strict convention is the feature; there is no fallback. */
-static bool downplay_parse_system_folder(const char *folder,
+static bool pastime_parse_system_folder(const char *folder,
       char **display_out, char **ident_out)
 {
    const char *open;
@@ -740,14 +740,14 @@ static bool downplay_parse_system_folder(const char *folder,
    return true;
 }
 
-static int downplay_system_cmp(const void *a, const void *b)
+static int pastime_system_cmp(const void *a, const void *b)
 {
-   const downplay_system_t *sa = (const downplay_system_t*)a;
-   const downplay_system_t *sb = (const downplay_system_t*)b;
+   const pastime_system_t *sa = (const pastime_system_t*)a;
+   const pastime_system_t *sb = (const pastime_system_t*)b;
    return strcasecmp(sa->display_name, sb->display_name);
 }
 
-static void downplay_systems_free(downplay_system_t *systems, size_t count)
+static void pastime_systems_free(pastime_system_t *systems, size_t count)
 {
    size_t i;
    if (!systems)
@@ -766,7 +766,7 @@ static void downplay_systems_free(downplay_system_t *systems, size_t count)
  * resets each per-ROM gfx_thumbnail_t — both are required by
  * gfx_thumbnail.h (cancel before any pending->reset sequence) to
  * avoid the upload callback writing into freed memory. */
-static void downplay_roms_free(downplay_rom_t *roms, size_t count)
+static void pastime_roms_free(pastime_rom_t *roms, size_t count)
 {
    size_t i;
    if (!roms)
@@ -787,7 +787,7 @@ static void downplay_roms_free(downplay_rom_t *roms, size_t count)
  * retro_opendir so we can bail at the first hit without allocating a
  * full file listing — a 5000-ROM library would otherwise allocate
  * megabytes per system on every rebuild. */
-static bool downplay_folder_has_content(const char *full_path)
+static bool pastime_folder_has_content(const char *full_path)
 {
    RDIR *dir;
    bool  found = false;
@@ -804,7 +804,7 @@ static bool downplay_folder_has_content(const char *full_path)
       {
          char child[PATH_MAX_LENGTH];
          fill_pathname_join_special(child, full_path, name, sizeof(child));
-         if (downplay_folder_has_content(child))
+         if (pastime_folder_has_content(child))
          {
             found = true;
             break;
@@ -821,11 +821,11 @@ static bool downplay_folder_has_content(const char *full_path)
 /* Scan Roms/ for conforming subfolders.  Drops files, drops folders that
  * don't match "Display Name (core_ident)", and drops folders with no
  * content inside.  Returns NULL + count==0 when nothing qualifies. */
-static downplay_system_t *downplay_scan_systems(const char *content_root,
+static pastime_system_t *pastime_scan_systems(const char *content_root,
       size_t *out_count)
 {
    struct string_list *raw;
-   downplay_system_t  *systems = NULL;
+   pastime_system_t  *systems = NULL;
    size_t              cap     = 0;
    size_t              count   = 0;
    size_t              i;
@@ -848,9 +848,9 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
       if (raw->elems[i].attr.i != RARCH_DIRECTORY)
          continue;
       fill_pathname_base(base, raw->elems[i].data, sizeof(base));
-      if (!downplay_parse_system_folder(base, &display, &ident))
+      if (!pastime_parse_system_folder(base, &display, &ident))
          continue;
-      if (!downplay_folder_has_content(raw->elems[i].data))
+      if (!pastime_folder_has_content(raw->elems[i].data))
       {
          free(display);
          free(ident);
@@ -860,7 +860,7 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
       if (count == cap)
       {
          size_t             new_cap = cap ? cap * 2 : 8;
-         downplay_system_t *grown   = (downplay_system_t*)realloc(systems,
+         pastime_system_t *grown   = (pastime_system_t*)realloc(systems,
                new_cap * sizeof(*systems));
          if (!grown)
          {
@@ -889,7 +889,7 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
           * either typed an unknown display name or the core's .info
           * isn't loaded yet.  Survivable; recovers on next rebuild
           * once core_info catches up. */
-         db = downplay_metadata_resolve_db_name(display, ident);
+         db = pastime_metadata_resolve_db_name(display, ident);
          systems[count].db_name = db ? strdup(db) : NULL;
          count++;
       }
@@ -897,16 +897,16 @@ static downplay_system_t *downplay_scan_systems(const char *content_root,
    string_list_free(raw);
 
    if (count > 1)
-      qsort(systems, count, sizeof(*systems), downplay_system_cmp);
+      qsort(systems, count, sizeof(*systems), pastime_system_cmp);
 
    *out_count = count;
    return systems;
 }
 
-static int downplay_rom_cmp(const void *a, const void *b)
+static int pastime_rom_cmp(const void *a, const void *b)
 {
-   const downplay_rom_t *ra = (const downplay_rom_t*)a;
-   const downplay_rom_t *rb = (const downplay_rom_t*)b;
+   const pastime_rom_t *ra = (const pastime_rom_t*)a;
+   const pastime_rom_t *rb = (const pastime_rom_t*)b;
    const char *ka = ra->sort_key ? ra->sort_key : ra->display_name;
    const char *kb = rb->sort_key ? rb->sort_key : rb->display_name;
    return strcmp(ka, kb);
@@ -915,11 +915,11 @@ static int downplay_rom_cmp(const void *a, const void *b)
 /* Scan one system folder for ROMs.  Top-level files only (subfolders
  * deferred); .zip and other archives included since libretro cores
  * read them directly via the VFS layer. */
-static downplay_rom_t *downplay_scan_roms(const char *system_path,
+static pastime_rom_t *pastime_scan_roms(const char *system_path,
       size_t *out_count)
 {
    struct string_list *raw;
-   downplay_rom_t     *roms  = NULL;
+   pastime_rom_t     *roms  = NULL;
    size_t              cap   = 0;
    size_t              count = 0;
    size_t              i;
@@ -951,7 +951,7 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
       if (count == cap)
       {
          size_t          new_cap = cap ? cap * 2 : 16;
-         downplay_rom_t *grown   = (downplay_rom_t*)realloc(roms,
+         pastime_rom_t *grown   = (pastime_rom_t*)realloc(roms,
                new_cap * sizeof(*roms));
          if (!grown)
             break;
@@ -966,11 +966,11 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          /* Strip No-Intro / Redump trailing tags here so the user sees
           * "Super Mario Bros. 3" not "Super Mario Bros. 3 (USA) (Rev A)".
           * sort_key folds case + drops a leading article so "The Legend
-          * of Zelda" sorts under L.  See downplay_display_name.h. */
-         downplay_display_name_clean(base, clean, sizeof(clean));
+          * of Zelda" sorts under L.  See pastime_display_name.h. */
+         pastime_display_name_clean(base, clean, sizeof(clean));
          if (!*clean)
             continue;
-         downplay_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
+         pastime_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
          if (!(display = strdup(clean)))
             break;
          if (!(sort_dup = strdup(sort_buf)))
@@ -990,7 +990,7 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
          roms[count].full_path    = path_dup;
          gfx_thumbnail_init_blank(&roms[count].thumbnail);
          /* image_w/image_h left zero by the memset above — populated
-          * once by the dim warm-up in downplay_open_system after the
+          * once by the dim warm-up in pastime_open_system after the
           * thumbnail manager is opened, and (in the cold-fetch case)
           * re-populated by the per-frame drive once the index lands. */
          count++;
@@ -999,23 +999,23 @@ static downplay_rom_t *downplay_scan_roms(const char *system_path,
    string_list_free(raw);
 
    if (count > 1)
-      qsort(roms, count, sizeof(*roms), downplay_rom_cmp);
+      qsort(roms, count, sizeof(*roms), pastime_rom_cmp);
 
    *out_count = count;
    return roms;
 }
 
-static void downplay_recompute_total_rows(downplay_handle_t *dp)
+static void pastime_recompute_total_rows(pastime_handle_t *dp)
 {
-   if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
+   if (dp->nav.view == PASTIME_VIEW_INGAME)
       dp->total_rows = dp->ingame_action_count;
-   else if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
+   else if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER)
       dp->total_rows = dp->save_picker_count;
-   else if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
+   else if (dp->nav.view == PASTIME_VIEW_SYSTEM)
       dp->total_rows = dp->rom_count;
-   else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
+   else if (dp->nav.view == PASTIME_VIEW_RECENTS)
       dp->total_rows = dp->recent_row_count;
-   else if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+   else if (dp->nav.view == PASTIME_VIEW_SETTINGS)
    {
       /* Settings view manages its own selection/scroll on the active
        * stack frame; the main `selection` cursor isn't meaningful
@@ -1026,8 +1026,8 @@ static void downplay_recompute_total_rows(downplay_handle_t *dp)
       return;
    }
    else
-      dp->total_rows = (downplay_has_resume_row(dp)  ? 1 : 0)
-                     + (downplay_has_recents_row(dp) ? 1 : 0)
+      dp->total_rows = (pastime_has_resume_row(dp)  ? 1 : 0)
+                     + (pastime_has_recents_row(dp) ? 1 : 0)
                      + dp->system_count;
 
    /* Selection clamp: keep dp->nav.selection in [0, total_rows).
@@ -1042,21 +1042,21 @@ static void downplay_recompute_total_rows(downplay_handle_t *dp)
 }
 
 /* nav stack helpers (push/pop/pop_to/top/root_view/set_selection)
- * live in downplay/downplay_nav.c — see the header included at the
+ * live in pastime/pastime_nav.c — see the header included at the
  * top of this file.  Wrapper that lets the after_change callback
  * (dp_nav_state_t-typed) reach back into the host's recompute. */
-static void downplay_after_nav_change(void *user)
+static void pastime_after_nav_change(void *user)
 {
-   downplay_recompute_total_rows((downplay_handle_t*)user);
+   pastime_recompute_total_rows((pastime_handle_t*)user);
 }
 
-static void downplay_recents_free(downplay_recent_t *rows, size_t count)
+static void pastime_recents_free(pastime_recent_t *rows, size_t count)
 {
    size_t i;
    if (!rows)
       return;
    /* Cancel any in-flight gfx_thumbnail_request_file before resetting,
-    * mirroring downplay_roms_free; otherwise a callback can race onto
+    * mirroring pastime_roms_free; otherwise a callback can race onto
     * freed memory.  Safe even if no requests were ever issued. */
    gfx_thumbnail_cancel_pending_requests();
    for (i = 0; i < count; i++)
@@ -1074,10 +1074,10 @@ static void downplay_recents_free(downplay_recent_t *rows, size_t count)
  * with neither (corrupt history line, contentless-core stub) so they
  * can't push a blank row — pl_idx preserves the original index for
  * launch lookup. */
-static downplay_recent_t *downplay_build_recents(size_t *out_count)
+static pastime_recent_t *pastime_build_recents(size_t *out_count)
 {
    playlist_t        *pl    = g_defaults.content_history;
-   downplay_recent_t *out   = NULL;
+   pastime_recent_t *out   = NULL;
    char               buf[NAME_MAX_LENGTH];
    size_t             total;
    size_t             count = 0;
@@ -1089,7 +1089,7 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
    total = playlist_size(pl);
    if (total == 0)
       return NULL;
-   if (!(out = (downplay_recent_t*)calloc(total, sizeof(*out))))
+   if (!(out = (pastime_recent_t*)calloc(total, sizeof(*out))))
       return NULL;
 
    for (i = 0; i < total; i++)
@@ -1116,7 +1116,7 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
 
       {
          char clean[NAME_MAX_LENGTH];
-         downplay_display_name_clean(src, clean, sizeof(clean));
+         pastime_display_name_clean(src, clean, sizeof(clean));
          if (!*clean)
             continue;
          if (!(dup = strdup(clean)))
@@ -1156,9 +1156,9 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
          }
          folder = path_basename(parent_dir);
          if (folder && *folder
-               && downplay_parse_system_folder(folder, &display, &ident))
+               && pastime_parse_system_folder(folder, &display, &ident))
          {
-            const char *db = downplay_metadata_resolve_db_name(display, ident);
+            const char *db = pastime_metadata_resolve_db_name(display, ident);
             if (db && *db)
                out[count].db_name = strdup(db);
             free(display);
@@ -1182,11 +1182,11 @@ static downplay_recent_t *downplay_build_recents(size_t *out_count)
 /* Filesystem mtime in seconds since epoch.  Returns 0 on stat failure
  * — callers treat 0 as "absent" and skip the entry, so we never sort
  * stat-failed files into the picker.  POSIX stat is fine on macOS,
- * Linux, and Android (Downplay's target platforms).  Windows ports
+ * Linux, and Android (Pastime's target platforms).  Windows ports
  * would need a `_stat` / `_stati64` shim around `<sys/stat.h>` —
- * downplay.c is HAVE_DOWNPLAY-gated and the fork doesn't ship for
+ * pastime.c is HAVE_PASTIME-gated and the fork doesn't ship for
  * Windows yet, so the unconditional POSIX call is fine for now. */
-static int64_t downplay_file_mtime(const char *path)
+static int64_t pastime_file_mtime(const char *path)
 {
    struct stat st;
    if (!path || !*path)
@@ -1200,7 +1200,7 @@ static int64_t downplay_file_mtime(const char *path)
  * since for our use case (10 manual slots that rotate) entries older
  * than a few weeks are a corner case, not the norm.  Returns the
  * string unconditionally (always NUL-terminated). */
-static void downplay_format_relative_time(int64_t mtime,
+static void pastime_format_relative_time(int64_t mtime,
       char *out, size_t out_len)
 {
    int64_t now;
@@ -1248,7 +1248,7 @@ static void downplay_format_relative_time(int64_t mtime,
 
 /* Free GPU textures held by the picker entries and zero the array.
  * Safe to call repeatedly (entries with thumb_tex == 0 are skipped). */
-static void downplay_save_picker_free(downplay_handle_t *dp)
+static void pastime_save_picker_free(pastime_handle_t *dp)
 {
    size_t i;
    for (i = 0; i < dp->save_picker_count; i++)
@@ -1272,7 +1272,7 @@ static void downplay_save_picker_free(downplay_handle_t *dp)
  * the display, and even at exact integer multiples the result reads
  * blurry because the menu framebuffer itself is rescaled.  LINEAR is
  * right for hand-drawn / photographic assets where smoothing helps. */
-static uintptr_t downplay_load_png_texture(const char *path,
+static uintptr_t pastime_load_png_texture(const char *path,
       enum texture_filter_type filter,
       unsigned *out_w, unsigned *out_h)
 {
@@ -1285,7 +1285,7 @@ static uintptr_t downplay_load_png_texture(const char *path,
       return 0;
 
    memset(&ti, 0, sizeof(ti));
-   /* All RA video drivers used on Downplay's targets accept RGBA;
+   /* All RA video drivers used on Pastime's targets accept RGBA;
     * mirror what build_cap_texture below does. */
    ti.supports_rgba = true;
 
@@ -1300,10 +1300,10 @@ static uintptr_t downplay_load_png_texture(const char *path,
 }
 
 /* mtime-desc qsort comparator. */
-static int downplay_save_entry_cmp(const void *a, const void *b)
+static int pastime_save_entry_cmp(const void *a, const void *b)
 {
-   const downplay_save_entry_t *ea = (const downplay_save_entry_t*)a;
-   const downplay_save_entry_t *eb = (const downplay_save_entry_t*)b;
+   const pastime_save_entry_t *ea = (const pastime_save_entry_t*)a;
+   const pastime_save_entry_t *eb = (const pastime_save_entry_t*)b;
    if (ea->mtime > eb->mtime) return -1;
    if (ea->mtime < eb->mtime) return  1;
    return 0;
@@ -1314,7 +1314,7 @@ static int downplay_save_entry_cmp(const void *a, const void *b)
  * picker state (textures) before calling.  load_thumbs == true loads
  * the PNG thumbnails synchronously — the picker view passes true; the
  * INGAME row-count refresh passes false (it just needs the count). */
-static void downplay_savestate_enumerate(downplay_save_entry_t *out,
+static void pastime_savestate_enumerate(pastime_save_entry_t *out,
       size_t *out_count, bool load_thumbs)
 {
    size_t           count = 0;
@@ -1333,18 +1333,18 @@ static void downplay_savestate_enumerate(downplay_save_entry_t *out,
    if (!base_savestate || !*base_savestate)
       return;
 
-   for (slot = -1; slot < DOWNPLAY_MAX_MANUAL_SLOTS; slot++)
+   for (slot = -1; slot < PASTIME_MAX_MANUAL_SLOTS; slot++)
    {
       if (!runloop_get_savestate_path(state_path, sizeof(state_path), slot))
          continue;
-      mtime = downplay_file_mtime(state_path);
+      mtime = pastime_file_mtime(state_path);
       if (mtime == 0)
          continue;
 
       out[count].slot   = slot;
       out[count].mtime  = mtime;
       out[count].locked = false;
-      downplay_format_relative_time(mtime,
+      pastime_format_relative_time(mtime,
             out[count].label, sizeof(out[count].label));
       /* Tag the autosave so the user can tell it apart from manual
        * saves (esp. when "Just now" matches a recent quit). */
@@ -1359,7 +1359,7 @@ static void downplay_savestate_enumerate(downplay_save_entry_t *out,
       {
          gfx_savestate_thumbnail_get_path(thumb_path, sizeof(thumb_path),
                base_savestate, slot);
-         out[count].thumb_tex = downplay_load_png_texture(thumb_path,
+         out[count].thumb_tex = pastime_load_png_texture(thumb_path,
                TEXTURE_FILTER_NEAREST,
                &out[count].thumb_w, &out[count].thumb_h);
       }
@@ -1367,7 +1367,7 @@ static void downplay_savestate_enumerate(downplay_save_entry_t *out,
    }
 
    if (count > 1)
-      qsort(out, count, sizeof(*out), downplay_save_entry_cmp);
+      qsort(out, count, sizeof(*out), pastime_save_entry_cmp);
    *out_count = count;
 }
 
@@ -1375,7 +1375,7 @@ static void downplay_savestate_enumerate(downplay_save_entry_t *out,
  * Strategy: first empty manual slot 0..9, else oldest (lowest mtime)
  * unlocked manual slot.  Ignores the .auto slot — that's reserved for
  * RA's autosave-on-quit and is never our target. */
-static int downplay_pick_next_save_slot(void)
+static int pastime_pick_next_save_slot(void)
 {
    int              slot;
    int64_t          mt;
@@ -1387,11 +1387,11 @@ static int downplay_pick_next_save_slot(void)
    if (!runloop_st || !*runloop_st->name.savestate)
       return 0;
 
-   for (slot = 0; slot < DOWNPLAY_MAX_MANUAL_SLOTS; slot++)
+   for (slot = 0; slot < PASTIME_MAX_MANUAL_SLOTS; slot++)
    {
       if (!runloop_get_savestate_path(state_path, sizeof(state_path), slot))
          continue;
-      mt = downplay_file_mtime(state_path);
+      mt = pastime_file_mtime(state_path);
       if (mt == 0)
          return slot;       /* first empty wins */
       if (mt < oldest_mt)
@@ -1406,7 +1406,7 @@ static int downplay_pick_next_save_slot(void)
 /* Save / load to a specific slot WITHOUT permanently disturbing the
  * user's state_slot cursor (which OSD widgets, hotkeys, and Settings
  * UI all read from).  Stash → set → fire command → restore. */
-static void downplay_save_to_slot(int slot)
+static void pastime_save_to_slot(int slot)
 {
    settings_t *settings = config_get_ptr();
    int         saved_slot;
@@ -1419,7 +1419,7 @@ static void downplay_save_to_slot(int slot)
    configuration_set_int(settings, settings->ints.state_slot, saved_slot);
 }
 
-static void downplay_load_from_slot(int slot)
+static void pastime_load_from_slot(int slot)
 {
    settings_t *settings = config_get_ptr();
    int         saved_slot;
@@ -1437,9 +1437,9 @@ static void downplay_load_from_slot(int slot)
  * row hidden when zero manual saves exist (auto-only doesn't count —
  * that's loaded via Resume from the launcher, not the in-game menu).
  * Selection is clamped to the new bounds. */
-static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
+static void pastime_refresh_ingame_actions(pastime_handle_t *dp)
 {
-   downplay_save_entry_t scratch[DOWNPLAY_MAX_SAVE_ENTRIES];
+   pastime_save_entry_t scratch[PASTIME_MAX_SAVE_ENTRIES];
    size_t                scratch_count = 0;
    bool                  supports;
    size_t                manual_count  = 0;
@@ -1450,7 +1450,7 @@ static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
 
    if (supports)
    {
-      downplay_savestate_enumerate(scratch, &scratch_count, false);
+      pastime_savestate_enumerate(scratch, &scratch_count, false);
       for (i = 0; i < scratch_count; i++)
          if (scratch[i].slot >= 0)
             manual_count++;
@@ -1465,7 +1465,7 @@ static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
    dp->ingame_actions[n++] = DP_INGAME_QUIT;
    dp->ingame_action_count = n;
 
-   if (dp->nav.view == DOWNPLAY_VIEW_INGAME && dp->nav.selection >= n)
+   if (dp->nav.view == PASTIME_VIEW_INGAME && dp->nav.selection >= n)
       dp_nav_set_selection(&dp->nav, n - 1);
 }
 
@@ -1474,12 +1474,12 @@ static void downplay_refresh_ingame_actions(downplay_handle_t *dp)
  * reproduce RA's path-construction for `<savestate_dir>/<content
  * basename minus extension>.state.auto`.  This matches the branch in
  * runloop_path_set_redirect (runloop.c:8408) that fires when
- * directory_savestate is set — Downplay always sets it via the
+ * directory_savestate is set — Pastime always sets it via the
  * defaults overlay.  Crucially, RA strips the content extension
  * before appending `.state` (see runloop_path_set_basename at
  * runloop.c:8174), so we must too — otherwise `foo.nes` would map
  * to `foo.nes.state.auto` and the Resume row would never appear. */
-static void downplay_refresh_resume(downplay_handle_t *dp)
+static void pastime_refresh_resume(pastime_handle_t *dp)
 {
    playlist_t                  *pl    = g_defaults.content_history;
    const struct playlist_entry *entry = NULL;
@@ -1526,14 +1526,14 @@ static void downplay_refresh_resume(downplay_handle_t *dp)
  * and the read-only thumbnail resolver.  Selection is preserved by
  * the parent TOP frame underneath us, so we don't need to do
  * anything to restore it. */
-static void downplay_recents_dispose(void *user, void *side)
+static void pastime_recents_dispose(void *user, void *side)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)user;
+   pastime_handle_t *dp = (pastime_handle_t*)user;
    (void)side;
-   downplay_recents_free(dp->recents, dp->recent_row_count);
+   pastime_recents_free(dp->recents, dp->recent_row_count);
    dp->recents             = NULL;
    dp->recent_row_count    = 0;
-   downplay_thumbs_recents_close(dp->recents_thumbs);
+   pastime_thumbs_recents_close(dp->recents_thumbs);
    dp->recents_thumbs      = NULL;
    dp->thumb_prev_selection_rec = SIZE_MAX;
    /* Reset the right-pane fade key so re-entering a two-pane view
@@ -1545,11 +1545,11 @@ static void downplay_recents_dispose(void *user, void *side)
  * (next push will rebuild it via refresh_ingame_actions); we just
  * need to refresh the launcher's Resume row availability so the new
  * autosave RA wrote on unload shows up. */
-static void downplay_ingame_dispose(void *user, void *side)
+static void pastime_ingame_dispose(void *user, void *side)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)user;
+   pastime_handle_t *dp = (pastime_handle_t*)user;
    (void)side;
-   downplay_refresh_resume(dp);
+   pastime_refresh_resume(dp);
 }
 
 /* Dispose hook for the SAVE_PICKER frame: free thumbnail textures
@@ -1557,12 +1557,12 @@ static void downplay_ingame_dispose(void *user, void *side)
  * Load row's visibility is gated on manual_count, which the user
  * may have just changed by loading a slot — and a freshly-loaded
  * state generates an autosave that bumps the count next time). */
-static void downplay_save_picker_dispose(void *user, void *side)
+static void pastime_save_picker_dispose(void *user, void *side)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)user;
+   pastime_handle_t *dp = (pastime_handle_t*)user;
    (void)side;
-   downplay_save_picker_free(dp);
-   downplay_refresh_ingame_actions(dp);
+   pastime_save_picker_free(dp);
+   pastime_refresh_ingame_actions(dp);
    /* Drop the right-pane fade key: the next two-pane view should fade
     * its first texture in from zero, not skip the fade because the
     * GPU happened to recycle a texture handle we still had cached. */
@@ -1570,16 +1570,16 @@ static void downplay_save_picker_dispose(void *user, void *side)
    dp_free_thumbhash_placeholder(dp);
 }
 
-static void downplay_open_recents(downplay_handle_t *dp)
+static void pastime_open_recents(pastime_handle_t *dp)
 {
    size_t i;
-   downplay_recents_free(dp->recents, dp->recent_row_count);
+   pastime_recents_free(dp->recents, dp->recent_row_count);
    dp->recents          = NULL;
    dp->recent_row_count = 0;
-   dp->recents          = downplay_build_recents(&dp->recent_row_count);
+   dp->recents          = pastime_build_recents(&dp->recent_row_count);
    /* Cheap allocation; no I/O until the per-frame pump fires. */
-   downplay_thumbs_recents_close(dp->recents_thumbs);
-   dp->recents_thumbs            = downplay_thumbs_recents_open();
+   pastime_thumbs_recents_close(dp->recents_thumbs);
+   dp->recents_thumbs            = pastime_thumbs_recents_open();
    dp->thumb_prev_selection_rec  = SIZE_MAX;
    /* Seed every distinct db_name across the row set so the per-frame
     * pump can pre-warm them in seed order, one .idx read per frame.
@@ -1592,36 +1592,36 @@ static void downplay_open_recents(downplay_handle_t *dp)
       {
          const char *db = dp->recents[i].db_name;
          if (db && *db)
-            downplay_thumbs_recents_seed(dp->recents_thumbs, db);
+            pastime_thumbs_recents_seed(dp->recents_thumbs, db);
       }
    }
-   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_RECENTS, NULL, downplay_recents_dispose);
+   dp_nav_push(&dp->nav, PASTIME_VIEW_RECENTS, NULL, pastime_recents_dispose);
 }
 
-static void downplay_close_recents(downplay_handle_t *dp)
+static void pastime_close_recents(pastime_handle_t *dp)
 {
    dp_nav_pop(&dp->nav);
 }
 
 /* Dispose hook for the SYSTEM frame: free the loaded ROM list and
  * close the per-system thumbnail manager. */
-static void downplay_system_dispose(void *user, void *side)
+static void pastime_system_dispose(void *user, void *side)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)user;
+   pastime_handle_t *dp = (pastime_handle_t*)user;
    (void)side;
    /* Order matters: roms_free already cancels pending thumbnail
     * requests and resets each thumbnail's texture (gfx_thumbnail.h
     * requires cancel before reset for any in-flight load).  We then
     * blank the path_data so set_system / set_content from a
     * subsequent system enter start clean. */
-   downplay_roms_free(dp->roms, dp->rom_count);
+   pastime_roms_free(dp->roms, dp->rom_count);
    dp->roms                     = NULL;
    dp->rom_count                = 0;
    dp->thumb_prev_selection_sys = SIZE_MAX;
    dp->roms_dims_warmed         = false;
    if (dp->current_thumbs)
    {
-      downplay_thumbs_close(dp->current_thumbs);
+      pastime_thumbs_close(dp->current_thumbs);
       dp->current_thumbs = NULL;
    }
    /* See save_picker_dispose: clear the right-pane fade key so the
@@ -1659,13 +1659,13 @@ static void downplay_system_dispose(void *user, void *side)
  * checks the flag to decide whether to retry on later frames.
  *
  * Cold-fetch case (no on-disk index yet at open_system time): every
- * peek misses and the flag stays false; downplay_drive_system_thumbnails
+ * peek misses and the flag stays false; pastime_drive_system_thumbnails
  * re-runs this each frame until the pump lands the index, at which
  * point all rows reflow in one frame.  That single reflow is the
  * unavoidable consequence of not having the data — far better than
  * the previous behavior where each row's text width depended on
  * whether the user had hovered onto it. */
-static void dp_warm_roms_dims(downplay_handle_t *dp)
+static void dp_warm_roms_dims(pastime_handle_t *dp)
 {
    size_t      i;
    const char *base;
@@ -1681,7 +1681,7 @@ static void dp_warm_roms_dims(downplay_handle_t *dp)
       h    = 0;
       if (!base || !*base)
          continue;
-      if (downplay_thumbs_peek(dp->current_thumbs, base,
+      if (pastime_thumbs_peek(dp->current_thumbs, base,
                &w, &h, NULL, NULL))
       {
          dp->roms[i].image_w = w;
@@ -1693,21 +1693,21 @@ static void dp_warm_roms_dims(downplay_handle_t *dp)
       dp->roms_dims_warmed = true;
 }
 
-static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
+static void pastime_open_system(pastime_handle_t *dp, size_t sys_idx)
 {
-   const downplay_system_t *sys;
+   const pastime_system_t *sys;
    size_t                   i;
 
    if (!dp->systems || sys_idx >= dp->system_count)
       return;
 
-   downplay_roms_free(dp->roms, dp->rom_count);
+   pastime_roms_free(dp->roms, dp->rom_count);
    dp->roms                     = NULL;
    dp->rom_count                = 0;
    dp->thumb_prev_selection_sys = SIZE_MAX;
 
    sys           = &dp->systems[sys_idx];
-   dp->roms      = downplay_scan_roms(sys->full_path, &dp->rom_count);
+   dp->roms      = pastime_scan_roms(sys->full_path, &dp->rom_count);
    dp->active_system = sys_idx;
 
    /* Open the pastime.gg-backed thumbnail manager.  Closes the prior
@@ -1715,11 +1715,11 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
     * db_name → manager is skipped; rows still render labels. */
    if (dp->current_thumbs)
    {
-      downplay_thumbs_close(dp->current_thumbs);
+      pastime_thumbs_close(dp->current_thumbs);
       dp->current_thumbs = NULL;
    }
    if (sys->db_name && *sys->db_name)
-      dp->current_thumbs = downplay_thumbs_open(sys->db_name);
+      dp->current_thumbs = pastime_thumbs_open(sys->db_name);
 
    /* Reset and try the per-row dim warm-up.  See dp_warm_roms_dims
     * for the cold-vs-warm cache rationale. */
@@ -1749,14 +1749,14 @@ static void downplay_open_system(downplay_handle_t *dp, size_t sys_idx)
             names[n++] = b;
       }
       if (n > 0)
-         downplay_thumbs_prefetch(dp->current_thumbs, names, n);
+         pastime_thumbs_prefetch(dp->current_thumbs, names, n);
       #undef DP_SPECULATIVE_PREFETCH_ROWS
    }
 
-   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SYSTEM, NULL, downplay_system_dispose);
+   dp_nav_push(&dp->nav, PASTIME_VIEW_SYSTEM, NULL, pastime_system_dispose);
 }
 
-static void downplay_close_system(downplay_handle_t *dp)
+static void pastime_close_system(pastime_handle_t *dp)
 {
    dp_nav_pop(&dp->nav);
 }
@@ -1769,7 +1769,7 @@ static void downplay_close_system(downplay_handle_t *dp)
  *
  * Copying out the path matters: core_info_t->path is owned by the global
  * core_info list, which the load-content path may reload mid-call. */
-static bool downplay_resolve_core_path(const char *core_ident,
+static bool pastime_resolve_core_path(const char *core_ident,
       char *out_path, size_t out_len)
 {
    char         lookup[NAME_MAX_LENGTH];
@@ -1788,14 +1788,14 @@ static bool downplay_resolve_core_path(const char *core_ident,
 
 /* Push the actual content-load task.  Caller must have already resolved
  * core_ident to an installed core; we re-resolve here defensively. */
-static void downplay_do_launch_rom(const char *core_ident, const char *rom_path)
+static void pastime_do_launch_rom(const char *core_ident, const char *rom_path)
 {
    char               core_path[PATH_MAX_LENGTH];
    content_ctx_info_t content_info;
 
-   if (!downplay_resolve_core_path(core_ident, core_path, sizeof(core_path)))
+   if (!pastime_resolve_core_path(core_ident, core_path, sizeof(core_path)))
    {
-      RARCH_WARN("[Downplay] core not installed: %s\n", core_ident);
+      RARCH_WARN("[Pastime] core not installed: %s\n", core_ident);
       return;
    }
 
@@ -1810,11 +1810,11 @@ static void downplay_do_launch_rom(const char *core_ident, const char *rom_path)
    if (!task_push_load_content_with_new_core_from_menu(
             core_path, rom_path, &content_info,
             CORE_TYPE_PLAIN, NULL, NULL))
-      RARCH_ERR("[Downplay] task_push_load_content failed for '%s'\n",
+      RARCH_ERR("[Pastime] task_push_load_content failed for '%s'\n",
             rom_path);
 }
 
-static void downplay_clear_pending_launch(downplay_handle_t *dp)
+static void pastime_clear_pending_launch(pastime_handle_t *dp)
 {
    dp->pending_launch_core[0] = '\0';
    dp->pending_launch_rom[0]  = '\0';
@@ -1823,15 +1823,15 @@ static void downplay_clear_pending_launch(downplay_handle_t *dp)
 /* ROM-pick entry point.  If the core is already installed, launch now.
  * Otherwise stash the pick and kick a single-ident install through the
  * cores module — the existing splash takes over rendering and
- * downplay_drive_pending_launch finishes the launch when it dismisses. */
-static void downplay_launch_rom(downplay_handle_t *dp,
+ * pastime_drive_pending_launch finishes the launch when it dismisses. */
+static void pastime_launch_rom(pastime_handle_t *dp,
       const char *core_ident, const char *rom_path)
 {
    const char *idents[1];
 
-   if (downplay_cores_is_installed(core_ident))
+   if (pastime_cores_is_installed(core_ident))
    {
-      downplay_do_launch_rom(core_ident, rom_path);
+      pastime_do_launch_rom(core_ident, rom_path);
       return;
    }
 
@@ -1841,18 +1841,18 @@ static void downplay_launch_rom(downplay_handle_t *dp,
     * the in-flight one. */
    if (*dp->pending_launch_core)
    {
-      RARCH_WARN("[Downplay] launch already pending; ignoring second pick\n");
+      RARCH_WARN("[Pastime] launch already pending; ignoring second pick\n");
       return;
    }
 
-   RARCH_LOG("[Downplay] core %s not installed; lazy install before launch\n",
+   RARCH_LOG("[Pastime] core %s not installed; lazy install before launch\n",
          core_ident);
    strlcpy(dp->pending_launch_core, core_ident,
          sizeof(dp->pending_launch_core));
    strlcpy(dp->pending_launch_rom,  rom_path,
          sizeof(dp->pending_launch_rom));
    idents[0] = core_ident;
-   downplay_setup_begin_boot(idents, 1);
+   pastime_setup_begin_boot(idents, 1);
 }
 
 
@@ -1860,7 +1860,7 @@ static void downplay_launch_rom(downplay_handle_t *dp,
  * path it last ran with, so we don't go through core_info_find — if the
  * core has since been uninstalled, the playlist task will surface that
  * itself. */
-static void downplay_launch_recent(size_t index)
+static void pastime_launch_recent(size_t index)
 {
    playlist_t                  *pl    = g_defaults.content_history;
    const struct playlist_entry *entry = NULL;
@@ -1872,7 +1872,7 @@ static void downplay_launch_recent(size_t index)
    if (!entry || !entry->path || !*entry->path
          || !entry->core_path || !*entry->core_path)
    {
-      RARCH_WARN("[Downplay] recents entry %u missing path/core\n",
+      RARCH_WARN("[Pastime] recents entry %u missing path/core\n",
             (unsigned)index);
       return;
    }
@@ -1885,10 +1885,10 @@ static void downplay_launch_recent(size_t index)
    if (!task_push_load_content_from_playlist_from_menu(
             entry->core_path, entry->path, entry->label,
             &content_info, NULL, NULL))
-      RARCH_ERR("[Downplay] recents launch failed: %s\n", entry->path);
+      RARCH_ERR("[Pastime] recents launch failed: %s\n", entry->path);
 }
 
-static void downplay_rebuild_lists(downplay_handle_t *dp)
+static void pastime_rebuild_lists(pastime_handle_t *dp)
 {
    char        expanded[PATH_MAX_LENGTH];
    settings_t *settings   = config_get_ptr();
@@ -1898,9 +1898,9 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
     * to TOP — active_system / cached recents would otherwise index
     * into stale arrays.  Each frame's dispose hook handles its own
     * cleanup (roms/recents free). */
-   if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
-         || dp->nav.view == DOWNPLAY_VIEW_RECENTS)
-      dp_nav_pop_to(&dp->nav, DOWNPLAY_VIEW_TOP);
+   if (dp->nav.view == PASTIME_VIEW_SYSTEM
+         || dp->nav.view == PASTIME_VIEW_RECENTS)
+      dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
 
    /* directory_menu_content is stored verbatim — RA doesn't expand "~" or
     * ":/" prefixes for this setting (see configuration.c).  Expand here so
@@ -1911,10 +1911,10 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
       root = expanded;
    }
 
-   downplay_systems_free(dp->systems, dp->system_count);
+   pastime_systems_free(dp->systems, dp->system_count);
    dp->systems      = NULL;
    dp->system_count = 0;
-   dp->systems      = downplay_scan_systems(root, &dp->system_count);
+   dp->systems      = pastime_scan_systems(root, &dp->system_count);
 
    /* g_defaults.content_history is initialized once at boot in retroarch.c
     * and lives for the process lifetime, so reading it without locking is
@@ -1926,18 +1926,18 @@ static void downplay_rebuild_lists(downplay_handle_t *dp)
    /* M7: launcher's "Resume <Game>" row appears when the most-recent
     * recents entry has a `.state.auto` on disk.  Refreshed here so a
     * fresh boot picks up an autosave from a previous process. */
-   downplay_refresh_resume(dp);
+   pastime_refresh_resume(dp);
 
-   downplay_recompute_total_rows(dp);
+   pastime_recompute_total_rows(dp);
 }
 
 /* ---------- layout ---------- */
 
-static void downplay_layout_recompute(downplay_layout_t *L,
+static void pastime_layout_recompute(pastime_layout_t *L,
       unsigned video_width, unsigned video_height,
       float user_scale_factor)
 {
-   float scale = ((float)video_height / DOWNPLAY_REF_HEIGHT) * user_scale_factor;
+   float scale = ((float)video_height / PASTIME_REF_HEIGHT) * user_scale_factor;
    if (scale < 0.5f)
       scale = 0.5f;
 
@@ -1979,8 +1979,8 @@ static void downplay_layout_recompute(downplay_layout_t *L,
    L->chrome_pad_x     = (int)(12.0f  * scale);
    L->chrome_gap       = (int)(8.0f   * scale);
 
-   L->font_size        = DOWNPLAY_FONT_BASE_SIZE * scale;
-   L->chrome_font_size = (DOWNPLAY_FONT_BASE_SIZE * 0.65f) * scale;
+   L->font_size        = PASTIME_FONT_BASE_SIZE * scale;
+   L->chrome_font_size = (PASTIME_FONT_BASE_SIZE * 0.65f) * scale;
 
    /* Settings-list dimensions.  Row height + font picked so ~10 rows
     * fit on a 480px-tall reference design with room for top/bottom
@@ -1991,7 +1991,7 @@ static void downplay_layout_recompute(downplay_layout_t *L,
    L->settings_value_gap = (int)(24.0f * scale);
 }
 
-static bool downplay_layout_changed(const downplay_layout_t *L,
+static bool pastime_layout_changed(const pastime_layout_t *L,
       unsigned video_width, unsigned video_height, float user_scale_factor)
 {
    /* Compare the source inputs that drive the layout, not the derived
@@ -2004,11 +2004,11 @@ static bool downplay_layout_changed(const downplay_layout_t *L,
 }
 
 /* Forward decls for settings-list lifecycle (defined further down). */
-static void downplay_settings_pop_all(downplay_handle_t *dp);
+static void pastime_settings_pop_all(pastime_handle_t *dp);
 
 /* ---------- font handling ---------- */
 
-static void downplay_resolve_font_path(char *out, size_t out_len)
+static void pastime_resolve_font_path(char *out, size_t out_len)
 {
    char fontdir[PATH_MAX_LENGTH];
    settings_t *settings = config_get_ptr();
@@ -2018,17 +2018,17 @@ static void downplay_resolve_font_path(char *out, size_t out_len)
       return;
 
    fill_pathname_join_special(fontdir,
-         settings->paths.directory_assets, "downplay", sizeof(fontdir));
-   fill_pathname_join_special(out, fontdir, DOWNPLAY_FONT_FILE, out_len);
+         settings->paths.directory_assets, "pastime", sizeof(fontdir));
+   fill_pathname_join_special(out, fontdir, PASTIME_FONT_FILE, out_len);
 }
 
-static font_data_t *downplay_load_font(gfx_display_t *p_disp,
+static font_data_t *pastime_load_font(gfx_display_t *p_disp,
       float size, bool is_threaded)
 {
    char fontpath[PATH_MAX_LENGTH];
    font_data_t *font = NULL;
 
-   downplay_resolve_font_path(fontpath, sizeof(fontpath));
+   pastime_resolve_font_path(fontpath, sizeof(fontpath));
    if (*fontpath)
       font = gfx_display_font_file(p_disp, fontpath, size, is_threaded);
    /* Fall back to the renderer's built-in font when the bundled asset
@@ -2038,7 +2038,7 @@ static font_data_t *downplay_load_font(gfx_display_t *p_disp,
    return font;
 }
 
-static void downplay_release_fonts(downplay_handle_t *dp)
+static void pastime_release_fonts(pastime_handle_t *dp)
 {
    if (dp->font)
    {
@@ -2057,14 +2057,14 @@ static void downplay_release_fonts(downplay_handle_t *dp)
    }
 }
 
-static void downplay_reload_fonts(downplay_handle_t *dp,
+static void pastime_reload_fonts(pastime_handle_t *dp,
       bool is_threaded)
 {
    gfx_display_t *p_disp = disp_get_ptr();
-   downplay_release_fonts(dp);
-   dp->font        = downplay_load_font(p_disp,
+   pastime_release_fonts(dp);
+   dp->font        = pastime_load_font(p_disp,
          dp->layout.font_size, is_threaded);
-   dp->chrome_font = downplay_load_font(p_disp,
+   dp->chrome_font = pastime_load_font(p_disp,
          dp->layout.chrome_font_size, is_threaded);
    /* Snapshot the per-font centre offsets while the fonts are fresh.
     * Re-runs on every reload (i.e. when the rendered font size changes
@@ -2073,7 +2073,7 @@ static void downplay_reload_fonts(downplay_handle_t *dp,
          ? font_driver_get_line_centre_offset(dp->font, 1.0f) : 0;
    dp->chrome_font_centre_offset = dp->chrome_font
          ? font_driver_get_line_centre_offset(dp->chrome_font, 1.0f) : 0;
-   dp->settings_font = downplay_load_font(p_disp,
+   dp->settings_font = pastime_load_font(p_disp,
          dp->layout.settings_font_size, is_threaded);
    dp->settings_font_centre_offset = dp->settings_font
          ? font_driver_get_line_centre_offset(dp->settings_font, 1.0f) : 0;
@@ -2088,7 +2088,7 @@ static void downplay_reload_fonts(downplay_handle_t *dp,
  * by the source falloff rather than the GPU's bilinear filter, while
  * the visible extent stays close enough to the inscribed circle that
  * cap-meets-rect joins look clean. */
-static uintptr_t downplay_build_cap_texture(unsigned diameter)
+static uintptr_t pastime_build_cap_texture(unsigned diameter)
 {
    struct texture_image ti;
    uintptr_t tex_id   = 0;
@@ -2139,13 +2139,13 @@ static uintptr_t downplay_build_cap_texture(unsigned diameter)
  * offset / chrome_font_centre_offset).  This is exact rather than
  * heuristic — the previous (font_size * 0.35f) approximation drifted
  * by a pixel or two depending on the font. */
-static int downplay_baseline_y(int top, int height, int centre_offset)
+static int pastime_baseline_y(int top, int height, int centre_offset)
 {
    return top + (height / 2) + centre_offset;
 }
 
-static void downplay_draw_rect(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L,
+static void pastime_draw_rect(gfx_display_t *p_disp, void *userdata,
+      const pastime_layout_t *L,
       int x, int y, int w, int h, float *color)
 {
    if (w <= 0 || h <= 0)
@@ -2162,8 +2162,8 @@ static void downplay_draw_rect(gfx_display_t *p_disp, void *userdata,
  * rect of the pill covers the inner half of each cap, so we just draw
  * the full circle on each end and let the rect occlude the parts we
  * don't want. */
-static void downplay_draw_cap(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L, uintptr_t cap_tex,
+static void pastime_draw_cap(gfx_display_t *p_disp, void *userdata,
+      const pastime_layout_t *L, uintptr_t cap_tex,
       int x, int y, int w, int h, float *color)
 {
    if (w <= 0 || h <= 0 || !cap_tex)
@@ -2178,8 +2178,8 @@ static void downplay_draw_cap(gfx_display_t *p_disp, void *userdata,
 /* Pill = rectangle with semicircular end-caps.  Falls back to a plain
  * rect when no cap texture is available (e.g. asset / texture upload
  * failed) so the menu still works, just with square corners. */
-static void downplay_draw_pill(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L, uintptr_t cap_tex,
+static void pastime_draw_pill(gfx_display_t *p_disp, void *userdata,
+      const pastime_layout_t *L, uintptr_t cap_tex,
       int x, int y, int w, int h, float *color)
 {
    int cap_w;
@@ -2189,22 +2189,22 @@ static void downplay_draw_pill(gfx_display_t *p_disp, void *userdata,
 
    if (!cap_tex || w < h)
    {
-      downplay_draw_rect(p_disp, userdata, L, x, y, w, h, color);
+      pastime_draw_rect(p_disp, userdata, L, x, y, w, h, color);
       return;
    }
 
    cap_w = h;  /* square cap == full circle when scaled */
-   downplay_draw_cap(p_disp, userdata, L, cap_tex,
+   pastime_draw_cap(p_disp, userdata, L, cap_tex,
          x, y, cap_w, h, color);
-   downplay_draw_cap(p_disp, userdata, L, cap_tex,
+   pastime_draw_cap(p_disp, userdata, L, cap_tex,
          x + w - cap_w, y, cap_w, h, color);
    if (w > h)
-      downplay_draw_rect(p_disp, userdata, L,
+      pastime_draw_rect(p_disp, userdata, L,
             x + (cap_w / 2), y, w - cap_w, h, color);
 }
 
-static void downplay_draw_text(font_data_t *font, const char *text,
-      float x, float y, const downplay_layout_t *L,
+static void pastime_draw_text(font_data_t *font, const char *text,
+      float x, float y, const pastime_layout_t *L,
       uint32_t color, enum text_alignment align)
 {
    if (!font || !text)
@@ -2217,18 +2217,18 @@ static void downplay_draw_text(font_data_t *font, const char *text,
 
 /* ---------- chrome (status pill, button hints) ---------- */
 
-enum downplay_anchor
+enum pastime_anchor
 {
-   DOWNPLAY_ANCHOR_LEFT = 0,
-   DOWNPLAY_ANCHOR_RIGHT
+   PASTIME_ANCHOR_LEFT = 0,
+   PASTIME_ANCHOR_RIGHT
 };
 
 /* One badge + label pair inside a footer hint pill. */
-typedef struct downplay_hint
+typedef struct pastime_hint
 {
    const char *glyph;
    const char *label;
-} downplay_hint_t;
+} pastime_hint_t;
 
 /* Footer hint = outer dark pill (row_h tall, auto-sized to content)
  * containing one or more (badge, label) pairs.  The inner badges are
@@ -2239,11 +2239,11 @@ typedef struct downplay_hint
  * `anchor_x` is the left edge for ANCHOR_LEFT, or the right edge for
  * ANCHOR_RIGHT — the function measures the content and positions the
  * outer pill accordingly. */
-static int downplay_draw_footer_hints(gfx_display_t *p_disp, void *userdata,
+static int pastime_draw_footer_hints(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset,
-      const downplay_layout_t *L, uintptr_t cap_tex,
-      int anchor_x, int y, enum downplay_anchor anchor,
-      const downplay_hint_t *hints, size_t hint_count, float *bg_color)
+      const pastime_layout_t *L, uintptr_t cap_tex,
+      int anchor_x, int y, enum pastime_anchor anchor,
+      const pastime_hint_t *hints, size_t hint_count, float *bg_color)
 {
    int    badge_inset_y = (int)(6.0f * L->scale);
    /* Asymmetric inner padding so the *visible text* is equally inset
@@ -2296,30 +2296,30 @@ static int downplay_draw_footer_hints(gfx_display_t *p_disp, void *userdata,
    if (pill_w < L->row_h)
       pill_w = L->row_h;
 
-   pill_x = (anchor == DOWNPLAY_ANCHOR_RIGHT)
+   pill_x = (anchor == PASTIME_ANCHOR_RIGHT)
           ? anchor_x - pill_w
           : anchor_x;
 
    /* Pass 2 — draw outer pill, then each badge + label in order. */
-   downplay_draw_pill(p_disp, userdata, L, cap_tex,
+   pastime_draw_pill(p_disp, userdata, L, cap_tex,
          pill_x, y, pill_w, L->row_h, bg_color);
 
-   label_y  = downplay_baseline_y(y, L->row_h, centre_offset);
+   label_y  = pastime_baseline_y(y, L->row_h, centre_offset);
    cursor_x = pill_x + inner_pad_l;
    for (i = 0; i < hint_count; i++)
    {
       int badge_x      = cursor_x;
-      int badge_text_y = downplay_baseline_y(y + badge_inset_y, badge_h,
+      int badge_text_y = pastime_baseline_y(y + badge_inset_y, badge_h,
             centre_offset);
       int label_x      = badge_x + badge_w[i] + L->chrome_gap;
 
-      downplay_draw_pill(p_disp, userdata, L, cap_tex,
+      pastime_draw_pill(p_disp, userdata, L, cap_tex,
             badge_x, y + badge_inset_y, badge_w[i], badge_h,
             DP_COLOR_PILL_LIGHT);
-      downplay_draw_text(font, hints[i].glyph,
+      pastime_draw_text(font, hints[i].glyph,
             (float)(badge_x + badge_w[i] / 2), (float)badge_text_y,
             L, DP_TEXT_BADGE, TEXT_ALIGN_CENTER);
-      downplay_draw_text(font, hints[i].label,
+      pastime_draw_text(font, hints[i].label,
             (float)label_x, (float)label_y,
             L, DP_TEXT_LIGHT, TEXT_ALIGN_LEFT);
 
@@ -2333,7 +2333,7 @@ static int downplay_draw_footer_hints(gfx_display_t *p_disp, void *userdata,
  * the original already fits.  buf_size is the full capacity of the
  * caller's buffer (must hold the trimmed prefix + 3 ellipsis bytes +
  * NUL); we bail without mutation if it can't. */
-static void downplay_truncate_to_width(font_data_t *font, char *buf,
+static void pastime_truncate_to_width(font_data_t *font, char *buf,
       size_t buf_size, int max_w)
 {
    const char *ell    = "...";
@@ -2389,20 +2389,20 @@ static void downplay_truncate_to_width(font_data_t *font, char *buf,
  * the visible left-margin spacing, or `chrome_pad_x` for tight chrome
  * pills (status).  Returns the pixel width drawn so callers can
  * layout further chrome to the right. */
-static int downplay_draw_text_pill(gfx_display_t *p_disp, void *userdata,
+static int pastime_draw_text_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset, int height,
-      const downplay_layout_t *L, uintptr_t cap_tex,
+      const pastime_layout_t *L, uintptr_t cap_tex,
       int x, int y, int max_w, int pad_x,
       char *text_buf, size_t text_buf_size)
 {
    int text_max_w = max_w - 2 * pad_x;
    int text_w;
    int pill_w;
-   int text_y = downplay_baseline_y(y, height, centre_offset);
+   int text_y = pastime_baseline_y(y, height, centre_offset);
 
    if (text_max_w < 0)
       text_max_w = 0;
-   downplay_truncate_to_width(font, text_buf, text_buf_size, text_max_w);
+   pastime_truncate_to_width(font, text_buf, text_buf_size, text_max_w);
 
    text_w = font_driver_get_message_width(font, text_buf,
          (unsigned)strlen(text_buf), 1.0f);
@@ -2414,9 +2414,9 @@ static int downplay_draw_text_pill(gfx_display_t *p_disp, void *userdata,
    if (pill_w > max_w)
       pill_w = max_w;
 
-   downplay_draw_pill(p_disp, userdata, L, cap_tex,
+   pastime_draw_pill(p_disp, userdata, L, cap_tex,
          x, y, pill_w, height, DP_COLOR_PILL_DARK);
-   downplay_draw_text(font, text_buf,
+   pastime_draw_text(font, text_buf,
          (float)(x + pill_w / 2), (float)text_y,
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
    return pill_w;
@@ -2425,9 +2425,9 @@ static int downplay_draw_text_pill(gfx_display_t *p_disp, void *userdata,
 /* INGAME-only: dark pill at the top-left holding the loaded content's
  * display name (basename minus extension).  Sized to the row font so
  * the title visually anchors the menu the way "Continue/Quit" do. */
-static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
+static void pastime_draw_title_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset, int height,
-      const downplay_layout_t *L, uintptr_t cap_tex,
+      const pastime_layout_t *L, uintptr_t cap_tex,
       int right_limit)
 {
    const char *content = path_get(RARCH_PATH_CONTENT);
@@ -2443,7 +2443,7 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
       return;
    /* Same cleanup as the system list rows: strip "(USA) (Rev 1) [!]"
     * tails and rotate ", The" articles to the front. */
-   downplay_display_name_clean(title, clean, sizeof(clean));
+   pastime_display_name_clean(title, clean, sizeof(clean));
    if (!*clean)
       return;
 
@@ -2455,7 +2455,7 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
    if (max_w < height)
       max_w = height;
 
-   downplay_draw_text_pill(p_disp, userdata, font, centre_offset, height,
+   pastime_draw_text_pill(p_disp, userdata, font, centre_offset, height,
          L, cap_tex, L->margin_x, L->margin_y, max_w, L->row_text_indent,
          clean, sizeof(clean));
 }
@@ -2467,7 +2467,7 @@ static void downplay_draw_title_pill(gfx_display_t *p_disp, void *userdata,
  * tracks settings->uints.menu_timedate_style — set by the global
  * Settings menu's Clock Format row.  Date+time styles fall back to
  * 24-hour time-only since the pill has no room for a date. */
-static void downplay_build_status_text(char *out, size_t len)
+static void pastime_build_status_text(char *out, size_t len)
 {
    settings_t *settings = config_get_ptr();
    gfx_display_ctx_powerstate_t ps;
@@ -2506,9 +2506,9 @@ static void downplay_build_status_text(char *out, size_t len)
 /* Width of the rendered status pill — useful to callers (e.g. the
  * title pill) that need to reserve space for it without coupling to
  * its draw site.  Text is dp->status_text, recomputed once per
- * frame in downplay_menu_frame. */
-static int downplay_status_pill_width(font_data_t *font,
-      const downplay_layout_t *L, const char *text)
+ * frame in pastime_menu_frame. */
+static int pastime_status_pill_width(font_data_t *font,
+      const pastime_layout_t *L, const char *text)
 {
    int text_w = font_driver_get_message_width(font, text,
          (unsigned)strlen(text), 1.0f);
@@ -2521,28 +2521,28 @@ static int downplay_status_pill_width(font_data_t *font,
    return pill_w;
 }
 
-static void downplay_draw_status_pill(gfx_display_t *p_disp, void *userdata,
+static void pastime_draw_status_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset,
-      const downplay_layout_t *L, uintptr_t cap_tex, float *bg_color,
+      const pastime_layout_t *L, uintptr_t cap_tex, float *bg_color,
       const char *text)
 {
    /* Right-anchored: pill sized to text + padding (with a row-h floor
     * so single-glyph values still look pill-shaped), positioned so its
     * right edge sits on the right margin. */
-   int pill_w = downplay_status_pill_width(font, L, text);
+   int pill_w = pastime_status_pill_width(font, L, text);
    int x      = (int)L->vid_w - L->margin_x - pill_w;
-   int text_y = downplay_baseline_y(L->margin_y, L->row_h, centre_offset);
+   int text_y = pastime_baseline_y(L->margin_y, L->row_h, centre_offset);
 
-   downplay_draw_pill(p_disp, userdata, L, cap_tex,
+   pastime_draw_pill(p_disp, userdata, L, cap_tex,
          x, L->margin_y, pill_w, L->row_h, bg_color);
-   downplay_draw_text(font, text,
+   pastime_draw_text(font, text,
          (float)(x + pill_w / 2), (float)text_y,
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
 }
 
 /* ---------- settings list (M8) ---------- */
 
-static void downplay_settings_list_free(downplay_settings_list_t *L)
+static void pastime_settings_list_free(pastime_settings_list_t *L)
 {
    if (!L)
       return;
@@ -2555,16 +2555,16 @@ static void downplay_settings_list_free(downplay_settings_list_t *L)
  * `userdata_pool_size` reserves a contiguous backing buffer for
  * per-row userdata structs (caller carves it up).  Pass 0 if no row
  * needs allocated userdata. */
-static downplay_settings_list_t *downplay_settings_list_new(
+static pastime_settings_list_t *pastime_settings_list_new(
       const char *title, size_t row_count,
       size_t userdata_pool_size, unsigned width_pct)
 {
-   downplay_settings_list_t *L;
-   if (!(L = (downplay_settings_list_t*)calloc(1, sizeof(*L))))
+   pastime_settings_list_t *L;
+   if (!(L = (pastime_settings_list_t*)calloc(1, sizeof(*L))))
       return NULL;
    if (row_count > 0)
    {
-      if (!(L->rows = (downplay_settings_row_t*)calloc(
+      if (!(L->rows = (pastime_settings_row_t*)calloc(
                   row_count, sizeof(*L->rows))))
       {
          free(L);
@@ -2590,15 +2590,15 @@ static downplay_settings_list_t *downplay_settings_list_new(
  * on_close (Frontend submenu uses this to commit deferred shader
  * changes) before freeing.  on_close may still inspect L->rows[]
  * since the list isn't freed until after it returns. */
-static void downplay_settings_dispose(void *user, void *side)
+static void pastime_settings_dispose(void *user, void *side)
 {
-   downplay_handle_t        *dp = (downplay_handle_t*)user;
-   downplay_settings_list_t *L  = (downplay_settings_list_t*)side;
+   pastime_handle_t        *dp = (pastime_handle_t*)user;
+   pastime_settings_list_t *L  = (pastime_settings_list_t*)side;
    if (L)
    {
       if (L->on_close)
          L->on_close(L, L->on_close_userdata);
-      downplay_settings_list_free(L);
+      pastime_settings_list_free(L);
    }
    /* When the last SETTINGS frame pops (i.e. we're returning to a
     * non-SETTINGS view such as INGAME or TOP), refresh the ingame
@@ -2607,46 +2607,46 @@ static void downplay_settings_dispose(void *user, void *side)
     * could have shifted while the user was inside Options.  pop's
     * sync runs before dispose, so dp->nav.view here already
     * reflects the parent — no SETTINGS frame remains under us. */
-   if (dp && dp->nav.view != DOWNPLAY_VIEW_SETTINGS)
-      downplay_refresh_ingame_actions(dp);
+   if (dp && dp->nav.view != PASTIME_VIEW_SETTINGS)
+      pastime_refresh_ingame_actions(dp);
 }
 
 /* Push a fully-built list onto the nav stack as a SETTINGS frame.
  * Takes ownership: pop will fire on_close + free.  Drops the push
  * silently when L is NULL (the build_*_list helpers can return NULL
  * on calloc failure or when there's nothing to show). */
-static void downplay_settings_push(downplay_handle_t *dp,
-      downplay_settings_list_t *L)
+static void pastime_settings_push(pastime_handle_t *dp,
+      pastime_settings_list_t *L)
 {
    if (!L)
       return;
-   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SETTINGS, L, downplay_settings_dispose);
+   dp_nav_push(&dp->nav, PASTIME_VIEW_SETTINGS, L, pastime_settings_dispose);
 }
 
-static void downplay_settings_pop(downplay_handle_t *dp)
+static void pastime_settings_pop(pastime_handle_t *dp)
 {
-   if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+   if (dp->nav.view == PASTIME_VIEW_SETTINGS)
       dp_nav_pop(&dp->nav);
 }
 
 /* Pop every SETTINGS frame off the top.  Used when Start toggles
  * the in-game Options menu closed (collapse the entire stack
  * instead of one Cancel-press per level). */
-static void downplay_settings_pop_all(downplay_handle_t *dp)
+static void pastime_settings_pop_all(pastime_handle_t *dp)
 {
-   while (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+   while (dp->nav.view == PASTIME_VIEW_SETTINGS)
       dp_nav_pop(&dp->nav);
 }
 
 /* Top settings list; NULL if the top frame isn't a SETTINGS frame. */
-static downplay_settings_list_t *downplay_settings_top(
-      const downplay_handle_t *dp)
+static pastime_settings_list_t *pastime_settings_top(
+      const pastime_handle_t *dp)
 {
    const dp_nav_frame_t *top = dp->nav.nav_depth > 0
          ? &dp->nav.nav[dp->nav.nav_depth - 1] : NULL;
-   if (!top || top->view != DOWNPLAY_VIEW_SETTINGS)
+   if (!top || top->view != PASTIME_VIEW_SETTINGS)
       return NULL;
-   return (downplay_settings_list_t*)top->side;
+   return (pastime_settings_list_t*)top->side;
 }
 
 /* CONFIRM frame side data.  Each open_confirm allocates one of
@@ -2662,7 +2662,7 @@ typedef struct
    void (*on_confirm)(void *dp);
 } dp_confirm_side_t;
 
-static void downplay_confirm_dispose(void *user, void *side)
+static void pastime_confirm_dispose(void *user, void *side)
 {
    (void)user;
    free(side);
@@ -2671,10 +2671,10 @@ static void downplay_confirm_dispose(void *user, void *side)
 /* Open the confirm modal.  `b_label` may be NULL/empty to suppress
  * the cancel button (acknowledgement-only screen).  `on_confirm` is
  * invoked when the user presses A, *before* the frame is popped —
- * callbacks may call downplay_open_confirm again to chain screens.
+ * callbacks may call pastime_open_confirm again to chain screens.
  * Each call pushes a new CONFIRM frame; the underlying view (TOP /
  * INGAME / SETTINGS) and any deeper SETTINGS stack are preserved. */
-static void downplay_open_confirm(downplay_handle_t *dp,
+static void pastime_open_confirm(pastime_handle_t *dp,
       const char *message, const char *a_label, const char *b_label,
       void (*on_confirm)(void *dp))
 {
@@ -2686,17 +2686,17 @@ static void downplay_open_confirm(downplay_handle_t *dp,
          sizeof(side->a_label));
    strlcpy(side->b_label, b_label ? b_label : "", sizeof(side->b_label));
    side->on_confirm = on_confirm;
-   dp_nav_push(&dp->nav, DOWNPLAY_VIEW_CONFIRM, side, downplay_confirm_dispose);
+   dp_nav_push(&dp->nav, PASTIME_VIEW_CONFIRM, side, pastime_confirm_dispose);
 }
 
 /* Dismiss the confirm modal.  Capture the callback locally before
  * the pop (the pop frees `side`), then fire it after — at which
  * point a chained open_confirm pushes a new frame onto the now-
  * exposed parent, not on top of the dying frame. */
-static void downplay_close_confirm(downplay_handle_t *dp, bool fire)
+static void pastime_close_confirm(pastime_handle_t *dp, bool fire)
 {
    dp_nav_frame_t    *top  = dp_nav_top(&dp->nav);
-   dp_confirm_side_t *side = (top && top->view == DOWNPLAY_VIEW_CONFIRM)
+   dp_confirm_side_t *side = (top && top->view == PASTIME_VIEW_CONFIRM)
                            ? (dp_confirm_side_t*)top->side : NULL;
    void             (*cb)(void *) = side ? side->on_confirm : NULL;
    dp_nav_pop(&dp->nav);
@@ -2709,20 +2709,20 @@ static void downplay_close_confirm(downplay_handle_t *dp, bool fire)
  * chevron is visible) so visible_rows stays stable as scroll
  * advances — otherwise paging would shift the row block as the
  * top/bottom chevrons appeared and disappeared. */
-#define DOWNPLAY_SETTINGS_CHEVRON_ZONE_PX(L) ((int)(20.0f * (L)->scale))
+#define PASTIME_SETTINGS_CHEVRON_ZONE_PX(L) ((int)(20.0f * (L)->scale))
 
 /* How many rows fit in the visible area for the active list.
- * Geometry mirrors downplay_draw_settings_view: top = below the
+ * Geometry mirrors pastime_draw_settings_view: top = below the
  * status row (with the same gap the launcher list uses); bottom =
  * just above the description band, which sits at the very bottom
  * margin (the SETTINGS view hides the footer hint pills so the row
  * block can extend that far).  Chevron zones are reserved at both
  * ends. */
-static size_t downplay_settings_visible_rows(const downplay_handle_t *dp,
-      const downplay_settings_list_t *L)
+static size_t pastime_settings_visible_rows(const pastime_handle_t *dp,
+      const pastime_settings_list_t *L)
 {
-   const downplay_layout_t *Ly = &dp->layout;
-   int chev_z   = DOWNPLAY_SETTINGS_CHEVRON_ZONE_PX(Ly);
+   const pastime_layout_t *Ly = &dp->layout;
+   int chev_z   = PASTIME_SETTINGS_CHEVRON_ZONE_PX(Ly);
    int top_y    = Ly->margin_y + Ly->row_h + (int)(16.0f * Ly->scale)
                 + chev_z;
    int desc_h   = (int)(Ly->chrome_font_size * 2.4f);
@@ -2742,10 +2742,10 @@ static size_t downplay_settings_visible_rows(const downplay_handle_t *dp,
 /* Keep `scroll` such that `sel` is in the visible window.  Symmetric
  * snap on both ends so a single Down past the edge advances scroll
  * by 1 (no jumpy auto-centring). */
-static void downplay_settings_snap_scroll(const downplay_handle_t *dp,
-      downplay_settings_list_t *L)
+static void pastime_settings_snap_scroll(const pastime_handle_t *dp,
+      pastime_settings_list_t *L)
 {
-   size_t visible = downplay_settings_visible_rows(dp, L);
+   size_t visible = pastime_settings_visible_rows(dp, L);
    if (L->row_count == 0)
    {
       L->scroll = 0;
@@ -2762,8 +2762,8 @@ static void downplay_settings_snap_scroll(const downplay_handle_t *dp,
 /* Draw a downward-pointing chevron centered on (cx, cy_top).  Built
  * from filled rects so we don't depend on the bundled font carrying
  * U+25BC.  `dir` is +1 down, -1 up. */
-static void downplay_draw_chevron(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L, int cx, int cy_top, int dir)
+static void pastime_draw_chevron(gfx_display_t *p_disp, void *userdata,
+      const pastime_layout_t *L, int cx, int cy_top, int dir)
 {
    /* Drawn as a triangle approximated by stacked horizontal bars.
     * `bars` is the height in source rows; width tapers to zero.
@@ -2791,7 +2791,7 @@ static void downplay_draw_chevron(gfx_display_t *p_disp, void *userdata,
       int y       = cy_top + i;
       if (w < 1)
          continue;
-      downplay_draw_rect(p_disp, userdata, L, x, y, w, 1, color);
+      pastime_draw_rect(p_disp, userdata, L, x, y, w, 1, color);
    }
 }
 
@@ -2801,12 +2801,12 @@ static void downplay_draw_chevron(gfx_display_t *p_disp, void *userdata,
  * Description band is fixed at the bottom — height = ~2 lines of
  * chrome font, separated from the row block by one row's worth of
  * gap. */
-static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
-      const downplay_handle_t *dp)
+static void pastime_draw_settings_view(gfx_display_t *p_disp, void *userdata,
+      const pastime_handle_t *dp)
 {
-   const downplay_layout_t        *L = &dp->layout;
-   const downplay_settings_list_t *S = downplay_settings_top(dp);
-   const downplay_settings_row_t  *sel_row;
+   const pastime_layout_t        *L = &dp->layout;
+   const pastime_settings_list_t *S = pastime_settings_top(dp);
+   const pastime_settings_row_t  *sel_row;
    font_data_t                    *row_font;
    int                             row_centre;
    int                             desc_centre;
@@ -2847,7 +2847,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
       size_t k;
       for (k = 0; k < S->row_count; k++)
       {
-         const downplay_settings_row_t *rr = &S->rows[k];
+         const pastime_settings_row_t *rr = &S->rows[k];
          if (rr->values && rr->values_count > 0)
          {
             any_value = true;
@@ -2894,7 +2894,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
     * are reserved at both ends so the up/down chevrons never collide
     * with the status row or description band. */
    {
-      int chev_z = DOWNPLAY_SETTINGS_CHEVRON_ZONE_PX(L);
+      int chev_z = PASTIME_SETTINGS_CHEVRON_ZONE_PX(L);
       avail_top    = L->margin_y + L->row_h + (int)(16.0f * L->scale)
                    + chev_z;
       avail_bottom = (int)L->vid_h - L->margin_y - desc_band_h - chev_z;
@@ -2903,7 +2903,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
    if (avail_h < L->settings_row_h)
       return;
 
-   visible      = downplay_settings_visible_rows(dp, S);
+   visible      = pastime_settings_visible_rows(dp, S);
    block_h      = (int)visible * L->settings_row_h;
    /* Top-align the row block.  Earlier centering looked good for
     * short lists but pushed long ones (with a chevron) into the
@@ -2921,7 +2921,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
    for (i = 0; i < visible; i++)
    {
       size_t                         row_idx = S->scroll + i;
-      const downplay_settings_row_t *r;
+      const pastime_settings_row_t *r;
       int                            row_y   = block_top + (int)i * L->settings_row_h;
       bool                           selected;
       int                            text_y;
@@ -2950,7 +2950,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
        * action rows skip this — same row layout, but no value to
        * adjust means no full-width chrome. */
       if (selected && has_value)
-         downplay_draw_pill(p_disp, userdata, L, dp->pill_cap_tex,
+         pastime_draw_pill(p_disp, userdata, L, dp->pill_cap_tex,
                block_x, row_y, block_w, L->settings_row_h,
                DP_COLOR_PILL_BG_GRAY);
 
@@ -3023,13 +3023,13 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
       /* Truncate each to its budget, then measure the actual width
        * for placement.  truncate_to_width is a no-op when the text
        * already fits. */
-      downplay_truncate_to_width(row_font, title_buf,
+      pastime_truncate_to_width(row_font, title_buf,
             sizeof(title_buf), title_budget);
       if (has_value)
-         downplay_truncate_to_width(row_font, value_buf,
+         pastime_truncate_to_width(row_font, value_buf,
                sizeof(value_buf), value_budget);
 
-      text_y = downplay_baseline_y(row_y, L->settings_row_h, row_centre);
+      text_y = pastime_baseline_y(row_y, L->settings_row_h, row_centre);
 
       /* Right-aligned value text first — measured here too so we
        * know value_w for any callers below (currently unused, but
@@ -3041,7 +3041,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
                (unsigned)strlen(value_buf), 1.0f);
          if (value_w < 0)
             value_w = 0;
-         downplay_draw_text(row_font, value_buf,
+         pastime_draw_text(row_font, value_buf,
                (float)value_x, (float)text_y,
                L, DP_TEXT_LIGHT, TEXT_ALIGN_RIGHT);
       }
@@ -3061,11 +3061,11 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
          int pill_w  = text_w + 2 * L->row_text_indent;
          if (pill_w < L->settings_row_h)
             pill_w = L->settings_row_h;
-         downplay_draw_pill(p_disp, userdata, L, dp->pill_cap_tex,
+         pastime_draw_pill(p_disp, userdata, L, dp->pill_cap_tex,
                block_x, row_y, pill_w, L->settings_row_h,
                DP_COLOR_PILL_LIGHT);
       }
-      downplay_draw_text(row_font, title_buf,
+      pastime_draw_text(row_font, title_buf,
             (float)(block_x + L->row_text_indent), (float)text_y,
             L, title_color, TEXT_ALIGN_LEFT);
    }
@@ -3073,11 +3073,11 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
    /* Scroll chevrons — only when there's content above / below the
     * visible window.  Drawn just outside the row block in muted gray. */
    if (S->scroll > 0)
-      downplay_draw_chevron(p_disp, userdata, L,
+      pastime_draw_chevron(p_disp, userdata, L,
             block_x + block_w / 2,
             block_top - (int)(12.0f * L->scale), -1);
    if (S->scroll + visible < S->row_count)
-      downplay_draw_chevron(p_disp, userdata, L,
+      pastime_draw_chevron(p_disp, userdata, L,
             block_x + block_w / 2,
             block_top + block_h + (int)(4.0f * L->scale), +1);
 
@@ -3133,7 +3133,7 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
             /* No fit-on-space — fall back to char-truncated single
              * line + ellipsis. */
             strlcpy(line1, src, sizeof(line1));
-            downplay_truncate_to_width(dp->chrome_font, line1,
+            pastime_truncate_to_width(dp->chrome_font, line1,
                   sizeof(line1), line_w);
          }
          else
@@ -3145,20 +3145,20 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
             while (src[cut] == ' ')
                cut++;
             strlcpy(line2, src + cut, sizeof(line2));
-            downplay_truncate_to_width(dp->chrome_font, line2,
+            pastime_truncate_to_width(dp->chrome_font, line2,
                   sizeof(line2), line_w);
          }
       }
 
-      line1_y = downplay_baseline_y(desc_y_top,
+      line1_y = pastime_baseline_y(desc_y_top,
             (int)L->chrome_font_size + (int)(4.0f * L->scale), desc_centre);
-      downplay_draw_text(dp->chrome_font, line1,
+      pastime_draw_text(dp->chrome_font, line1,
             (float)L->vid_w / 2.0f, (float)line1_y,
             L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
       if (*line2)
       {
          line2_y = line1_y + (int)(L->chrome_font_size * 1.2f);
-         downplay_draw_text(dp->chrome_font, line2,
+         pastime_draw_text(dp->chrome_font, line2,
                (float)L->vid_w / 2.0f, (float)line2_y,
                L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
       }
@@ -3171,15 +3171,15 @@ static void downplay_draw_settings_view(gfx_display_t *p_disp, void *userdata,
  * are short ("Saved for console.", "Restore all options to defaults?")
  * and would otherwise need a measure-and-truncate pass like the
  * settings rows. */
-static void downplay_draw_confirm_view(void *userdata,
-      const downplay_handle_t *dp)
+static void pastime_draw_confirm_view(void *userdata,
+      const pastime_handle_t *dp)
 {
-   const downplay_layout_t *L  = &dp->layout;
+   const pastime_layout_t *L  = &dp->layout;
    font_data_t             *f  = dp->font ? dp->font : dp->chrome_font;
    const dp_nav_frame_t    *top = (dp->nav.nav_depth > 0)
                                 ? &dp->nav.nav[dp->nav.nav_depth - 1] : NULL;
    const dp_confirm_side_t *side = (top
-            && top->view == DOWNPLAY_VIEW_CONFIRM)
+            && top->view == PASTIME_VIEW_CONFIRM)
          ? (const dp_confirm_side_t*)top->side : NULL;
    int                      cx;
    int                      cy;
@@ -3190,7 +3190,7 @@ static void downplay_draw_confirm_view(void *userdata,
    cx     = (int)L->vid_w / 2;
    cy     = (int)L->vid_h / 2;
    ascent = dp->font ? dp->font_centre_offset : dp->chrome_font_centre_offset;
-   downplay_draw_text(f, side->message,
+   pastime_draw_text(f, side->message,
          (float)cx, (float)(cy + ascent),
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
 }
@@ -3208,23 +3208,23 @@ typedef struct
 {
    core_option_manager_t *opt;
    size_t                 idx;
-   downplay_handle_t     *dp;
-} downplay_core_opt_row_ud_t;
+   pastime_handle_t     *dp;
+} pastime_core_opt_row_ud_t;
 
 /* Per-list userdata payload holding both the core-options manager
  * pointer (shared by all rows) and the synthesized values arrays
  * (one const char** per row).  Allocated as one trailing block so
- * downplay_settings_list_free's `free(userdata_pool)` reclaims
+ * pastime_settings_list_free's `free(userdata_pool)` reclaims
  * everything in a single call.
  *
  * Layout in `userdata_pool`:
- *   [N × downplay_core_opt_row_ud_t][N × const char* arrays...]
+ *   [N × pastime_core_opt_row_ud_t][N × const char* arrays...]
  * Where N = number of visible options.  rows[i].userdata points at
  * &per_row[i]; rows[i].values points into the values block. */
 
-static void downplay_core_opt_on_change(int delta, void *userdata)
+static void pastime_core_opt_on_change(int delta, void *userdata)
 {
-   downplay_core_opt_row_ud_t *ud = (downplay_core_opt_row_ud_t*)userdata;
+   pastime_core_opt_row_ud_t *ud = (pastime_core_opt_row_ud_t*)userdata;
    if (!ud || !ud->opt)
       return;
    /* Direct call rather than RARCH_CTL_CORE_OPTION_NEXT/PREV:
@@ -3242,24 +3242,24 @@ static void downplay_core_opt_on_change(int delta, void *userdata)
       ud->dp->settings_rebuild_pending = true;
 }
 
-static downplay_settings_list_t *downplay_build_core_options_list(
-      downplay_handle_t *dp);
+static pastime_settings_list_t *pastime_build_core_options_list(
+      pastime_handle_t *dp);
 
 /* Push the core-options list — invoked by the Emulator nav row's
  * on_confirm. */
-static void downplay_action_open_core_options(void *userdata)
+static void pastime_action_open_core_options(void *userdata)
 {
-   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
-   downplay_settings_list_t *L  = downplay_build_core_options_list(dp);
+   pastime_handle_t        *dp = (pastime_handle_t*)userdata;
+   pastime_settings_list_t *L  = pastime_build_core_options_list(dp);
    if (L)
-      downplay_settings_push(dp, L);
+      pastime_settings_push(dp, L);
 }
 
 /* Stub list — placeholder used by Controls / Shortcuts until they
  * have real implementations.  One nav row that just cancels back. */
-static downplay_settings_list_t *downplay_build_stub_list(const char *title)
+static pastime_settings_list_t *pastime_build_stub_list(const char *title)
 {
-   downplay_settings_list_t *L = downplay_settings_list_new(title, 1, 0, 50);
+   pastime_settings_list_t *L = pastime_settings_list_new(title, 1, 0, 50);
    if (!L)
       return NULL;
    L->rows[0].title      = "Coming soon";
@@ -3320,7 +3320,7 @@ enum dp_scaling_mode
  * stable. */
 typedef struct
 {
-   downplay_handle_t   *dp;
+   pastime_handle_t   *dp;
    char                 storage[DP_SCALING_MODE_MAX][DP_SCALING_LABEL_MAX];
    const char          *labels[DP_SCALING_MODE_MAX];
    uint8_t              mode[DP_SCALING_MODE_MAX];
@@ -3440,7 +3440,7 @@ static void dp_frontend_scaling_apply(enum dp_scaling_mode mode)
 
 /* Slang shader presets shown by Screen Effect.  Paths are relative to
  * <directory_video_shader>/shaders_slang and must match the layout that
- * downplay_setup.c lays down for the slang shaders bucket.
+ * pastime_setup.c lays down for the slang shaders bucket.
  *
  * match_pass_stem is a fallback identifier for read-back when the
  * .slang pass filenames don't share a stem with the .slangp basename.
@@ -3452,7 +3452,7 @@ static void dp_frontend_scaling_apply(enum dp_scaling_mode mode)
  * presets even when they're loaded.
  *
  * param_overrides is a NULL-terminated list of #pragma parameter
- * tweaks applied after the preset loads — used to ship Downplay's
+ * tweaks applied after the preset loads — used to ship Pastime's
  * own defaults on top of the upstream shader (e.g. softer LCD grid,
  * subtler crt-geom curvature).  Captured by Save Changes since we
  * write to both the live and menu shader copies. */
@@ -3529,7 +3529,7 @@ static const dp_shader_preset_t dp_shader_presets[] = {
  * (or "Off"); rows[].values points at this array. */
 typedef struct
 {
-   downplay_handle_t *dp;
+   pastime_handle_t *dp;
    size_t             preset_idx[DP_SHADER_PRESET_COUNT + 1];
    const char        *labels[DP_SHADER_PRESET_COUNT + 1];
    size_t             count;
@@ -3565,7 +3565,7 @@ static void dp_shader_set_param(struct video_shader *s,
    }
 }
 
-/* Apply Downplay's #pragma parameter overrides to both shader copies:
+/* Apply Pastime's #pragma parameter overrides to both shader copies:
  *   - the video driver's live shader (so the picture changes on the
  *     next set_params call), and
  *   - menu_shader (so Save Changes serialises our values to the
@@ -3710,12 +3710,12 @@ static size_t dp_shader_current_idx(const dp_shader_row_ud_t *ud)
 static void dp_frontend_scaling_on_change(int delta, void *userdata)
 {
    dp_scaling_row_ud_t      *ud = (dp_scaling_row_ud_t*)userdata;
-   downplay_settings_list_t *S;
+   pastime_settings_list_t *S;
    size_t                    row_idx;
    (void)delta;
    if (!ud || !ud->dp)
       return;
-   S = downplay_settings_top(ud->dp);
+   S = pastime_settings_top(ud->dp);
    if (!S || S->sel >= S->row_count)
       return;
    row_idx = S->rows[S->sel].idx_value;
@@ -3739,10 +3739,10 @@ static void dp_frontend_effect_on_change(int delta, void *userdata)
 /* Flush hook fired when the user backs out of the Frontend submenu.
  * Picks up the final Effect row value and applies it.  No-op if
  * nothing was touched (saves an unnecessary shader recompile). */
-static void dp_frontend_on_close(downplay_settings_list_t *L,
+static void dp_frontend_on_close(pastime_settings_list_t *L,
       void *userdata)
 {
-   downplay_handle_t        *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t        *dp = (pastime_handle_t*)userdata;
    const dp_shader_row_ud_t *ud;
    size_t                    i;
    size_t                    effect_preset_idx = SIZE_MAX;
@@ -3760,13 +3760,13 @@ static void dp_frontend_on_close(downplay_settings_list_t *L,
    dp_frontend_apply_effect(effect_preset_idx);
 }
 
-static downplay_settings_list_t *downplay_build_frontend_list(
-      downplay_handle_t *dp)
+static pastime_settings_list_t *pastime_build_frontend_list(
+      pastime_handle_t *dp)
 {
-   downplay_settings_list_t *L;
+   pastime_settings_list_t *L;
    dp_scaling_row_ud_t      *scaling_ud;
    dp_shader_row_ud_t       *shader_ud;
-   downplay_settings_row_t  *r;
+   pastime_settings_row_t  *r;
    size_t                    i;
    size_t                    out_row   = 0;
    size_t                    pool_sz;
@@ -3796,7 +3796,7 @@ static downplay_settings_list_t *downplay_build_frontend_list(
     * pointer-aligned address on both LP64 and ILP32 ABIs. */
    pool_sz = sizeof(dp_scaling_row_ud_t)
            + (slang_ok ? sizeof(dp_shader_row_ud_t) : 0);
-   L       = downplay_settings_list_new("Frontend", row_count, pool_sz, 60);
+   L       = pastime_settings_list_new("Frontend", row_count, pool_sz, 60);
    if (!L)
       return NULL;
 
@@ -3838,7 +3838,7 @@ static downplay_settings_list_t *downplay_build_frontend_list(
 
    /* Map the current settings_t state back to a row idx.  When the
     * SQUARE block is suppressed (square-PAR core, or migrating from an
-    * older Downplay where Native wrote SQUARE+integer+UNDERSCALE), any
+    * older Pastime where Native wrote SQUARE+integer+UNDERSCALE), any
     * SQUARE-flavor mode in settings_t has no row to display.  Remap
     * each to its CORE-PAR sibling for the search — visually identical
     * on a square-PAR core, and the rendered picture matches the
@@ -3918,30 +3918,30 @@ static downplay_settings_list_t *downplay_build_frontend_list(
    return L;
 }
 
-static void downplay_action_open_frontend(void *userdata)
+static void pastime_action_open_frontend(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
-   downplay_settings_push(dp, downplay_build_frontend_list(dp));
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
+   pastime_settings_push(dp, pastime_build_frontend_list(dp));
 }
 
-static void downplay_action_open_controls(void *userdata)
+static void pastime_action_open_controls(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
-   downplay_settings_push(dp, downplay_build_stub_list("Controls"));
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
+   pastime_settings_push(dp, pastime_build_stub_list("Controls"));
 }
 
-static void downplay_action_open_shortcuts(void *userdata)
+static void pastime_action_open_shortcuts(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
-   downplay_settings_push(dp, downplay_build_stub_list("Shortcuts"));
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
+   pastime_settings_push(dp, pastime_build_stub_list("Shortcuts"));
 }
 
 /* Save Changes submenu — three scoped persist operations.  Each
  * action calls into the existing retroarch.h helpers (no new patch
- * point needed) and shows a confirm/ack via DOWNPLAY_VIEW_CONFIRM.
+ * point needed) and shows a confirm/ack via PASTIME_VIEW_CONFIRM.
  *
  * Persistence model recap (M8): config_save_on_exit is forced off in
- * downplay_defaults_apply, so settings_t mutations made via the
+ * pastime_defaults_apply, so settings_t mutations made via the
  * Frontend submenu are session-only by default.  These actions are
  * the explicit commit:
  *   - core options:  flush / create_override (RA's per-core .opt mech)
@@ -3953,7 +3953,7 @@ static void downplay_action_open_shortcuts(void *userdata)
  *                    matching remove_auto_preset when the user picked
  *                    Off (so the prior preset doesn't keep auto-loading) */
 
-static void downplay_save_shader_for_scope(downplay_handle_t *dp,
+static void pastime_save_shader_for_scope(pastime_handle_t *dp,
       enum auto_shader_type type)
 {
    settings_t          *s      = config_get_ptr();
@@ -3994,26 +3994,26 @@ static void downplay_save_shader_for_scope(downplay_handle_t *dp,
  * <core>.opt, RA settings to <core>.cfg override, shader to
  * <core>.slangp.  Applies to every game launched with this core
  * unless a per-game override exists. */
-static void downplay_action_save_for_console(void *userdata)
+static void pastime_action_save_for_console(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
    core_options_flush();
    command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG_OVERRIDE_CORE, NULL);
-   downplay_save_shader_for_scope(dp, SHADER_PRESET_CORE);
-   downplay_open_confirm(dp, "Saved for console.", "OKAY", NULL, NULL);
+   pastime_save_shader_for_scope(dp, SHADER_PRESET_CORE);
+   pastime_open_confirm(dp, "Saved for console.", "OKAY", NULL, NULL);
 }
 
 /* Save the current state as a per-game override: <core>/<game>.opt
  * for core options, <core>/<game>.cfg for RA settings,
  * <core>/<game>.slangp for the shader.  Takes precedence over the
  * per-core files when this specific ROM is loaded next time. */
-static void downplay_action_save_for_game(void *userdata)
+static void pastime_action_save_for_game(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
    core_options_create_override(true);
    command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG_OVERRIDE_GAME, NULL);
-   downplay_save_shader_for_scope(dp, SHADER_PRESET_GAME);
-   downplay_open_confirm(dp, "Saved for game.", "OKAY", NULL, NULL);
+   pastime_save_shader_for_scope(dp, SHADER_PRESET_GAME);
+   pastime_open_confirm(dp, "Saved for game.", "OKAY", NULL, NULL);
 }
 
 /* Restore step 2: user pressed YES on the confirm prompt.  Reset
@@ -4024,7 +4024,7 @@ static void downplay_action_save_for_game(void *userdata)
  * invoked from the Save Changes submenu (one level above).  When
  * the user navigates back into Emulator the list is rebuilt fresh
  * from coreopts->opts[i].index anyway. */
-static void downplay_action_restore_defaults_confirmed(void *userdata)
+static void pastime_action_restore_defaults_confirmed(void *userdata)
 {
    (void)userdata;
    /* Guard against the core having unloaded between the user
@@ -4039,69 +4039,69 @@ static void downplay_action_restore_defaults_confirmed(void *userdata)
 
 /* Restore step 1: open a YES/CANCEL prompt before doing anything
  * destructive.  YES chains to ..._confirmed above. */
-static void downplay_action_restore_defaults(void *userdata)
+static void pastime_action_restore_defaults(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
-   downplay_open_confirm(dp,
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
+   pastime_open_confirm(dp,
          "Restore all options to defaults?",
          "YES", "CANCEL",
-         downplay_action_restore_defaults_confirmed);
+         pastime_action_restore_defaults_confirmed);
 }
 
-static downplay_settings_list_t *downplay_build_save_changes_list(
-      downplay_handle_t *dp)
+static pastime_settings_list_t *pastime_build_save_changes_list(
+      pastime_handle_t *dp)
 {
-   downplay_settings_list_t *L =
-      downplay_settings_list_new("Save Changes", 3, 0, 60);
+   pastime_settings_list_t *L =
+      pastime_settings_list_new("Save Changes", 3, 0, 60);
    if (!L)
       return NULL;
    L->rows[0].title      = "Save for console";
    L->rows[0].desc       = "Use these values for every game with this core.";
-   L->rows[0].on_confirm = downplay_action_save_for_console;
+   L->rows[0].on_confirm = pastime_action_save_for_console;
    L->rows[0].userdata   = dp;
    L->rows[1].title      = "Save for game";
    L->rows[1].desc       = "Use these values only for the current game.";
-   L->rows[1].on_confirm = downplay_action_save_for_game;
+   L->rows[1].on_confirm = pastime_action_save_for_game;
    L->rows[1].userdata   = dp;
    L->rows[2].title      = "Restore defaults";
    L->rows[2].desc       = "Reset all options to the core's defaults.";
-   L->rows[2].on_confirm = downplay_action_restore_defaults;
+   L->rows[2].on_confirm = pastime_action_restore_defaults;
    L->rows[2].userdata   = dp;
    return L;
 }
 
-static void downplay_action_open_save_changes(void *userdata)
+static void pastime_action_open_save_changes(void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
-   downplay_settings_push(dp, downplay_build_save_changes_list(dp));
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
+   pastime_settings_push(dp, pastime_build_save_changes_list(dp));
 }
 
 /* Build the root Options list.  Static row labels live in .rodata,
  * so no per-row userdata pool needed (each on_confirm takes `dp`
  * directly). */
-static downplay_settings_list_t *downplay_build_root_options_list(
-      downplay_handle_t *dp)
+static pastime_settings_list_t *pastime_build_root_options_list(
+      pastime_handle_t *dp)
 {
-   downplay_settings_list_t *L =
-      downplay_settings_list_new("Options", 5, 0, 60);
+   pastime_settings_list_t *L =
+      pastime_settings_list_new("Options", 5, 0, 60);
    if (!L)
       return NULL;
    L->rows[0].title      = "Frontend";
-   L->rows[0].on_confirm = downplay_action_open_frontend;
+   L->rows[0].on_confirm = pastime_action_open_frontend;
    L->rows[0].userdata   = dp;
    L->rows[1].title      = "Emulator";
    L->rows[1].desc       = "Adjust the running core's options.";
-   L->rows[1].on_confirm = downplay_action_open_core_options;
+   L->rows[1].on_confirm = pastime_action_open_core_options;
    L->rows[1].userdata   = dp;
    L->rows[2].title      = "Controls";
-   L->rows[2].on_confirm = downplay_action_open_controls;
+   L->rows[2].on_confirm = pastime_action_open_controls;
    L->rows[2].userdata   = dp;
    L->rows[3].title      = "Shortcuts";
-   L->rows[3].on_confirm = downplay_action_open_shortcuts;
+   L->rows[3].on_confirm = pastime_action_open_shortcuts;
    L->rows[3].userdata   = dp;
    L->rows[4].title      = "Save Changes";
    L->rows[4].desc       = "Persist core option changes to disk.";
-   L->rows[4].on_confirm = downplay_action_open_save_changes;
+   L->rows[4].on_confirm = pastime_action_open_save_changes;
    L->rows[4].userdata   = dp;
    return L;
 }
@@ -4109,15 +4109,15 @@ static downplay_settings_list_t *downplay_build_root_options_list(
 /* ---- Global Settings — launcher-level toggles, opened from the
  * top view via Start.  Three rows: Swap A/B, Clock Format, Menu
  * Scale.  Each persists immediately to the base retroarch.cfg via
- * CMD_EVENT_MENU_SAVE_CURRENT_CONFIG since downplay_defaults_apply
+ * CMD_EVENT_MENU_SAVE_CURRENT_CONFIG since pastime_defaults_apply
  * forces config_save_on_exit = false (so without an explicit save,
  * changes here would vanish at process quit).  Reachable only from
- * DOWNPLAY_VIEW_TOP, where there is no content loaded — so
+ * PASTIME_VIEW_TOP, where there is no content loaded — so
  * OVERRIDE_NONE always lands in the global cfg, never a per-core
  * override. */
 
 /* Percentage scale presets multiplied on top of the base
- * video_height/DOWNPLAY_REF_HEIGHT scaling.  5% steps from 75% to
+ * video_height/PASTIME_REF_HEIGHT scaling.  5% steps from 75% to
  * 125% — fine-grained enough that any device should land within
  * one step of comfortable.  Single source of truth: the float
  * multiplier is pct/100.0f and the row label is "NN%". */
@@ -4157,9 +4157,9 @@ static void dp_global_persist(void)
 /* Read the active row's idx_value from the top settings frame.
  * Used by every on_change below — the framework writes idx_value
  * before invoking us, so the new state is already there. */
-static size_t dp_global_active_idx(downplay_handle_t *dp)
+static size_t dp_global_active_idx(pastime_handle_t *dp)
 {
-   downplay_settings_list_t *S = downplay_settings_top(dp);
+   pastime_settings_list_t *S = pastime_settings_top(dp);
    if (!S || S->sel >= S->row_count)
       return 0;
    return S->rows[S->sel].idx_value;
@@ -4167,7 +4167,7 @@ static size_t dp_global_active_idx(downplay_handle_t *dp)
 
 static void dp_global_swap_ab_on_change(int delta, void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
    settings_t        *s  = config_get_ptr();
    (void)delta;
    if (!dp || !s)
@@ -4178,12 +4178,12 @@ static void dp_global_swap_ab_on_change(int delta, void *userdata)
 }
 
 /* Two-state mapping: 0 → 24-hour (HM), 1 → 12-hour (HM_AMPM).
- * Overwrites any pre-existing date+time style — Downplay's status
+ * Overwrites any pre-existing date+time style — Pastime's status
  * pill is time-only, and we don't expose the full upstream
  * timedate menu, so this is the only sanctioned way to set it. */
 static void dp_global_clock_on_change(int delta, void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
    settings_t        *s  = config_get_ptr();
    (void)delta;
    if (!dp || !s)
@@ -4196,7 +4196,7 @@ static void dp_global_clock_on_change(int delta, void *userdata)
 
 static void dp_global_scale_on_change(int delta, void *userdata)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
    settings_t        *s  = config_get_ptr();
    size_t             idx;
    (void)delta;
@@ -4208,7 +4208,7 @@ static void dp_global_scale_on_change(int delta, void *userdata)
    s->floats.menu_scale_factor = (float)dp_global_scale_pct[idx] / 100.0f;
    dp_global_persist();
    /* Layout picks up the new scale on the next frame via
-    * downplay_layout_needs_recompute watching menu_scale_factor —
+    * pastime_layout_needs_recompute watching menu_scale_factor —
     * no explicit recompute call needed. */
 }
 
@@ -4234,19 +4234,19 @@ static size_t dp_global_scale_current_idx(float current)
    return best;
 }
 
-static downplay_settings_list_t *downplay_build_global_settings_list(
-      downplay_handle_t *dp)
+static pastime_settings_list_t *pastime_build_global_settings_list(
+      pastime_handle_t *dp)
 {
    static const char * const off_on[]    = { "Off", "On" };
    static const char * const clock_lab[] = { "24-hour", "12-hour" };
 
-   downplay_settings_list_t *L;
-   downplay_settings_row_t  *r;
+   pastime_settings_list_t *L;
+   pastime_settings_row_t  *r;
    settings_t               *s = config_get_ptr();
    if (!s)
       return NULL;
    dp_global_scale_labels_build();
-   L = downplay_settings_list_new("Settings", 3, 0, 60);
+   L = pastime_settings_list_new("Settings", 3, 0, 60);
    if (!L)
       return NULL;
 
@@ -4287,11 +4287,11 @@ static downplay_settings_list_t *downplay_build_global_settings_list(
  * options are skipped on enumeration; the Emulator nav row will
  * already have decided to push us by then, so an all-hidden manager
  * legitimately renders an empty list (gets the "No options" fallback
- * via downplay_build_no_options_list below). */
-static downplay_settings_list_t *downplay_build_no_options_list(void)
+ * via pastime_build_no_options_list below). */
+static pastime_settings_list_t *pastime_build_no_options_list(void)
 {
-   downplay_settings_list_t *L =
-      downplay_settings_list_new("Emulator", 1, 0, 50);
+   pastime_settings_list_t *L =
+      pastime_settings_list_new("Emulator", 1, 0, 50);
    if (!L)
       return NULL;
    L->rows[0].title = "No options";
@@ -4299,12 +4299,12 @@ static downplay_settings_list_t *downplay_build_no_options_list(void)
    return L;
 }
 
-static downplay_settings_list_t *downplay_build_core_options_list(
-      downplay_handle_t *dp)
+static pastime_settings_list_t *pastime_build_core_options_list(
+      pastime_handle_t *dp)
 {
    core_option_manager_t        *opts = NULL;
-   downplay_settings_list_t     *L;
-   downplay_core_opt_row_ud_t   *row_uds;
+   pastime_settings_list_t     *L;
+   pastime_core_opt_row_ud_t   *row_uds;
    const char                  **values_pool;
    size_t                        visible_count = 0;
    size_t                        total_values  = 0;
@@ -4315,7 +4315,7 @@ static downplay_settings_list_t *downplay_build_core_options_list(
 
    retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
    if (!opts || opts->size == 0)
-      return downplay_build_no_options_list();
+      return pastime_build_no_options_list();
 
    /* Two-pass: count visible rows + total value strings to size the
     * userdata pool exactly.  Keeps the values array contiguous in
@@ -4329,26 +4329,26 @@ static downplay_settings_list_t *downplay_build_core_options_list(
          total_values += opts->opts[i].vals->size;
    }
    if (visible_count == 0)
-      return downplay_build_no_options_list();
+      return pastime_build_no_options_list();
 
-   ud_bytes  = visible_count * sizeof(downplay_core_opt_row_ud_t)
+   ud_bytes  = visible_count * sizeof(pastime_core_opt_row_ud_t)
              + total_values  * sizeof(const char*);
    /* Core options use the full content width — these strings tend to
     * be long (especially "On / Off / Lenient / Strict"-style enums)
     * and the launcher's outer margins are still respected. */
-   L = downplay_settings_list_new("Emulator", visible_count, ud_bytes, 100);
+   L = pastime_settings_list_new("Emulator", visible_count, ud_bytes, 100);
    if (!L)
       return NULL;
-   row_uds     = (downplay_core_opt_row_ud_t*)L->userdata_pool;
+   row_uds     = (pastime_core_opt_row_ud_t*)L->userdata_pool;
    values_pool = (const char**)((char*)L->userdata_pool
-         + visible_count * sizeof(downplay_core_opt_row_ud_t));
+         + visible_count * sizeof(pastime_core_opt_row_ud_t));
 
    for (i = 0; i < opts->size && out_row < visible_count; i++)
    {
       struct core_option        *o = &opts->opts[i];
       struct string_list        *src;
       size_t                     k;
-      downplay_settings_row_t   *r;
+      pastime_settings_row_t   *r;
 
       if (!core_option_manager_get_visible(opts, i))
          continue;
@@ -4386,7 +4386,7 @@ static downplay_settings_list_t *downplay_build_core_options_list(
        * when r->values_count is 0). */
       r->idx_value    = (r->values_count > 0 && o->index < r->values_count)
                         ? o->index : 0;
-      r->on_change    = downplay_core_opt_on_change;
+      r->on_change    = pastime_core_opt_on_change;
       row_uds[out_row].opt = opts;
       row_uds[out_row].idx = i;
       row_uds[out_row].dp  = dp;
@@ -4408,15 +4408,15 @@ static downplay_settings_list_t *downplay_build_core_options_list(
  * stretched to enclose its label, with row_text_indent worth of
  * padding either side so the visible text-to-pill-edge spacing
  * matches the unselected-row left margin. */
-static void downplay_draw_list_row(gfx_display_t *p_disp, void *userdata,
+static void pastime_draw_list_row(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset,
-      const downplay_layout_t *L, uintptr_t cap_tex,
+      const pastime_layout_t *L, uintptr_t cap_tex,
       int list_x, int row_y, int row_max_w,
       const char *label, bool selected)
 {
    char     buf[NAME_MAX_LENGTH];
    int      text_x   = list_x + L->row_text_indent;
-   int      text_y   = downplay_baseline_y(row_y, L->row_h, centre_offset);
+   int      text_y   = pastime_baseline_y(row_y, L->row_h, centre_offset);
    int      max_text_w;
    int      text_w;
    int      pill_w;
@@ -4436,7 +4436,7 @@ static void downplay_draw_list_row(gfx_display_t *p_disp, void *userdata,
    max_text_w = row_max_w - 2 * L->row_text_indent;
    if (max_text_w < 0)
       max_text_w = 0;
-   downplay_truncate_to_width(font, buf, sizeof(buf), max_text_w);
+   pastime_truncate_to_width(font, buf, sizeof(buf), max_text_w);
 
    text_w = font_driver_get_message_width(font, buf,
          (unsigned)strlen(buf), 1.0f);
@@ -4450,11 +4450,11 @@ static void downplay_draw_list_row(gfx_display_t *p_disp, void *userdata,
          pill_w = L->row_h;
       if (pill_w > row_max_w)
          pill_w = row_max_w;
-      downplay_draw_pill(p_disp, userdata, L, cap_tex,
+      pastime_draw_pill(p_disp, userdata, L, cap_tex,
             list_x, row_y, pill_w, L->row_h, DP_COLOR_PILL_LIGHT);
    }
 
-   downplay_draw_text(font, buf,
+   pastime_draw_text(font, buf,
          (float)text_x, (float)text_y, L, txt_color, TEXT_ALIGN_LEFT);
 }
 
@@ -4472,19 +4472,19 @@ static void downplay_draw_list_row(gfx_display_t *p_disp, void *userdata,
  * core's native framebuffer (e.g. 256×240 NES) and want crisp
  * integer scaling; cover art / hand-drawn assets want smooth aspect-
  * fit; tiny icons might want to render at 1:1. */
-enum downplay_preview_scale
+enum pastime_preview_scale
 {
    /* Aspect-preserving fit: scale up or down so one axis touches the
     * pane edge.  Bilinear-smoothed.  Use for non-pixel art. */
-   DOWNPLAY_PREVIEW_SCALE_FIT = 0,
+   PASTIME_PREVIEW_SCALE_FIT = 0,
    /* Native pixels when the texture fits; aspect-fit shrink when it
     * overflows.  Never scales up. */
-   DOWNPLAY_PREVIEW_SCALE_NATIVE,
+   PASTIME_PREVIEW_SCALE_NATIVE,
    /* Largest integer multiplier (1×, 2×, 3×…) that fits in the pane;
     * preserves aspect implicitly because both axes scale by the same
     * factor.  Falls back to NATIVE / aspect-fit when even 1× doesn't
     * fit.  Right choice for retro framebuffers. */
-   DOWNPLAY_PREVIEW_SCALE_INTEGER
+   PASTIME_PREVIEW_SCALE_INTEGER
 };
 
 /* Smoothstep fade duration for right-pane art changes (in microseconds).
@@ -4527,7 +4527,7 @@ static uint32_t dp_thumbhash_key(const uint8_t *bytes, size_t len)
 /* Free the cached placeholder texture if any.  Idempotent — when
  * tex is 0, the dim/key fields are already 0 by construction (every
  * write site sets all four together). */
-static void dp_free_thumbhash_placeholder(downplay_handle_t *dp)
+static void dp_free_thumbhash_placeholder(pastime_handle_t *dp)
 {
    if (!dp || !dp->preview_thumbhash_tex)
       return;
@@ -4541,11 +4541,11 @@ static void dp_free_thumbhash_placeholder(downplay_handle_t *dp)
 /* Decode `thumbhash` (already-known-non-NULL) into a small BGRA
  * texture and stash it on dp.  Aspect-correct downscale to
  * DP_THUMBHASH_LONG_EDGE so the placeholder's aspect matches the
- * eventual image's; the FIT scale path in downplay_draw_right_preview
+ * eventual image's; the FIT scale path in pastime_draw_right_preview
  * then produces the same on-screen rect for both, eliminating size
  * jank when the real image swaps in. */
 static void dp_load_thumbhash_placeholder(
-      downplay_handle_t *dp,
+      pastime_handle_t *dp,
       const uint8_t *thumbhash, size_t th_len,
       uint16_t img_w, uint16_t img_h,
       uint32_t key)
@@ -4575,7 +4575,7 @@ static void dp_load_thumbhash_placeholder(
    bgra = (uint8_t*)malloc((size_t)dec_w * dec_h * 4u);
    if (!bgra)
       return;
-   if (!downplay_thumbhash_decode(thumbhash, th_len, dec_w, dec_h, bgra))
+   if (!pastime_thumbhash_decode(thumbhash, th_len, dec_w, dec_h, bgra))
    {
       free(bgra);
       return;
@@ -4611,12 +4611,12 @@ static void dp_load_thumbhash_placeholder(
  * time, keyed by the FNV1a hash of the row's thumbhash bytes.
  *
  * Fade interaction: the swap from placeholder → real triggers
- * downplay_draw_right_preview's fade restart (texture identity
+ * pastime_draw_right_preview's fade restart (texture identity
  * changed), so the real image fades in cleanly while the
  * placeholder vanishes the same frame.  No cross-fade — same hard-
  * pop policy as the rest of the preview path. */
 static void dp_resolve_preview_tex(
-      downplay_handle_t     *dp,
+      pastime_handle_t     *dp,
       const gfx_thumbnail_t *real,
       const uint8_t         *thumbhash,
       size_t                 th_len,
@@ -4692,11 +4692,11 @@ static void dp_resolve_preview_tex(
 /* Aspect-fit a (src_w × src_h) image into a (pane_w × pane_h) box;
  * return the resulting on-screen width in pixels.  Cross-product
  * comparison keeps the math integer-only and matches the body of the
- * FIT branch in downplay_draw_right_preview — same answer at the
+ * FIT branch in pastime_draw_right_preview — same answer at the
  * preview draw and at the row-text gate, so the image's left edge
  * agrees in both places.  Returns 0 on degenerate inputs (caller
  * treats as "no art slot to reserve"). */
-static int downplay_image_pane_width(int pane_w, int pane_h,
+static int pastime_image_pane_width(int pane_w, int pane_h,
       unsigned src_w, unsigned src_h)
 {
    if (pane_w <= 0 || pane_h <= 0 || src_w == 0 || src_h == 0)
@@ -4708,10 +4708,10 @@ static int downplay_image_pane_width(int pane_w, int pane_h,
    return (int)((unsigned)pane_h * src_w / src_h);
 }
 
-static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L, downplay_handle_t *dp,
+static void pastime_draw_right_preview(gfx_display_t *p_disp, void *userdata,
+      const pastime_layout_t *L, pastime_handle_t *dp,
       uintptr_t tex, unsigned texture_w, unsigned texture_h,
-      enum downplay_preview_scale scale)
+      enum pastime_preview_scale scale)
 {
    int pane_left   = L->pane_left;
    int pane_right  = (int)L->vid_w - L->margin_x;
@@ -4750,7 +4750,7 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    fits_natively = (texture_w <= (unsigned)pane_w
                 && texture_h <= (unsigned)pane_h);
 
-   if (scale == DOWNPLAY_PREVIEW_SCALE_INTEGER && fits_natively)
+   if (scale == PASTIME_PREVIEW_SCALE_INTEGER && fits_natively)
    {
       /* Largest integer multiplier where both axes still fit. */
       int mx = pane_w / (int)texture_w;
@@ -4761,7 +4761,7 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
       img_w = (int)texture_w * m;
       img_h = (int)texture_h * m;
    }
-   else if (scale == DOWNPLAY_PREVIEW_SCALE_NATIVE && fits_natively)
+   else if (scale == PASTIME_PREVIEW_SCALE_NATIVE && fits_natively)
    {
       img_w = (int)texture_w;
       img_h = (int)texture_h;
@@ -4771,7 +4771,7 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
       /* Aspect-fit (FIT, or NATIVE/INTEGER fallback when too big).
        * Helper keeps the same math used by the per-row text gate so
        * the image's left edge agrees at both sites. */
-      img_w = downplay_image_pane_width(pane_w, pane_h, texture_w, texture_h);
+      img_w = pastime_image_pane_width(pane_w, pane_h, texture_w, texture_h);
       if (img_w == pane_w)
          img_h = (int)((unsigned)pane_w * texture_h / texture_w);
       else
@@ -4833,16 +4833,16 @@ static void downplay_draw_right_preview(gfx_display_t *p_disp, void *userdata,
          color, &tex_local);
 }
 
-static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
-      const downplay_layout_t *L, uintptr_t cap_tex,
-      downplay_handle_t *dp)
+static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
+      const pastime_layout_t *L, uintptr_t cap_tex,
+      pastime_handle_t *dp)
 {
    size_t   i;
    /* INGAME draws a left-anchored title pill on the top row, so the
     * list has to start one row below.  Other views leave that row
     * to the (right-anchored, short) status pill, which sits beside
     * the left-anchored row 0. */
-   bool     has_title  = (dp->nav.view == DOWNPLAY_VIEW_INGAME);
+   bool     has_title  = (dp->nav.view == PASTIME_VIEW_INGAME);
    int      list_top   = L->margin_y
                        + (has_title ? L->row_h : 0);
    int      list_x     = L->margin_x;
@@ -4873,9 +4873,9 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
     * loads, so the gate is binary on `thumb_tex != 0` and uses the
     * full-pane fallback width.  The selected row keeps full width
     * unconditionally — its pill deliberately overlaps its image. */
-   bool     art_pane_active = (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
-                            || dp->nav.view == DOWNPLAY_VIEW_RECENTS
-                            || dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER);
+   bool     art_pane_active = (dp->nav.view == PASTIME_VIEW_SYSTEM
+                            || dp->nav.view == PASTIME_VIEW_RECENTS
+                            || dp->nav.view == PASTIME_VIEW_SAVE_PICKER);
    int      pane_right      = (int)L->vid_w - L->margin_x;
    int      pane_full_w     = pane_right - L->pane_left;
    /* Pane height matches the right-preview drawer (margin_y +/- a row
@@ -4898,7 +4898,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
     * has_title pushes the list past that row entirely. */
    int      top_row_max_w = has_title ? row_max_w
          : (row_max_w
-            - downplay_status_pill_width(dp->chrome_font, L,
+            - pastime_status_pill_width(dp->chrome_font, L,
                   dp->status_text)
             - L->margin_x);
    if (top_row_max_w < 0)
@@ -4923,22 +4923,22 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
     * SAVE_PICKER shows the selected save's thumbnail.  SYSTEM shows
     * box art for the selected ROM (loaded asynchronously via
     * gfx_thumbnail_request_stream, see
-    * downplay_drive_system_thumbnails).  Both share the same right-
+    * pastime_drive_system_thumbnails).  Both share the same right-
     * pane geometry and the helper's smoothstep fade-in.  When the
     * thumbnail isn't loaded yet (status != AVAILABLE) we pass tex=0,
     * which the helper draws as an empty pane (no placeholder). */
-   if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
+   if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER
          && dp->nav.selection < dp->save_picker_count)
    {
-      const downplay_save_entry_t *e = &dp->save_picker[dp->nav.selection];
-      downplay_draw_right_preview(p_disp, userdata, L, dp,
+      const pastime_save_entry_t *e = &dp->save_picker[dp->nav.selection];
+      pastime_draw_right_preview(p_disp, userdata, L, dp,
             e->thumb_tex, e->thumb_w, e->thumb_h,
-            DOWNPLAY_PREVIEW_SCALE_INTEGER);
+            PASTIME_PREVIEW_SCALE_INTEGER);
    }
-   else if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+   else if (dp->nav.view == PASTIME_VIEW_SYSTEM
          && dp->roms && dp->nav.selection < dp->rom_count)
    {
-      const downplay_rom_t  *rom = &dp->roms[dp->nav.selection];
+      const pastime_rom_t  *rom = &dp->roms[dp->nav.selection];
       const gfx_thumbnail_t *t   = &rom->thumbnail;
       const uint8_t         *th  = NULL;
       size_t                 thlen = 0;
@@ -4951,17 +4951,17 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
        * stays NULL and dp_resolve_preview_tex returns no fallback. */
       base = rom->full_path ? path_basename(rom->full_path) : NULL;
       if (dp->current_thumbs && base && *base)
-         downplay_thumbs_peek(dp->current_thumbs, base,
+         pastime_thumbs_peek(dp->current_thumbs, base,
                NULL, NULL, &th, &thlen);
       dp_resolve_preview_tex(dp, t, th, thlen,
             rom->image_w, rom->image_h, &tex, &w, &h);
-      downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
-            DOWNPLAY_PREVIEW_SCALE_FIT);
+      pastime_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
+            PASTIME_PREVIEW_SCALE_FIT);
    }
-   else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS
+   else if (dp->nav.view == PASTIME_VIEW_RECENTS
          && dp->recents && dp->nav.selection < dp->recent_row_count)
    {
-      const downplay_recent_t *re = &dp->recents[dp->nav.selection];
+      const pastime_recent_t *re = &dp->recents[dp->nav.selection];
       const gfx_thumbnail_t   *t  = &re->thumbnail;
       uintptr_t                tex = 0;
       unsigned                 w   = 0;
@@ -4976,8 +4976,8 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
        * per-row text-truncation gate so the layout is correct. */
       dp_resolve_preview_tex(dp, t, NULL, 0,
             re->image_w, re->image_h, &tex, &w, &h);
-      downplay_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
-            DOWNPLAY_PREVIEW_SCALE_FIT);
+      pastime_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
+            PASTIME_PREVIEW_SCALE_FIT);
    }
    else
    {
@@ -5003,7 +5003,7 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
 
       if (art_pane_active && !selected)
       {
-         if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM
+         if (dp->nav.view == PASTIME_VIEW_SYSTEM
                && dp->roms && row_idx < dp->rom_count
                && dp->roms[row_idx].image_w > 0
                && dp->roms[row_idx].image_h > 0)
@@ -5011,14 +5011,14 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             /* Per-row width: aspect-fit the index-known dims into the
              * preview pane to find the image's left edge, then clamp
              * the row's text to leave breathing room before it. */
-            int img_w = downplay_image_pane_width(pane_full_w, pane_h,
+            int img_w = pastime_image_pane_width(pane_full_w, pane_h,
                   dp->roms[row_idx].image_w,
                   dp->roms[row_idx].image_h);
             if (img_w > 0)
                row_max_w_art = (pane_right - img_w) - L->margin_x
                              - L->row_text_indent;
          }
-         else if (dp->nav.view == DOWNPLAY_VIEW_RECENTS
+         else if (dp->nav.view == PASTIME_VIEW_RECENTS
                && dp->recents && row_idx < dp->recent_row_count
                && dp->recents[row_idx].image_cached
                && dp->recents[row_idx].image_w > 0
@@ -5027,14 +5027,14 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
             /* Recents truncates only when the image is actually on
              * disk — recents never fetches, so a non-cached row will
              * never show art and shouldn't sacrifice text width. */
-            int img_w = downplay_image_pane_width(pane_full_w, pane_h,
+            int img_w = pastime_image_pane_width(pane_full_w, pane_h,
                   dp->recents[row_idx].image_w,
                   dp->recents[row_idx].image_h);
             if (img_w > 0)
                row_max_w_art = (pane_right - img_w) - L->margin_x
                              - L->row_text_indent;
          }
-         else if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER
+         else if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER
                && row_idx < dp->save_picker_count
                && dp->save_picker[row_idx].thumb_tex != 0)
             row_max_w_art = row_max_w_full_pane;
@@ -5042,10 +5042,10 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
       if (row_max_w_art > 0 && row_w > row_max_w_art)
          row_w = row_max_w_art;
 
-      downplay_draw_list_row(p_disp, userdata, dp->font,
+      pastime_draw_list_row(p_disp, userdata, dp->font,
             dp->font_centre_offset, L, cap_tex,
             list_x, row_y, row_w,
-            downplay_row_label(dp, row_idx),
+            pastime_row_label(dp, row_idx),
             selected);
    }
 }
@@ -5078,17 +5078,17 @@ static void downplay_draw_list(gfx_display_t *p_disp, void *userdata,
  *
  * No-op outside SYSTEM view, or when the path-data isn't ready
  * (graceful degradation: rows still show filenames). */
-static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
+static void pastime_drive_system_thumbnails(pastime_handle_t *dp)
 {
-   const downplay_rom_t *rom;
+   const pastime_rom_t *rom;
    const char           *base;
-   downplay_thumb_result_t result;
+   pastime_thumb_result_t result;
    settings_t           *settings;
    unsigned              upscale_thresh;
    size_t                sel;
    enum gfx_thumbnail_status status;
 
-   if (dp->nav.view != DOWNPLAY_VIEW_SYSTEM)
+   if (dp->nav.view != PASTIME_VIEW_SYSTEM)
       return;
    if (!dp->roms || dp->rom_count == 0)
       return;
@@ -5099,7 +5099,7 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
 
    /* Pump the thumbnail manager (drains image queue, reconciles). */
    if (dp->current_thumbs)
-      downplay_thumbs_pump(dp->current_thumbs);
+      pastime_thumbs_pump(dp->current_thumbs);
 
    /* Cold-fetch warm-up retry.  open_system tried this once with the
     * manager freshly opened; if the on-disk index wasn't there yet,
@@ -5126,7 +5126,7 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
    upscale_thresh = settings
          ? settings->uints.gfx_thumbnail_upscale_threshold : 0;
 
-   downplay_thumbs_request(dp->current_thumbs, base, &result);
+   pastime_thumbs_request(dp->current_thumbs, base, &result);
 
    status = (enum gfx_thumbnail_status)
          retro_atomic_load_acquire_int(&dp->roms[sel].thumbnail.status);
@@ -5137,7 +5137,7 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
       if (status == GFX_THUMBNAIL_STATUS_UNKNOWN
           || status == GFX_THUMBNAIL_STATUS_MISSING)
       {
-#ifdef HAVE_DOWNPLAY_WEBP
+#ifdef HAVE_PASTIME_WEBP
          /* WebP path uses our vendored libwebp directly — RA's
           * `task_push_image_load` doesn't know our format-selection
           * rules, and going through it would round-trip through the
@@ -5146,7 +5146,7 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
           *
           * Tradeoff: this blocks the menu thread for ~5–15 ms per
           * first-load while the JPG path is async.  Acceptable today
-          * because the boot-time prefetch (downplay_thumbs.c) warms
+          * because the boot-time prefetch (pastime_thumbs.c) warms
           * the on-disk cache before the user navigates, so the I/O is
           * page-cache-hot and decode is the only cost.  If real-world
           * jank shows up on cold storage, move this to a task. */
@@ -5158,7 +5158,7 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
             gfx_thumbnail_reset(th);
             retro_atomic_store_release_int(&th->status,
                   GFX_THUMBNAIL_STATUS_MISSING);
-            if (downplay_webp_load_texture(result.local_path,
+            if (pastime_webp_load_texture(result.local_path,
                      &th->texture, &w, &h))
             {
                th->width  = w;
@@ -5212,26 +5212,26 @@ static void downplay_drive_system_thumbnails(downplay_handle_t *dp)
          names[n++] = path_basename(dp->roms[idx].full_path);
       }
       if (n > 0)
-         downplay_thumbs_prefetch(dp->current_thumbs, names, n);
+         pastime_thumbs_prefetch(dp->current_thumbs, names, n);
    }
 }
 
 /* Drive per-frame thumbnail loading for the RECENTS view.  Mirrors
- * downplay_drive_system_thumbnails but reads from the read-only
+ * pastime_drive_system_thumbnails but reads from the read-only
  * recents resolver — no pump, no prefetch, no fetch.  If the
  * selected row's system has no cached `.idx` or no cached image,
  * the row simply renders without art.  Self-heals on first run as
  * the user opens system views and populates the cache. */
-static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
+static void pastime_drive_recents_thumbnails(pastime_handle_t *dp)
 {
-   const downplay_recent_t *row;
+   const pastime_recent_t *row;
    char                     path[1024];
    settings_t              *settings;
    unsigned                 upscale_thresh;
    size_t                   sel;
    enum gfx_thumbnail_status status;
 
-   if (dp->nav.view != DOWNPLAY_VIEW_RECENTS)
+   if (dp->nav.view != PASTIME_VIEW_RECENTS)
       return;
    if (!dp->recents || dp->recent_row_count == 0)
       return;
@@ -5242,7 +5242,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * every distinct system in the row set has been settled.  Bounds
     * blocking I/O to one .idx read per frame regardless of how the
     * user scrolls. */
-   downplay_thumbs_recents_pump(dp->recents_thumbs);
+   pastime_thumbs_recents_pump(dp->recents_thumbs);
 
    /* Probe per-row image-on-disk state.  Once true, sticky — so the
     * cost is bounded to one stat per row per frame *only while the
@@ -5250,7 +5250,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * view downloads the image; coming back here, the next frame's
     * stat flips image_cached → true and the truncation gate engages.
     *
-    * downplay_thumbs_recents_resolve returns true iff (a) the system
+    * pastime_thumbs_recents_resolve returns true iff (a) the system
     * index is loaded, (b) the cascade matches the basename, AND (c)
     * the resolved image file is on disk (final path_is_valid in the
     * resolver).  All three conditions are what we want gated on,
@@ -5258,7 +5258,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * rather than a separate "is cached" check. */
    {
       size_t             i;
-      downplay_recent_t *re;
+      pastime_recent_t *re;
       char               path[DP_THUMBS_PATH_MAX];
       for (i = 0; i < dp->recent_row_count; i++)
       {
@@ -5267,7 +5267,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
             continue;
          if (!re->db_name || !re->rom_basename)
             continue;
-         if (downplay_thumbs_recents_resolve(dp->recents_thumbs,
+         if (pastime_thumbs_recents_resolve(dp->recents_thumbs,
                   re->db_name, re->rom_basename, path, sizeof(path)))
             re->image_cached = true;
       }
@@ -5280,7 +5280,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
     * between frames so once a row hits, it stays hit. */
    {
       size_t             i;
-      downplay_recent_t *re;
+      pastime_recent_t *re;
       uint16_t           w;
       uint16_t           h;
       for (i = 0; i < dp->recent_row_count; i++)
@@ -5292,7 +5292,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
             continue;
          if (!re->db_name || !re->rom_basename)
             continue;
-         if (downplay_thumbs_recents_peek(dp->recents_thumbs,
+         if (pastime_thumbs_recents_peek(dp->recents_thumbs,
                   re->db_name, re->rom_basename,
                   &w, &h, NULL, NULL))
          {
@@ -5327,7 +5327,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
    if (!row->rom_basename || !*row->rom_basename)
       return;
 
-   if (!downplay_thumbs_recents_resolve(dp->recents_thumbs,
+   if (!pastime_thumbs_recents_resolve(dp->recents_thumbs,
             row->db_name, row->rom_basename, path, sizeof(path)))
       return;
 
@@ -5340,7 +5340,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
    settings       = config_get_ptr();
    upscale_thresh = settings
          ? settings->uints.gfx_thumbnail_upscale_threshold : 0;
-#ifdef HAVE_DOWNPLAY_WEBP
+#ifdef HAVE_PASTIME_WEBP
    {
       const char *ext = strrchr(path, '.');
       if (ext && !strcmp(ext, ".webp"))
@@ -5350,7 +5350,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
          gfx_thumbnail_reset(th);
          retro_atomic_store_release_int(&th->status,
                GFX_THUMBNAIL_STATUS_MISSING);
-         if (downplay_webp_load_texture(path, &th->texture, &w, &h))
+         if (pastime_webp_load_texture(path, &th->texture, &w, &h))
          {
             th->width  = w;
             th->height = h;
@@ -5373,7 +5373,7 @@ static void downplay_drive_recents_thumbnails(downplay_handle_t *dp)
  * stack instead, so we read the underlying condition (CORE_RUNNING)
  * and consume the upstream flag so it can't queue a displaylist push
  * that we'd ignore. */
-static void downplay_sync_ingame(downplay_handle_t *dp)
+static void pastime_sync_ingame(pastime_handle_t *dp)
 {
    struct menu_state *menu_st     = menu_state_get_ptr();
    runloop_state_t   *runloop_st  = runloop_state_get_ptr();
@@ -5397,18 +5397,18 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
     * views (already INGAME-or-deeper) — don't push another INGAME on
     * top of them.  Each tears itself down via its own pop path. */
    if (running
-         && dp->nav.view != DOWNPLAY_VIEW_INGAME
-         && dp->nav.view != DOWNPLAY_VIEW_SAVE_PICKER
-         && dp->nav.view != DOWNPLAY_VIEW_SETTINGS
-         && dp->nav.view != DOWNPLAY_VIEW_CONFIRM)
+         && dp->nav.view != PASTIME_VIEW_INGAME
+         && dp->nav.view != PASTIME_VIEW_SAVE_PICKER
+         && dp->nav.view != PASTIME_VIEW_SETTINGS
+         && dp->nav.view != PASTIME_VIEW_CONFIRM)
    {
       /* Refresh action composition before push so the recompute
        * inside dp_nav_sync_top reads the right count. */
-      downplay_refresh_ingame_actions(dp);
-      dp_nav_push(&dp->nav, DOWNPLAY_VIEW_INGAME, NULL,
-            downplay_ingame_dispose);
+      pastime_refresh_ingame_actions(dp);
+      dp_nav_push(&dp->nav, PASTIME_VIEW_INGAME, NULL,
+            pastime_ingame_dispose);
    }
-   else if (!running && dp->nav.view == DOWNPLAY_VIEW_INGAME)
+   else if (!running && dp->nav.view == PASTIME_VIEW_INGAME)
    {
       /* Pop returns us to whichever view was underneath INGAME (TOP
        * if the game was launched from there, RECENTS if from a
@@ -5419,8 +5419,8 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
       dp_nav_pop(&dp->nav);
    }
    else if (!running
-         && dp->nav.view != DOWNPLAY_VIEW_INGAME
-         && dp_nav_root_view(&dp->nav) == DOWNPLAY_VIEW_INGAME)
+         && dp->nav.view != PASTIME_VIEW_INGAME
+         && dp_nav_root_view(&dp->nav) == PASTIME_VIEW_INGAME)
    {
       /* Edge case: core died (crashed, external Quit, etc.) while
        * the user was drilled into a sub-view of INGAME — SAVE_PICKER,
@@ -5433,7 +5433,7 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
        * dp_nav_root_view returns SETTINGS / CONFIRM, never INGAME)
        * legitimately persist across "no core loaded" frames and are
        * not affected. */
-      dp_nav_pop_to(&dp->nav, DOWNPLAY_VIEW_TOP);
+      dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
    }
 }
 
@@ -5441,42 +5441,42 @@ static void downplay_sync_ingame(downplay_handle_t *dp)
  * buckets) suppresses the normal menu — we want a single, deliberate
  * "let's get you set up" screen from the very first frame instead of a
  * flash of empty list before the splash takes over. */
-enum downplay_render_mode
+enum pastime_render_mode
 {
-   DOWNPLAY_RENDER_LIST = 0,   /* normal menu */
-   DOWNPLAY_RENDER_WELCOME,    /* PLANNED — waiting for A to start */
-   DOWNPLAY_RENDER_SPLASH      /* setup pass in flight */
+   PASTIME_RENDER_LIST = 0,   /* normal menu */
+   PASTIME_RENDER_WELCOME,    /* PLANNED — waiting for A to start */
+   PASTIME_RENDER_SPLASH      /* setup pass in flight */
 };
 
-static enum downplay_render_mode downplay_get_render_mode(void)
+static enum pastime_render_mode pastime_get_render_mode(void)
 {
-   switch (downplay_setup_get_phase())
+   switch (pastime_setup_get_phase())
    {
-      case DOWNPLAY_SETUP_PLANNED: return DOWNPLAY_RENDER_WELCOME;
-      case DOWNPLAY_SETUP_RUNNING: return DOWNPLAY_RENDER_SPLASH;
-      default:                     return DOWNPLAY_RENDER_LIST;
+      case PASTIME_SETUP_PLANNED: return PASTIME_RENDER_WELCOME;
+      case PASTIME_SETUP_RUNNING: return PASTIME_RENDER_SPLASH;
+      default:                     return PASTIME_RENDER_LIST;
    }
 }
 
-/* Called every frame after downplay_setup_pump.  When the setup module
+/* Called every frame after pastime_setup_pump.  When the setup module
  * settles back to DONE/INACTIVE (rendering as LIST again) and we have a
  * pending pick, finish the launch.  If install failed (core still not
  * installed), do_launch logs and bails — we still clear the slot so the
  * user gets the menu back. */
-static void downplay_drive_pending_launch(downplay_handle_t *dp)
+static void pastime_drive_pending_launch(pastime_handle_t *dp)
 {
    char core[sizeof(dp->pending_launch_core)];
    char rom[sizeof(dp->pending_launch_rom)];
 
    if (!*dp->pending_launch_core)
       return;
-   if (downplay_get_render_mode() != DOWNPLAY_RENDER_LIST)
+   if (pastime_get_render_mode() != PASTIME_RENDER_LIST)
       return;
 
    strlcpy(core, dp->pending_launch_core, sizeof(core));
    strlcpy(rom,  dp->pending_launch_rom,  sizeof(rom));
-   downplay_clear_pending_launch(dp);
-   downplay_do_launch_rom(core, rom);
+   pastime_clear_pending_launch(dp);
+   pastime_do_launch_rom(core, rom);
 }
 
 /* Asymptotic progress curve: each frame, displayed lerps toward target.
@@ -5487,10 +5487,10 @@ static void downplay_drive_pending_launch(downplay_handle_t *dp)
  * decays so the bar visibly slows down — the "Zeno" feel — without ever
  * reaching the segment edge.  k controls how snappy: 3.0 feels alive
  * without being jittery. */
-#define DOWNPLAY_SETUP_BAR_K        2.0f
-#define DOWNPLAY_SETUP_BAR_ASYMPTOTE 0.85f
+#define PASTIME_SETUP_BAR_K        2.0f
+#define PASTIME_SETUP_BAR_ASYMPTOTE 0.85f
 
-static void downplay_setup_anim_step(downplay_handle_t *dp,
+static void pastime_setup_anim_step(pastime_handle_t *dp,
       size_t done, size_t total)
 {
    retro_time_t now = cpu_features_get_time_usec();
@@ -5514,10 +5514,10 @@ static void downplay_setup_anim_step(downplay_handle_t *dp,
    if (total == 0)
       total = 1;
 
-   if (downplay_setup_get_phase() == DOWNPLAY_SETUP_DONE)
+   if (pastime_setup_get_phase() == PASTIME_SETUP_DONE)
       target = 1.0f;
    else
-      target = ((float)done + DOWNPLAY_SETUP_BAR_ASYMPTOTE)
+      target = ((float)done + PASTIME_SETUP_BAR_ASYMPTOTE)
              / (float)total;
    if (target > 1.0f) target = 1.0f;
 
@@ -5527,20 +5527,20 @@ static void downplay_setup_anim_step(downplay_handle_t *dp,
    if (target > dp->setup_anim.displayed)
       dp->setup_anim.displayed +=
             (target - dp->setup_anim.displayed) * dt
-            * DOWNPLAY_SETUP_BAR_K;
+            * PASTIME_SETUP_BAR_K;
    if (dp->setup_anim.displayed > 1.0f)
       dp->setup_anim.displayed = 1.0f;
 }
 
-/* Only called in DOWNPLAY_RENDER_WELCOME.  A static "Let's get you set
+/* Only called in PASTIME_RENDER_WELCOME.  A static "Let's get you set
  * up" screen that gates the actual download until the user presses A.
  * No visible progress, no decisions — just a beat so the dive-in isn't
  * jarring. */
-static void downplay_draw_welcome_view(const downplay_handle_t *dp)
+static void pastime_draw_welcome_view(const pastime_handle_t *dp)
 {
-   const downplay_layout_t *L      = &dp->layout;
-   size_t                   cores  = downplay_setup_planned_core_count();
-   size_t                   bucks  = downplay_setup_planned_bucket_count();
+   const pastime_layout_t *L      = &dp->layout;
+   size_t                   cores  = pastime_setup_planned_core_count();
+   size_t                   bucks  = pastime_setup_planned_bucket_count();
    char                     subline[160];
    float                    cy     = (float)L->vid_h * 0.5f;
 
@@ -5558,24 +5558,24 @@ static void downplay_draw_welcome_view(const downplay_handle_t *dp)
       snprintf(subline, sizeof(subline),
             "We'll download %u content bundles.", (unsigned)bucks);
 
-   downplay_draw_text(dp->font, "Let's get you set up",
+   pastime_draw_text(dp->font, "Let's get you set up",
          (float)L->vid_w * 0.5f,
          cy - (L->font_size * 0.3f),
          L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
-   downplay_draw_text(dp->chrome_font, subline,
+   pastime_draw_text(dp->chrome_font, subline,
          (float)L->vid_w * 0.5f,
          cy + L->font_size * 0.5f
                + (L->chrome_font_size * 0.85f) + (12.0f * L->scale),
          L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
 }
 
-/* Only called in DOWNPLAY_RENDER_SPLASH.  Centered title + asymptotic
+/* Only called in PASTIME_RENDER_SPLASH.  Centered title + asymptotic
  * progress bar + optional sub-line (current core ident during the
  * cores phase). */
-static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
-      downplay_handle_t *dp)
+static void pastime_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
+      pastime_handle_t *dp)
 {
-   const downplay_layout_t *L      = &dp->layout;
+   const pastime_layout_t *L      = &dp->layout;
    const char              *phase  = NULL;
    const char              *item   = NULL;
    size_t                   done   = 0;
@@ -5583,10 +5583,10 @@ static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
    int                      bar_w, bar_h, bar_x, bar_y, fill_w;
    float                    cy     = (float)L->vid_h * 0.5f;
 
-   downplay_setup_get_progress(&total, &done, &phase, &item);
-   downplay_setup_anim_step(dp, done, total);
+   pastime_setup_get_progress(&total, &done, &phase, &item);
+   pastime_setup_anim_step(dp, done, total);
 
-   downplay_draw_text(dp->font,
+   pastime_draw_text(dp->font,
          phase ? phase : "Setting up...",
          (float)L->vid_w * 0.5f,
          cy - (L->font_size * 0.5f) - (12.0f * L->scale),
@@ -5602,22 +5602,22 @@ static void downplay_draw_setup_splash(gfx_display_t *p_disp, void *userdata,
    bar_y  = (int)cy + (int)(8.0f * L->scale);
    fill_w = (int)((float)bar_w * dp->setup_anim.displayed);
 
-   downplay_draw_rect(p_disp, userdata, L,
+   pastime_draw_rect(p_disp, userdata, L,
          bar_x, bar_y, bar_w, bar_h, DP_COLOR_PILL_DARK);
-   downplay_draw_rect(p_disp, userdata, L,
+   pastime_draw_rect(p_disp, userdata, L,
          bar_x, bar_y, fill_w, bar_h, DP_COLOR_PILL_LIGHT);
 
    if (item && *item)
-      downplay_draw_text(dp->chrome_font, item,
+      pastime_draw_text(dp->chrome_font, item,
             (float)L->vid_w * 0.5f,
             (float)(bar_y + bar_h) + (L->chrome_font_size * 0.85f)
                   + (8.0f * L->scale),
             L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
 }
 
-static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
+static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
 {
-   downplay_handle_t       *dp = (downplay_handle_t*)data;
+   pastime_handle_t       *dp = (pastime_handle_t*)data;
    gfx_display_t           *p_disp;
    void                    *userdata;
    settings_t              *settings;
@@ -5625,7 +5625,7 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    float                    user_scale;
    int                      bottom_y;
    float                   *chrome_bg;
-   enum downplay_render_mode mode;
+   enum pastime_render_mode mode;
 
    if (!dp)
       return;
@@ -5655,19 +5655,19 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
    /* Pump the setup state machine on every frame.  Cheap; only does
     * work when the buildbot list has just landed or a bucket task has
     * settled. */
-   downplay_setup_pump();
+   pastime_setup_pump();
    /* If the pump just transitioned setup to DONE, this fires on the
     * same frame and the splash's "complete" state is never drawn.
     * That's intentional: content-load is async, so the splash dismissing
     * straight into the loading screen is the desired UX. */
-   downplay_drive_pending_launch(dp);
-   downplay_sync_ingame(dp);
+   pastime_drive_pending_launch(dp);
+   pastime_sync_ingame(dp);
    /* Thumbnail / index pump for the SYSTEM view.  No-op elsewhere; safe
     * to call before layout because it doesn't touch geometry. */
-   downplay_drive_system_thumbnails(dp);
+   pastime_drive_system_thumbnails(dp);
    /* Recents view loads thumbnails from the on-disk cache only — no
     * downloads kicked.  No-op outside RECENTS. */
-   downplay_drive_recents_thumbnails(dp);
+   pastime_drive_recents_thumbnails(dp);
 
    /* Core flipped option visibility on the previous frame's cycle.
     * Rebuild the active core-options list in place — same stack
@@ -5679,12 +5679,12 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       retroarch_ctl(RARCH_CTL_CORE_OPTIONS_LIST_GET, &opts);
       if (opts)
          opts->updated = false;
-      if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+      if (dp->nav.view == PASTIME_VIEW_SETTINGS)
       {
          dp_nav_frame_t           *frame = dp_nav_top(&dp->nav);
-         downplay_settings_list_t *cur   = downplay_settings_top(dp);
-         downplay_settings_list_t *neu   =
-               downplay_build_core_options_list(dp);
+         pastime_settings_list_t *cur   = pastime_settings_top(dp);
+         pastime_settings_list_t *neu   =
+               pastime_build_core_options_list(dp);
          if (neu && frame)
          {
             size_t saved_sel    = cur ? cur->sel    : 0;
@@ -5703,29 +5703,29 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
              * on_close, but the explicit free guards future
              * additions. */
             frame->side = neu;
-            downplay_settings_list_free(cur);
-            downplay_settings_snap_scroll(dp, neu);
+            pastime_settings_list_free(cur);
+            pastime_settings_snap_scroll(dp, neu);
          }
       }
       dp->settings_rebuild_pending = false;
    }
-   mode = downplay_get_render_mode();
+   mode = pastime_get_render_mode();
    /* When we leave splash, drop the anim flag so the next setup pass
     * (lazy install) starts fresh at displayed=0 instead of carrying
     * the previous run's full bar. */
-   if (mode != DOWNPLAY_RENDER_SPLASH)
+   if (mode != PASTIME_RENDER_SPLASH)
       dp->setup_anim.was_running = false;
 
    /* Recompute layout (and reload fonts at new size) only when the
     * window or user scale changed.  The font reload is the expensive
     * part — purely a glyph atlas rebuild — so we don't want it every
     * frame. */
-   if (downplay_layout_changed(&dp->layout,
+   if (pastime_layout_changed(&dp->layout,
             video_info->width, video_info->height, user_scale))
    {
-      downplay_layout_recompute(&dp->layout,
+      pastime_layout_recompute(&dp->layout,
             video_info->width, video_info->height, user_scale);
-      downplay_reload_fonts(dp, video_driver_is_threaded());
+      pastime_reload_fonts(dp, video_driver_is_threaded());
    }
 
    /* Refresh status-pill text once per frame, before anything reads it
@@ -5733,55 +5733,55 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     * limit, and the pill draw call below).  RA throttles the underlying
     * powerstate + timedate work internally, so calling every frame is
     * cheap. */
-   downplay_build_status_text(dp->status_text, sizeof(dp->status_text));
+   pastime_build_status_text(dp->status_text, sizeof(dp->status_text));
 
    /* Background — opaque normally, dim-overlay over the running game so
     * INGAME reads as a HUD instead of hiding the frame underneath. */
-   downplay_draw_rect(p_disp, userdata, &dp->layout,
+   pastime_draw_rect(p_disp, userdata, &dp->layout,
          0, 0, (int)dp->layout.vid_w, (int)dp->layout.vid_h,
-         dp->nav.view == DOWNPLAY_VIEW_INGAME ? DP_COLOR_BG_INGAME : DP_COLOR_BG);
+         dp->nav.view == PASTIME_VIEW_INGAME ? DP_COLOR_BG_INGAME : DP_COLOR_BG);
 
    /* Chrome bg: gray in launcher (would vanish against pure-black
     * DP_COLOR_BG), dark in INGAME (sits on dimmed game). */
-   chrome_bg = (dp->nav.view == DOWNPLAY_VIEW_INGAME)
+   chrome_bg = (dp->nav.view == PASTIME_VIEW_INGAME)
              ? DP_COLOR_PILL_DARK : DP_COLOR_PILL_CHROME_GRAY;
 
    /* Top-right status pill */
-   downplay_draw_status_pill(p_disp, userdata, dp->chrome_font,
+   pastime_draw_status_pill(p_disp, userdata, dp->chrome_font,
          dp->chrome_font_centre_offset, &dp->layout, dp->pill_cap_tex,
          chrome_bg, dp->status_text);
 
-   if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
+   if (dp->nav.view == PASTIME_VIEW_INGAME)
    {
       /* Title may grow up to the left edge of the status pill, with
        * one margin's worth of gap between them so they read as
        * separate elements.  status_pill_width must be called with
        * the same font that draw_status_pill above renders with —
        * mismatch would silently misalign the gap. */
-      int status_w = downplay_status_pill_width(dp->chrome_font,
+      int status_w = pastime_status_pill_width(dp->chrome_font,
             &dp->layout, dp->status_text);
       int title_right_limit = (int)dp->layout.vid_w - dp->layout.margin_x
             - status_w - dp->layout.margin_x;
-      downplay_draw_title_pill(p_disp, userdata, dp->font,
+      pastime_draw_title_pill(p_disp, userdata, dp->font,
             dp->font_centre_offset, dp->layout.row_h,
             &dp->layout, dp->pill_cap_tex, title_right_limit);
    }
 
    switch (mode)
    {
-      case DOWNPLAY_RENDER_SPLASH:
-         downplay_draw_setup_splash(p_disp, userdata, dp);
+      case PASTIME_RENDER_SPLASH:
+         pastime_draw_setup_splash(p_disp, userdata, dp);
          break;
-      case DOWNPLAY_RENDER_WELCOME:
-         downplay_draw_welcome_view(dp);
+      case PASTIME_RENDER_WELCOME:
+         pastime_draw_welcome_view(dp);
          break;
-      case DOWNPLAY_RENDER_LIST:
-         if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
-            downplay_draw_settings_view(p_disp, userdata, dp);
-         else if (dp->nav.view == DOWNPLAY_VIEW_CONFIRM)
-            downplay_draw_confirm_view(userdata, dp);
+      case PASTIME_RENDER_LIST:
+         if (dp->nav.view == PASTIME_VIEW_SETTINGS)
+            pastime_draw_settings_view(p_disp, userdata, dp);
+         else if (dp->nav.view == PASTIME_VIEW_CONFIRM)
+            pastime_draw_confirm_view(userdata, dp);
          else
-            downplay_draw_list(p_disp, userdata,
+            pastime_draw_list(p_disp, userdata,
                   &dp->layout, dp->pill_cap_tex, dp);
          break;
    }
@@ -5796,20 +5796,20 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
     *
     * SETTINGS view hides the footer entirely so the row block + the
     * fixed description band can extend to the bottom margin. */
-   if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+   if (dp->nav.view == PASTIME_VIEW_SETTINGS)
       goto restore_viewport;
    bottom_y = (int)dp->layout.vid_h - dp->layout.margin_y - dp->layout.row_h;
 
    /* CONFIRM view: just the modal-specific buttons, no POWER hint —
     * the modal is meant to read as focused, single-decision UX. */
-   if (dp->nav.view == DOWNPLAY_VIEW_CONFIRM)
+   if (dp->nav.view == PASTIME_VIEW_CONFIRM)
    {
       const dp_nav_frame_t    *top  = (dp->nav.nav_depth > 0)
                                     ? &dp->nav.nav[dp->nav.nav_depth - 1] : NULL;
       const dp_confirm_side_t *side = (top
-               && top->view == DOWNPLAY_VIEW_CONFIRM)
+               && top->view == PASTIME_VIEW_CONFIRM)
             ? (const dp_confirm_side_t*)top->side : NULL;
-      downplay_hint_t right[2];
+      pastime_hint_t right[2];
       size_t          n = 0;
       int             x = (int)dp->layout.vid_w - dp->layout.margin_x;
       if (!side)
@@ -5823,31 +5823,31 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
       right[n].glyph = "A";
       right[n].label = side->a_label;
       n++;
-      downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
+      pastime_draw_footer_hints(p_disp, userdata, dp->chrome_font,
             dp->chrome_font_centre_offset, &dp->layout,
             dp->pill_cap_tex, x, bottom_y,
-            DOWNPLAY_ANCHOR_RIGHT, right, n, chrome_bg);
+            PASTIME_ANCHOR_RIGHT, right, n, chrome_bg);
       goto restore_viewport;
    }
 
    {
-      downplay_hint_t left[1];
+      pastime_hint_t left[1];
       left[0].glyph = "POWER";
       left[0].label = "SLEEP";
-      downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
+      pastime_draw_footer_hints(p_disp, userdata, dp->chrome_font,
             dp->chrome_font_centre_offset, &dp->layout,
             dp->pill_cap_tex, dp->layout.margin_x, bottom_y,
-            DOWNPLAY_ANCHOR_LEFT, left, 1, chrome_bg);
+            PASTIME_ANCHOR_LEFT, left, 1, chrome_bg);
    }
 
    /* Right-aligned hint depends on mode.  When the current view
     * supports going back, a B BACK pair shares the outer pill with
     * the primary hint. */
    {
-      downplay_hint_t right[2];
+      pastime_hint_t right[2];
       size_t          n          = 0;
-      bool            show_back  = (mode == DOWNPLAY_RENDER_LIST
-                                   && dp->nav.view != DOWNPLAY_VIEW_TOP);
+      bool            show_back  = (mode == PASTIME_RENDER_LIST
+                                   && dp->nav.view != PASTIME_VIEW_TOP);
       int             x          = (int)dp->layout.vid_w - dp->layout.margin_x;
 
       /* B BACK first so it sits left of A OPEN inside the pill. */
@@ -5858,21 +5858,21 @@ static void downplay_menu_frame(void *data, video_frame_info_t *video_info)
          n++;
       }
       right[n].glyph = "A";
-      if (mode == DOWNPLAY_RENDER_SPLASH)
+      if (mode == PASTIME_RENDER_SPLASH)
       {
          right[n].glyph = "B";
          right[n].label = "CANCEL";
       }
-      else if (mode == DOWNPLAY_RENDER_WELCOME)
+      else if (mode == PASTIME_RENDER_WELCOME)
          right[n].label = "START";
       else
          right[n].label = "OPEN";
       n++;
 
-      downplay_draw_footer_hints(p_disp, userdata, dp->chrome_font,
+      pastime_draw_footer_hints(p_disp, userdata, dp->chrome_font,
             dp->chrome_font_centre_offset, &dp->layout,
             dp->pill_cap_tex, x, bottom_y,
-            DOWNPLAY_ANCHOR_RIGHT, right, n, chrome_bg);
+            PASTIME_ANCHOR_RIGHT, right, n, chrome_bg);
    }
 
 restore_viewport:
@@ -5894,10 +5894,10 @@ restore_viewport:
  * generic_menu_entry_action() (which assumes file_list_t-driven entries)
  * isn't useful — we mutate dp->nav.selection directly and consume the action.
  * OK/CANCEL just log for now; real navigation targets land in M3+. */
-static int downplay_entry_action(void *userdata, menu_entry_t *entry,
+static int pastime_entry_action(void *userdata, menu_entry_t *entry,
       size_t i, enum menu_action action)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)userdata;
+   pastime_handle_t *dp = (pastime_handle_t*)userdata;
    if (!dp)
       return -1;
 
@@ -5907,24 +5907,24 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
     * but its result is discarded.  The screen leaves splash/blank state
     * naturally as the cores state advances. */
    {
-      enum downplay_render_mode m = downplay_get_render_mode();
-      if (m == DOWNPLAY_RENDER_WELCOME)
+      enum pastime_render_mode m = pastime_get_render_mode();
+      if (m == PASTIME_RENDER_WELCOME)
       {
          if (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT)
-            downplay_setup_start();
+            pastime_setup_start();
          /* No CANCEL path — once we've decided setup is needed, the
           * user shouldn't be able to dismiss it.  POWER still works. */
          return 0;
       }
-      if (m == DOWNPLAY_RENDER_SPLASH)
+      if (m == PASTIME_RENDER_SPLASH)
       {
          if (action == MENU_ACTION_CANCEL)
          {
             /* Drop any pending lazy launch so a cancelled lazy install
              * returns to the menu instead of auto-launching when the
              * in-flight task completes. */
-            downplay_clear_pending_launch(dp);
-            downplay_setup_cancel();
+            pastime_clear_pending_launch(dp);
+            pastime_setup_cancel();
          }
          return 0;
       }
@@ -5935,43 +5935,43 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
     * acknowledgement-only screens the B button isn't drawn, but we
     * still honour Cancel as a way out — pressing it on an ack screen
     * just dismisses, which is what the user expects. */
-   if (dp->nav.view == DOWNPLAY_VIEW_CONFIRM)
+   if (dp->nav.view == PASTIME_VIEW_CONFIRM)
    {
       if (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT)
-         downplay_close_confirm(dp, true);
+         pastime_close_confirm(dp, true);
       else if (action == MENU_ACTION_CANCEL)
-         downplay_close_confirm(dp, false);
+         pastime_close_confirm(dp, false);
       return 0;
    }
 
    /* SETTINGS view drives its own selection cursor on the active
     * stack frame, not dp->nav.selection — handled before the generic
     * up/down code below to avoid two cursors fighting. */
-   if (dp->nav.view == DOWNPLAY_VIEW_SETTINGS)
+   if (dp->nav.view == PASTIME_VIEW_SETTINGS)
    {
-      downplay_settings_list_t *S = downplay_settings_top(dp);
+      pastime_settings_list_t *S = pastime_settings_top(dp);
       if (!S || S->row_count == 0)
       {
          if (action == MENU_ACTION_CANCEL)
-            downplay_settings_pop(dp);
+            pastime_settings_pop(dp);
          else if (action == MENU_ACTION_START)
-            downplay_settings_pop_all(dp);
+            pastime_settings_pop_all(dp);
          return 0;
       }
       switch (action)
       {
          case MENU_ACTION_UP:
             S->sel = (S->sel + S->row_count - 1) % S->row_count;
-            downplay_settings_snap_scroll(dp, S);
+            pastime_settings_snap_scroll(dp, S);
             return 0;
          case MENU_ACTION_DOWN:
             S->sel = (S->sel + 1) % S->row_count;
-            downplay_settings_snap_scroll(dp, S);
+            pastime_settings_snap_scroll(dp, S);
             return 0;
          case MENU_ACTION_LEFT:
          case MENU_ACTION_RIGHT:
          {
-            downplay_settings_row_t *r = &S->rows[S->sel];
+            pastime_settings_row_t *r = &S->rows[S->sel];
             int    delta = (action == MENU_ACTION_LEFT) ? -1 : +1;
             size_t inc;
             if (!r->values || r->values_count == 0)
@@ -5985,20 +5985,20 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          case MENU_ACTION_OK:
          case MENU_ACTION_SELECT:
          {
-            downplay_settings_row_t *r = &S->rows[S->sel];
+            pastime_settings_row_t *r = &S->rows[S->sel];
             if (r->on_confirm)
                r->on_confirm(r->userdata);
             return 0;
          }
          case MENU_ACTION_CANCEL:
-            downplay_settings_pop(dp);
+            pastime_settings_pop(dp);
             return 0;
          case MENU_ACTION_START:
             /* Toggle close: mirrors Start-to-open from the launcher,
              * and from deeper stacks (in-game Options) collapses the
              * whole stack so the user exits Settings entirely instead
              * of having to back out one level at a time. */
-            downplay_settings_pop_all(dp);
+            pastime_settings_pop_all(dp);
             return 0;
          default:
             return 0;
@@ -6010,7 +6010,7 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
    if (dp->total_rows == 0)
    {
       if (action == MENU_ACTION_CANCEL)
-         RARCH_LOG("[Downplay] cancel (empty list)\n");
+         RARCH_LOG("[Pastime] cancel (empty list)\n");
       return 0;
    }
 
@@ -6026,9 +6026,9 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
          return 0;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:
-         if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
+         if (dp->nav.view == PASTIME_VIEW_INGAME)
          {
-            enum downplay_ingame_action act;
+            enum pastime_ingame_action act;
             if (dp->nav.selection >= dp->ingame_action_count)
                return 0;
             act = dp->ingame_actions[dp->nav.selection];
@@ -6038,18 +6038,18 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                   command_event(CMD_EVENT_MENU_TOGGLE, NULL);
                   break;
                case DP_INGAME_SAVE:
-                  downplay_save_to_slot(downplay_pick_next_save_slot());
+                  pastime_save_to_slot(pastime_pick_next_save_slot());
                   /* Refresh row composition: zero→one save means Load
                    * appears next time the menu opens. */
-                  downplay_refresh_ingame_actions(dp);
-                  downplay_recompute_total_rows(dp);
+                  pastime_refresh_ingame_actions(dp);
+                  pastime_recompute_total_rows(dp);
                   /* Hide the menu after Save so the user can resume
                    * play without an extra Continue press. */
                   command_event(CMD_EVENT_MENU_TOGGLE, NULL);
                   break;
                case DP_INGAME_LOAD:
                {
-                  downplay_save_entry_t scratch[DOWNPLAY_MAX_SAVE_ENTRIES];
+                  pastime_save_entry_t scratch[PASTIME_MAX_SAVE_ENTRIES];
                   size_t                scratch_count = 0;
                   size_t                manual_count  = 0;
                   size_t                i;
@@ -6058,7 +6058,7 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                   /* Re-enumerate (without thumbs) to count manual
                    * saves — could have changed since view enter
                    * (background autosave, manual external delete). */
-                  downplay_savestate_enumerate(scratch, &scratch_count, false);
+                  pastime_savestate_enumerate(scratch, &scratch_count, false);
                   for (i = 0; i < scratch_count; i++)
                   {
                      if (scratch[i].slot < 0)
@@ -6071,7 +6071,7 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                      break;       /* race: row hidden next frame */
                   if (manual_count == 1)
                   {
-                     downplay_load_from_slot(only_slot);
+                     pastime_load_from_slot(only_slot);
                      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
                      break;
                   }
@@ -6082,16 +6082,16 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
                    * the recompute inside dp_nav_sync_top reads the
                    * right row count.  save_picker[] stays on dp —
                    * only one picker exists at a time. */
-                  downplay_save_picker_free(dp);
-                  downplay_savestate_enumerate(dp->save_picker,
+                  pastime_save_picker_free(dp);
+                  pastime_savestate_enumerate(dp->save_picker,
                         &dp->save_picker_count, true);
-                  dp_nav_push(&dp->nav, DOWNPLAY_VIEW_SAVE_PICKER, NULL,
-                        downplay_save_picker_dispose);
+                  dp_nav_push(&dp->nav, PASTIME_VIEW_SAVE_PICKER, NULL,
+                        pastime_save_picker_dispose);
                   break;
                }
                case DP_INGAME_OPTIONS:
-                  downplay_settings_push(dp,
-                        downplay_build_root_options_list(dp));
+                  pastime_settings_push(dp,
+                        pastime_build_root_options_list(dp));
                   break;
                case DP_INGAME_QUIT:
                   command_event(CMD_EVENT_UNLOAD_CORE, NULL);
@@ -6099,12 +6099,12 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
             }
             return 0;
          }
-         if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
+         if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER)
          {
             if (dp->nav.selection < dp->save_picker_count)
             {
                int slot = dp->save_picker[dp->nav.selection].slot;
-               downplay_load_from_slot(slot);
+               pastime_load_from_slot(slot);
                /* Pop back to INGAME — dispose hook frees thumbnails
                 * and refreshes the action composition.
                 * CMD_EVENT_LOAD_STATE doesn't unload the core, so
@@ -6114,51 +6114,51 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
             }
             return 0;
          }
-         if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
+         if (dp->nav.view == PASTIME_VIEW_SYSTEM)
          {
-            const downplay_system_t *sys = &dp->systems[dp->active_system];
-            const downplay_rom_t    *rom = &dp->roms[dp->nav.selection];
-            downplay_launch_rom(dp, sys->core_ident, rom->full_path);
+            const pastime_system_t *sys = &dp->systems[dp->active_system];
+            const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
+            pastime_launch_rom(dp, sys->core_ident, rom->full_path);
             return 0;
          }
-         if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
+         if (dp->nav.view == PASTIME_VIEW_RECENTS)
          {
             if (dp->recents && dp->nav.selection < dp->recent_row_count)
-               downplay_launch_recent(dp->recents[dp->nav.selection].pl_idx);
+               pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
             return 0;
          }
          /* TOP view: Resume → recents-launch the head; Recents → open;
           * else → drill into a system.  Order mirrors row layout in
-          * downplay_row_label. */
+          * pastime_row_label. */
          {
             size_t sel = dp->nav.selection;
-            if (downplay_has_resume_row(dp))
+            if (pastime_has_resume_row(dp))
             {
                if (sel == 0)
                {
-                  downplay_launch_recent(dp->resume_pl_idx);
+                  pastime_launch_recent(dp->resume_pl_idx);
                   return 0;
                }
                sel--;
             }
-            if (downplay_has_recents_row(dp) && sel == 0)
+            if (pastime_has_recents_row(dp) && sel == 0)
             {
-               downplay_open_recents(dp);
+               pastime_open_recents(dp);
                return 0;
             }
             {
-               size_t sys_idx = downplay_has_recents_row(dp) ? sel - 1 : sel;
-               downplay_open_system(dp, sys_idx);
+               size_t sys_idx = pastime_has_recents_row(dp) ? sel - 1 : sel;
+               pastime_open_system(dp, sys_idx);
             }
          }
          return 0;
       case MENU_ACTION_CANCEL:
-         if (dp->nav.view == DOWNPLAY_VIEW_INGAME)
+         if (dp->nav.view == PASTIME_VIEW_INGAME)
          {
             command_event(CMD_EVENT_MENU_TOGGLE, NULL);
             return 0;
          }
-         if (dp->nav.view == DOWNPLAY_VIEW_SAVE_PICKER)
+         if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER)
          {
             /* Back to INGAME — dispose hook frees thumbnails and
              * refreshes action composition; parent INGAME frame's
@@ -6166,14 +6166,14 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
             dp_nav_pop(&dp->nav);
             return 0;
          }
-         if (dp->nav.view == DOWNPLAY_VIEW_SYSTEM)
+         if (dp->nav.view == PASTIME_VIEW_SYSTEM)
          {
-            downplay_close_system(dp);
+            pastime_close_system(dp);
             return 0;
          }
-         if (dp->nav.view == DOWNPLAY_VIEW_RECENTS)
+         if (dp->nav.view == PASTIME_VIEW_RECENTS)
          {
-            downplay_close_recents(dp);
+            pastime_close_recents(dp);
             return 0;
          }
          /* TOP view: nothing to back out to.  Stay put. */
@@ -6183,9 +6183,9 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
           * Other views ignore Start (RA's default for it is "reset
           * to default" on whichever entry has focus, which we don't
           * want bleeding into our list-driven views). */
-         if (dp->nav.view == DOWNPLAY_VIEW_TOP)
-            downplay_settings_push(dp,
-                  downplay_build_global_settings_list(dp));
+         if (dp->nav.view == PASTIME_VIEW_TOP)
+            pastime_settings_push(dp,
+                  pastime_build_global_settings_list(dp));
          return 0;
       default:
          break;
@@ -6197,14 +6197,14 @@ static int downplay_entry_action(void *userdata, menu_entry_t *entry,
 
 /* ---------- lifecycle ---------- */
 
-static void *downplay_menu_init(void **userdata, bool video_is_threaded)
+static void *pastime_menu_init(void **userdata, bool video_is_threaded)
 {
    menu_handle_t     *menu = NULL;
-   downplay_handle_t *dp   = NULL;
+   pastime_handle_t *dp   = NULL;
 
    if (!(menu = (menu_handle_t*)calloc(1, sizeof(*menu))))
       return NULL;
-   if (!(dp = (downplay_handle_t*)calloc(1, sizeof(*dp))))
+   if (!(dp = (pastime_handle_t*)calloc(1, sizeof(*dp))))
    {
       free(menu);
       return NULL;
@@ -6214,8 +6214,8 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
     * after-change callback so every push/pop refreshes total_rows
     * for the new view.  All writes go through nav helpers from here
     * on so the cached dp->nav.view + dp->nav.selection can't drift. */
-   dp_nav_init(&dp->nav, DOWNPLAY_VIEW_TOP,
-         downplay_after_nav_change, dp);
+   dp_nav_init(&dp->nav, PASTIME_VIEW_TOP,
+         pastime_after_nav_change, dp);
    dp->thumb_prev_selection_sys = SIZE_MAX;
    dp->thumb_prev_selection_rec = SIZE_MAX;
    dp->roms_dims_warmed         = false;
@@ -6225,7 +6225,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
     * re-init (driver swap, GPU reset) doesn't re-read the file. */
    if (!g_defaults.content_history)
       command_event(CMD_EVENT_HISTORY_INIT, NULL);
-   downplay_rebuild_lists(dp);
+   pastime_rebuild_lists(dp);
 
    /* Eager-on-boot core install (PLAN.md M3).  Collect every core_ident
     * referenced by a non-empty system folder, hand them to the cores
@@ -6240,7 +6240,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
          size_t i;
          for (i = 0; i < dp->system_count; i++)
             idents[i] = dp->systems[i].core_ident;
-         downplay_setup_plan_boot(idents, dp->system_count);
+         pastime_setup_plan_boot(idents, dp->system_count);
          free(idents);
       }
    }
@@ -6248,7 +6248,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
    /* Boot-time thumbnail-index prefetch (PLAN — first-image-load
     * optimization).  Fan out async fetches for every installed
     * system's index.json so that by the time the user navigates
-    * into a system view, downplay_thumbs_open finds a fresh
+    * into a system view, pastime_thumbs_open finds a fresh
     * on-disk index and skips its own HTTP fetch. */
    if (dp->system_count > 0)
    {
@@ -6264,7 +6264,7 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
                systems[n++] = db;
          }
          if (n > 0)
-            downplay_thumbs_prefetch_indexes(systems, n);
+            pastime_thumbs_prefetch_indexes(systems, n);
          free(systems);
       }
    }
@@ -6273,12 +6273,12 @@ static void *downplay_menu_init(void **userdata, bool video_is_threaded)
    return menu;
 }
 
-static void downplay_menu_context_destroy(void *data)
+static void pastime_menu_context_destroy(void *data)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)data;
+   pastime_handle_t *dp = (pastime_handle_t*)data;
    if (!dp)
       return;
-   downplay_release_fonts(dp);
+   pastime_release_fonts(dp);
    if (dp->pill_cap_tex)
    {
       video_driver_texture_unload(&dp->pill_cap_tex);
@@ -6286,7 +6286,7 @@ static void downplay_menu_context_destroy(void *data)
    }
    /* Picker thumbnails are GPU resources; drop them on context loss
     * so they're not dangling handles after a renderer reset. */
-   downplay_save_picker_free(dp);
+   pastime_save_picker_free(dp);
    /* Right-pane fade key holds a uintptr_t the GPU may recycle on the
     * upcoming context_reset.  Clearing it here guarantees the next
     * texture restarts the smoothstep from alpha 0 — the dispose hooks
@@ -6301,41 +6301,41 @@ static void downplay_menu_context_destroy(void *data)
     * options manager (RA-owned, possibly torn down before us); a
     * CONFIRM frame on top would leak its heap-allocated side payload
     * if pop_all stopped at it.  pop_to(TOP) catches everything. */
-   dp_nav_pop_to(&dp->nav, DOWNPLAY_VIEW_TOP);
+   dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
    gfx_display_deinit_white_texture();
 }
 
-static void downplay_menu_free(void *data)
+static void pastime_menu_free(void *data)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)data;
+   pastime_handle_t *dp = (pastime_handle_t*)data;
    if (!dp)
       return;
-   downplay_menu_context_destroy(dp);
+   pastime_menu_context_destroy(dp);
    /* Thumbs are normally closed by system_dispose / recents_dispose on
     * pop_to_TOP, which context_destroy triggered above; these branches
     * only fire if the destroy path skipped them (defensive). */
    if (dp->current_thumbs)
    {
-      downplay_thumbs_close(dp->current_thumbs);
+      pastime_thumbs_close(dp->current_thumbs);
       dp->current_thumbs = NULL;
    }
    if (dp->recents_thumbs)
    {
-      downplay_thumbs_recents_close(dp->recents_thumbs);
+      pastime_thumbs_recents_close(dp->recents_thumbs);
       dp->recents_thumbs = NULL;
    }
    /* systems / roms are CPU-only state, freed here rather than in
     * context_destroy so they survive GPU context loss/reset cycles. */
-   downplay_systems_free(dp->systems, dp->system_count);
-   downplay_roms_free(dp->roms, dp->rom_count);
-   downplay_recents_free(dp->recents, dp->recent_row_count);
+   pastime_systems_free(dp->systems, dp->system_count);
+   pastime_roms_free(dp->roms, dp->rom_count);
+   pastime_recents_free(dp->recents, dp->recent_row_count);
    /* Don't free(dp) — menu_driver_ctl(RARCH_MENU_CTL_DEINIT) frees
     * menu_st->userdata (which is dp) itself right after this returns. */
 }
 
-static void downplay_menu_context_reset(void *data, bool video_is_threaded)
+static void pastime_menu_context_reset(void *data, bool video_is_threaded)
 {
-   downplay_handle_t *dp = (downplay_handle_t*)data;
+   pastime_handle_t *dp = (pastime_handle_t*)data;
    settings_t        *settings;
    float              user_scale;
    unsigned           width, height;
@@ -6345,28 +6345,28 @@ static void downplay_menu_context_reset(void *data, bool video_is_threaded)
 
    /* Seed the layout from the live framebuffer size; a real layout pass
     * will run on the first frame, but we need *something* sane so
-    * font_size is non-zero before downplay_reload_fonts(). */
+    * font_size is non-zero before pastime_reload_fonts(). */
    video_driver_get_output_size(&width, &height);
    settings   = config_get_ptr();
    user_scale = (settings && settings->floats.menu_scale_factor > 0.0f)
                 ? settings->floats.menu_scale_factor : 1.0f;
-   downplay_layout_recompute(&dp->layout, width, height, user_scale);
+   pastime_layout_recompute(&dp->layout, width, height, user_scale);
 
    gfx_display_init_white_texture();
    if (!dp->pill_cap_tex)
-      dp->pill_cap_tex = downplay_build_cap_texture(DOWNPLAY_CAP_TEX_DIAMETER);
-   downplay_reload_fonts(dp, video_is_threaded);
+      dp->pill_cap_tex = pastime_build_cap_texture(PASTIME_CAP_TEX_DIAMETER);
+   pastime_reload_fonts(dp, video_is_threaded);
 }
 
-menu_ctx_driver_t menu_ctx_downplay = {
+menu_ctx_driver_t menu_ctx_pastime = {
    NULL,                              /* set_texture */
    NULL,                              /* render_messagebox */
    NULL,                              /* render */
-   downplay_menu_frame,
-   downplay_menu_init,
-   downplay_menu_free,
-   downplay_menu_context_reset,
-   downplay_menu_context_destroy,
+   pastime_menu_frame,
+   pastime_menu_init,
+   pastime_menu_free,
+   pastime_menu_context_reset,
+   pastime_menu_context_destroy,
    NULL,                              /* populate_entries */
    NULL,                              /* toggle */
    NULL,                              /* navigation_clear */
@@ -6389,7 +6389,7 @@ menu_ctx_driver_t menu_ctx_downplay = {
    NULL,                              /* list_set_selection */
    NULL,                              /* bind_init */
    NULL,                              /* load_image */
-   "downplay",
+   "pastime",
    NULL,                              /* environ_cb */
    NULL,                              /* update_thumbnail_path */
    NULL,                              /* update_thumbnail_image */
@@ -6400,5 +6400,5 @@ menu_ctx_driver_t menu_ctx_downplay = {
    NULL,                              /* update_savestate_thumbnail_image */
    NULL,                              /* pointer_down */
    NULL,                              /* pointer_up */
-   downplay_entry_action
+   pastime_entry_action
 };

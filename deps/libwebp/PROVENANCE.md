@@ -1,6 +1,6 @@
 # libwebp 1.5.0 — vendored decoder
 
-Decoder-only subset of upstream libwebp, vendored for Downplay's
+Decoder-only subset of upstream libwebp, vendored for Pastime's
 thumbnail pipeline. Imported from the v1.5.0 release tag at
 https://github.com/webmproject/libwebp.
 
@@ -17,7 +17,7 @@ https://github.com/webmproject/libwebp.
   `mux_types.h`, `types.h`)
 
 The `mux/`, `demux/`, and `enc/` directories from upstream are not
-vendored — Downplay decodes single still images, not animated WebP or
+vendored — Pastime decodes single still images, not animated WebP or
 encoded streams.
 
 ## License

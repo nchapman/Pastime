@@ -1,5 +1,5 @@
-/* Unit tests for downplay/downplay_thumbs_index.c — the pure parse +
- * tier-cascade matcher.  The HTTP/IO manager (downplay_thumbs.c) is
+/* Unit tests for pastime/pastime_thumbs_index.c — the pure parse +
+ * tier-cascade matcher.  The HTTP/IO manager (pastime_thumbs.c) is
  * a separate translation unit and is intentionally NOT linked into
  * this test binary; see run_tests.sh. */
 
@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../downplay_thumbs.h"
-#include "../downplay_thumbs_internal.h"
+#include "../pastime_thumbs.h"
+#include "../pastime_thumbs_internal.h"
 
 /* rjson.c references stream / rfile I/O symbols even on the buffer
  * code paths we use.  We only call rjson_open_buffer / rjson_parse_quick,
@@ -128,12 +128,12 @@ static char *build_idx_json_v2(const v2_entry_t *entries, size_t n)
    return buf;
 }
 
-static downplay_thumbs_index_t *make_idx(const char * const *titles, size_t n)
+static pastime_thumbs_index_t *make_idx(const char * const *titles, size_t n)
 {
    char *json = build_idx_json(titles, n);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    if (!json) return NULL;
-   idx = downplay_thumbs_index_parse(json, strlen(json));
+   idx = pastime_thumbs_index_parse(json, strlen(json));
    free(json);
    return idx;
 }
@@ -144,12 +144,12 @@ static void test_parse_basic(void)
       "Pokemon Red (USA, Europe)",
       "Tetris (World)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
    ASSERT_NONNULL(idx);
    if (idx)
    {
-      ASSERT_TRUE(downplay_thumbs_index_count(idx) == 2);
-      downplay_thumbs_index_free(idx);
+      ASSERT_TRUE(pastime_thumbs_index_count(idx) == 2);
+      pastime_thumbs_index_free(idx);
    }
 }
 
@@ -159,12 +159,12 @@ static void test_t0_exact(void)
       "Pokemon Red (USA, Europe)",
       "Tetris (World)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
    /* Exact filename match (extension stripped). */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Pokemon Red (USA, Europe).gb"),
          "Pokemon Red (USA, Europe)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_t1_strips_flags(void)
@@ -173,11 +173,11 @@ static void test_t1_strips_flags(void)
       "Pokemon Red (USA, Europe) (SGB Enhanced)",
       "Tetris (World)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
    /* User has bare-titled ROM; canonical key has extra parens. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Pokemon Red.gb"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Pokemon Red.gb"),
          "Pokemon Red (USA, Europe) (SGB Enhanced)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_t1_rotates_article(void)
@@ -187,15 +187,15 @@ static void test_t1_rotates_article(void)
    const char *titles[] = {
       "Legend of Zelda, The (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "The Legend of Zelda.nes"),
          "Legend of Zelda, The (USA)");
    /* Reverse direction also works (user's ROM uses No-Intro form). */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Legend of Zelda, The (USA).nes"),
          "Legend of Zelda, The (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_t2_case_insensitive(void)
@@ -203,12 +203,12 @@ static void test_t2_case_insensitive(void)
    const char *titles[] = {
       "Pokemon Red (USA, Europe)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
    /* All lowercase — T2's sort_key normalization lowercases both
     * sides, so a hit is still possible. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "pokemon red.gb"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "pokemon red.gb"),
          "Pokemon Red (USA, Europe)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_t3_region_preference_usa_over_japan(void)
@@ -217,12 +217,12 @@ static void test_t3_region_preference_usa_over_japan(void)
       "Sonic The Hedgehog (Japan)",
       "Sonic The Hedgehog (USA, Europe)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
    /* Bare "Sonic The Hedgehog" matches both via T1; USA wins T3. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Sonic The Hedgehog.md"),
          "Sonic The Hedgehog (USA, Europe)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_t3_world_over_japan(void)
@@ -231,10 +231,10 @@ static void test_t3_world_over_japan(void)
       "Tetris (Japan)",
       "Tetris (World)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Tetris.gb"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Tetris.gb"),
          "Tetris (World)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_compact_spacing_variants(void)
@@ -243,12 +243,12 @@ static void test_compact_spacing_variants(void)
     * normalize (alphanumeric runs only, spaces are separators) — no
     * alias table needed. */
    const char *titles[] = { "Mega Man X (USA)" };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Megaman X.smc"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Megaman X.smc"),
          "Mega Man X (USA)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "MegaManX.smc"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "MegaManX.smc"),
          "Mega Man X (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_roman_arabic_equivalence(void)
@@ -256,11 +256,11 @@ static void test_roman_arabic_equivalence(void)
    /* "VI" and "6" both reduce to "6" — no alias table needed; the
     * roman→arabic conversion in normalize handles it. */
    const char *titles[] = { "Final Fantasy VI (USA)" };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Final Fantasy 6.smc"),
          "Final Fantasy VI (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_miss_homebrew(void)
@@ -269,11 +269,11 @@ static void test_miss_homebrew(void)
       "Pokemon Red (USA, Europe)",
       "Tetris (World)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
    /* Bogus homebrew filename — no match anywhere. */
-   ASSERT_NULL(downplay_thumbs_index_match(idx,
+   ASSERT_NULL(pastime_thumbs_index_match(idx,
          "My Awesome Homebrew Game (homebrew).gb"));
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_empty_index(void)
@@ -281,27 +281,27 @@ static void test_empty_index(void)
    /* An empty `files` object is a valid index with zero entries. */
    const char *json = "{\"system\":\"X\",\"image_type\":\"boxart\","
                       "\"files\":{}}";
-   downplay_thumbs_index_t *idx = downplay_thumbs_index_parse(json,
+   pastime_thumbs_index_t *idx = pastime_thumbs_index_parse(json,
          strlen(json));
    ASSERT_NONNULL(idx);
    if (idx)
    {
-      ASSERT_TRUE(downplay_thumbs_index_count(idx) == 0);
-      ASSERT_NULL(downplay_thumbs_index_match(idx, "Anything.nes"));
-      downplay_thumbs_index_free(idx);
+      ASSERT_TRUE(pastime_thumbs_index_count(idx) == 0);
+      ASSERT_NULL(pastime_thumbs_index_match(idx, "Anything.nes"));
+      pastime_thumbs_index_free(idx);
    }
 }
 
 static void test_idempotent_repeated_lookups(void)
 {
    const char *titles[] = { "Pokemon Red (USA, Europe)" };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   const char *a = downplay_thumbs_index_match(idx, "Pokemon Red.gb");
-   const char *b = downplay_thumbs_index_match(idx, "Pokemon Red.gb");
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   const char *a = pastime_thumbs_index_match(idx, "Pokemon Red.gb");
+   const char *b = pastime_thumbs_index_match(idx, "Pokemon Red.gb");
    /* Same internal pointer (not just same value) — confirms no
     * per-call allocation that the caller might forget to free. */
    ASSERT_TRUE(a == b);
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_multi_paren_world_beats_japan(void)
@@ -311,10 +311,10 @@ static void test_multi_paren_world_beats_japan(void)
       "Game (Japan) (Rev A)",
       "Game (World) (Rev 1)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Game.gb"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Game.gb"),
          "Game (World) (Rev 1)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_no_false_positive_substring(void)
@@ -325,15 +325,15 @@ static void test_no_false_positive_substring(void)
       "Castlevania (USA)",
       "Castlevania - Symphony of the Night (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
    /* User has the symphony subtitle; expects symphony, not bare. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Castlevania - Symphony of the Night.iso"),
          "Castlevania - Symphony of the Night (USA)");
    /* User has the bare title; expects bare, not symphony. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Castlevania.nes"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Castlevania.nes"),
          "Castlevania (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_multi_disc_disambiguation(void)
@@ -343,19 +343,19 @@ static void test_multi_disc_disambiguation(void)
       "Final Fantasy VII (USA) (Disc 2)",
       "Final Fantasy VII (USA) (Disc 3)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 3);
+   pastime_thumbs_index_t *idx = make_idx(titles, 3);
    /* User's filename names the disc — must pick the matching disc,
     * not whichever disc has the best region score. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Final Fantasy VII (Disc 2).bin"),
          "Final Fantasy VII (USA) (Disc 2)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Final Fantasy VII (Disc 3).bin"),
          "Final Fantasy VII (USA) (Disc 3)");
    /* Bare filename (no disc) — falls back to first/best region. */
-   ASSERT_NONNULL(downplay_thumbs_index_match(idx,
+   ASSERT_NONNULL(pastime_thumbs_index_match(idx,
          "Final Fantasy VII.bin"));
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_region_prefix_not_a_false_match(void)
@@ -369,10 +369,10 @@ static void test_region_prefix_not_a_false_match(void)
       "Game (USA Proto)",
       "Game (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Game.gb"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Game.gb"),
          "Game (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_path_traversal_rejected(void)
@@ -386,17 +386,17 @@ static void test_path_traversal_rejected(void)
       ".hidden",
       "Good Title (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 5);
+   pastime_thumbs_index_t *idx = make_idx(titles, 5);
    ASSERT_NONNULL(idx);
    if (idx)
    {
       /* Only the safe one survives. */
-      ASSERT_TRUE(downplay_thumbs_index_count(idx) == 1);
-      ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Good Title.nes"),
+      ASSERT_TRUE(pastime_thumbs_index_count(idx) == 1);
+      ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Good Title.nes"),
             "Good Title (USA)");
-      ASSERT_NULL(downplay_thumbs_index_match(idx, "../../etc/passwd"));
-      ASSERT_NULL(downplay_thumbs_index_match(idx, "subdir/Pokemon Red"));
-      downplay_thumbs_index_free(idx);
+      ASSERT_NULL(pastime_thumbs_index_match(idx, "../../etc/passwd"));
+      ASSERT_NULL(pastime_thumbs_index_match(idx, "subdir/Pokemon Red"));
+      pastime_thumbs_index_free(idx);
    }
 }
 
@@ -408,10 +408,10 @@ static void test_bad_dump_filtered_out(void)
       "Sonic the Hedgehog (Beta)",
       "Sonic the Hedgehog (Prototype)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 3);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Sonic the Hedgehog.md"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 3);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Sonic the Hedgehog.md"),
          "Sonic the Hedgehog (USA, Europe)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_bad_dump_only_falls_through(void)
@@ -421,9 +421,9 @@ static void test_bad_dump_only_falls_through(void)
       "Foo (Beta)",
       "Foo (Prototype)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_NONNULL(downplay_thumbs_index_match(idx, "Foo.bin"));
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_NONNULL(pastime_thumbs_index_match(idx, "Foo.bin"));
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_rev_highest_wins(void)
@@ -434,10 +434,10 @@ static void test_rev_highest_wins(void)
       "Foo (USA) (Rev 1)",
       "Foo (USA) (Rev 2)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 3);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Foo.bin"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 3);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Foo.bin"),
          "Foo (USA) (Rev 2)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_cd_rom_is_not_a_disc_tag(void)
@@ -450,14 +450,14 @@ static void test_cd_rom_is_not_a_disc_tag(void)
       "Bar (USA) (CD Audio)",
       "Real Disc Game (USA) (Disc 1)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 3);
+   pastime_thumbs_index_t *idx = make_idx(titles, 3);
    /* User file with (Disc 1) must not be penalised against the
     * (CD ROM) entry — the (CD ROM) tag should NOT have a disc_token. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Foo (Disc 1).bin"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Foo (Disc 1).bin"),
          "Foo (USA) (CD ROM)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Real Disc Game (Disc 1).bin"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Real Disc Game (Disc 1).bin"),
          "Real Disc Game (USA) (Disc 1)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_rev_clamped_no_overflow(void)
@@ -469,10 +469,10 @@ static void test_rev_clamped_no_overflow(void)
       "Foo (USA)",
       "Foo (Japan) (Rev 12345)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Foo.bin"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Foo.bin"),
          "Foo (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_roman_to_arabic(void)
@@ -482,12 +482,12 @@ static void test_roman_to_arabic(void)
    const char *titles[] = {
       "Final Fantasy VII (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Final Fantasy 7.bin"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Final Fantasy 7.bin"),
          "Final Fantasy VII (USA)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Final Fantasy VII.bin"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Final Fantasy VII.bin"),
          "Final Fantasy VII (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_roman_x_not_converted(void)
@@ -498,12 +498,12 @@ static void test_roman_x_not_converted(void)
       "Mega Man X (USA)",
       "Mega Man 10 (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Mega Man X.smc"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Mega Man X.smc"),
          "Mega Man X (USA)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Mega Man 10.smc"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Mega Man 10.smc"),
          "Mega Man 10 (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_ampersand_and_underscore_equivalence(void)
@@ -517,28 +517,28 @@ static void test_ampersand_and_underscore_equivalence(void)
    const char *titles[] = {
       "Mario _ Luigi - Superstar Saga (USA)"  /* mirror form */
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Mario & Luigi - Superstar Saga (USA).zip"),
          "Mario _ Luigi - Superstar Saga (USA)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Mario and Luigi - Superstar Saga.zip"),
          "Mario _ Luigi - Superstar Saga (USA)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Mario _ Luigi - Superstar Saga.zip"),
          "Mario _ Luigi - Superstar Saga (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 
    /* Also: "Tom & Jerry" ↔ "Tom and Jerry" (no underscore on either
     * side) still works via the "and" connective drop. */
    {
       const char *titles2[] = { "Tom & Jerry (USA)" };
-      downplay_thumbs_index_t *idx2 = make_idx(titles2, 1);
-      ASSERT_STR_EQ(downplay_thumbs_index_match(idx2, "Tom and Jerry.gen"),
+      pastime_thumbs_index_t *idx2 = make_idx(titles2, 1);
+      ASSERT_STR_EQ(pastime_thumbs_index_match(idx2, "Tom and Jerry.gen"),
             "Tom & Jerry (USA)");
-      ASSERT_STR_EQ(downplay_thumbs_index_match(idx2, "Tom & Jerry.gen"),
+      ASSERT_STR_EQ(pastime_thumbs_index_match(idx2, "Tom & Jerry.gen"),
             "Tom & Jerry (USA)");
-      downplay_thumbs_index_free(idx2);
+      pastime_thumbs_index_free(idx2);
    }
 }
 
@@ -549,19 +549,19 @@ static void test_latin_fold(void)
    const char *titles[] = {
       "Pokémon Red (USA, Europe)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Pokemon Red.gb"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Pokemon Red.gb"),
          "Pokémon Red (USA, Europe)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Pokémon Red.gb"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Pokémon Red.gb"),
          "Pokémon Red (USA, Europe)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 
    {
       const char *titles2[] = { "Doña Bárbara (Spain)" };
-      downplay_thumbs_index_t *idx2 = make_idx(titles2, 1);
-      ASSERT_STR_EQ(downplay_thumbs_index_match(idx2, "Dona Barbara.bin"),
+      pastime_thumbs_index_t *idx2 = make_idx(titles2, 1);
+      ASSERT_STR_EQ(pastime_thumbs_index_match(idx2, "Dona Barbara.bin"),
             "Doña Bárbara (Spain)");
-      downplay_thumbs_index_free(idx2);
+      pastime_thumbs_index_free(idx2);
    }
 }
 
@@ -570,13 +570,13 @@ static void test_punctuation_and_spacing_irrelevant(void)
    const char *titles[] = {
       "Mike Tyson's Punch-Out!! (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
    /* All these are equivalent under heavy normalize. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Mike.Tysons.Punch.Out.nes"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Mike.Tysons.Punch.Out.nes"),
          "Mike Tyson's Punch-Out!! (USA)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Mike_Tysons_PunchOut.nes"),
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Mike_Tysons_PunchOut.nes"),
          "Mike Tyson's Punch-Out!! (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_rev_letter_ordering(void)
@@ -587,10 +587,10 @@ static void test_rev_letter_ordering(void)
       "Foo (USA) (Rev C)",
       "Foo (USA) (Rev B)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 3);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Foo.bin"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 3);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Foo.bin"),
          "Foo (USA) (Rev C)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_multiple_bad_dump_tags(void)
@@ -600,10 +600,10 @@ static void test_multiple_bad_dump_tags(void)
       "Foo (USA)",
       "Foo (Beta) (Proto)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 2);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx, "Foo.bin"),
+   pastime_thumbs_index_t *idx = make_idx(titles, 2);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx, "Foo.bin"),
          "Foo (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_alt_name_bundle(void)
@@ -615,17 +615,17 @@ static void test_alt_name_bundle(void)
    const char *titles[] = {
       "F-16 Fighting Falcon _ F-16 Fighter _ F16 Falcon Fighter (USA, Europe, Brazil) (En)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "F-16 Fighter (USA, Europe, Brazil) (En).zip"),
          "F-16 Fighting Falcon _ F-16 Fighter _ F16 Falcon Fighter (USA, Europe, Brazil) (En)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "F-16 Fighting Falcon.zip"),
          "F-16 Fighting Falcon _ F-16 Fighter _ F16 Falcon Fighter (USA, Europe, Brazil) (En)");
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "F16 Falcon Fighter.zip"),
          "F-16 Fighting Falcon _ F-16 Fighter _ F16 Falcon Fighter (USA, Europe, Brazil) (En)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_unbalanced_paren_in_user_input(void)
@@ -635,13 +635,13 @@ static void test_unbalanced_paren_in_user_input(void)
    const char *titles[] = {
       "Bar Game (USA)"
    };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
    /* "Bar Game" → "bargame" matches "Bar Game" → "bargame".  The
     * trailing "(extra" tokenizes as "extra" and is appended → no
     * match.  This documents the behavior; the important property is
     * "no crash". */
-   (void)downplay_thumbs_index_match(idx, "Bar Game (extra.gb");
-   downplay_thumbs_index_free(idx);
+   (void)pastime_thumbs_index_match(idx, "Bar Game (extra.gb");
+   pastime_thumbs_index_free(idx);
 }
 
 static void test_null_and_empty_inputs(void)
@@ -651,37 +651,37 @@ static void test_null_and_empty_inputs(void)
     * — without them, a bug introduced in the early-return paths
     * would only surface in the manager and never in tests. */
    const char *titles[] = { "Sonic the Hedgehog (USA)" };
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
 
    /* _parse: bad inputs return NULL, never deref. */
-   ASSERT_NULL(downplay_thumbs_index_parse(NULL, 0));
-   ASSERT_NULL(downplay_thumbs_index_parse(NULL, 16));
-   ASSERT_NULL(downplay_thumbs_index_parse("ignored", 0));
+   ASSERT_NULL(pastime_thumbs_index_parse(NULL, 0));
+   ASSERT_NULL(pastime_thumbs_index_parse(NULL, 16));
+   ASSERT_NULL(pastime_thumbs_index_parse("ignored", 0));
    /* Outright malformed JSON. */
-   ASSERT_NULL(downplay_thumbs_index_parse("garbage", 7));
-   ASSERT_NULL(downplay_thumbs_index_parse("{", 1));
+   ASSERT_NULL(pastime_thumbs_index_parse("garbage", 7));
+   ASSERT_NULL(pastime_thumbs_index_parse("{", 1));
    /* JSON without a "files" object — saw_files_obj guard. */
-   ASSERT_NULL(downplay_thumbs_index_parse("{}", 2));
-   ASSERT_NULL(downplay_thumbs_index_parse(
+   ASSERT_NULL(pastime_thumbs_index_parse("{}", 2));
+   ASSERT_NULL(pastime_thumbs_index_parse(
          "{\"system\":\"Test\"}", 17));
 
    /* _count: NULL returns 0. */
-   ASSERT_TRUE(downplay_thumbs_index_count(NULL) == 0);
+   ASSERT_TRUE(pastime_thumbs_index_count(NULL) == 0);
 
    /* _match: NULL idx and NULL/empty rom basename short-circuit. */
    idx = make_idx(titles, 1);
    ASSERT_NONNULL(idx);
-   ASSERT_NULL(downplay_thumbs_index_match(NULL,  "Sonic.md"));
-   ASSERT_NULL(downplay_thumbs_index_match(idx,   NULL));
-   ASSERT_NULL(downplay_thumbs_index_match(idx,   ""));
+   ASSERT_NULL(pastime_thumbs_index_match(NULL,  "Sonic.md"));
+   ASSERT_NULL(pastime_thumbs_index_match(idx,   NULL));
+   ASSERT_NULL(pastime_thumbs_index_match(idx,   ""));
    /* Sanity: a real query against the same idx still works. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Sonic the Hedgehog.md"),
          "Sonic the Hedgehog (USA)");
-   downplay_thumbs_index_free(idx);
+   pastime_thumbs_index_free(idx);
 
    /* _free: NULL is a no-op. */
-   downplay_thumbs_index_free(NULL);
+   pastime_thumbs_index_free(NULL);
 }
 
 static void test_filename_extension_edge_cases(void)
@@ -690,16 +690,16 @@ static void test_filename_extension_edge_cases(void)
     * input is treated literally as ".gb", not stripped to "".
     * A no-extension input is passed through unchanged. */
    const char *titles[] = { "Sonic the Hedgehog (USA)" };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
    /* No-extension query: "Sonic the Hedgehog" → matches. */
-   ASSERT_STR_EQ(downplay_thumbs_index_match(idx,
+   ASSERT_STR_EQ(pastime_thumbs_index_match(idx,
          "Sonic the Hedgehog"),
          "Sonic the Hedgehog (USA)");
    /* Bare extension only: dp_strip_ext leaves ".gb" intact (skips
     * names starting with '.'); heavy normalize then yields "gb",
     * which doesn't match the canonical's "sonichedgehog" → miss. */
-   ASSERT_NULL(downplay_thumbs_index_match(idx, ".gb"));
-   downplay_thumbs_index_free(idx);
+   ASSERT_NULL(pastime_thumbs_index_match(idx, ".gb"));
+   pastime_thumbs_index_free(idx);
 }
 
 /* Round-trip width/height/thumbhash through the v2 binary format and
@@ -714,9 +714,9 @@ static void test_v2_dims_and_thumbhash_round_trip(void)
       { "Tetris (World)",            512, 512, NULL /* no thumbhash */ },
    };
    char *json = build_idx_json_v2(es, 2);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    ASSERT_NONNULL(json);
-   idx = downplay_thumbs_index_parse(json, strlen(json));
+   idx = pastime_thumbs_index_parse(json, strlen(json));
    free(json);
    ASSERT_NONNULL(idx);
    if (idx)
@@ -754,7 +754,7 @@ static void test_v2_dims_and_thumbhash_round_trip(void)
          ASSERT_TRUE(th == NULL);
          ASSERT_TRUE(thlen == 0);
       }
-      downplay_thumbs_index_free(idx);
+      pastime_thumbs_index_free(idx);
    }
 }
 
@@ -763,7 +763,7 @@ static void test_v2_dims_and_thumbhash_round_trip(void)
 static void test_v2_missing_fields_default_zero(void)
 {
    const char *titles[] = { "Tetris (World)" };
-   downplay_thumbs_index_t *idx = make_idx(titles, 1);
+   pastime_thumbs_index_t *idx = make_idx(titles, 1);
    ASSERT_NONNULL(idx);
    if (idx)
    {
@@ -781,7 +781,7 @@ static void test_v2_missing_fields_default_zero(void)
          ASSERT_TRUE(th == NULL);
          ASSERT_TRUE(thlen == 0);
       }
-      downplay_thumbs_index_free(idx);
+      pastime_thumbs_index_free(idx);
    }
 }
 
@@ -795,9 +795,9 @@ static void test_v2_malformed_thumbhash_tolerated(void)
       { "Tetris (World)", 200, 200, "not!valid!base64!" },
    };
    char *json = build_idx_json_v2(es, 1);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    ASSERT_NONNULL(json);
-   idx = downplay_thumbs_index_parse(json, strlen(json));
+   idx = pastime_thumbs_index_parse(json, strlen(json));
    free(json);
    ASSERT_NONNULL(idx);
    if (idx)
@@ -816,7 +816,7 @@ static void test_v2_malformed_thumbhash_tolerated(void)
          ASSERT_TRUE(th == NULL);
          ASSERT_TRUE(thlen == 0);
       }
-      downplay_thumbs_index_free(idx);
+      pastime_thumbs_index_free(idx);
    }
 }
 
@@ -898,7 +898,7 @@ static void test_v2_minimal_synthetic_buffer_opens(void)
 {
    size_t   n;
    uint8_t *buf = build_minimal_v2_buffer(&n);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    ASSERT_NONNULL(buf);
    if (!buf) return;
    /* Need a malloc'd copy because dp_idx_open frees on either path. */
@@ -906,8 +906,8 @@ static void test_v2_minimal_synthetic_buffer_opens(void)
    ASSERT_NONNULL(idx);
    if (idx)
    {
-      ASSERT_TRUE(downplay_thumbs_index_count(idx) == 1);
-      downplay_thumbs_index_free(idx);
+      ASSERT_TRUE(pastime_thumbs_index_count(idx) == 1);
+      pastime_thumbs_index_free(idx);
    }
    free(buf);
 }
@@ -921,7 +921,7 @@ static void test_v2_rejects_version_mismatch(void)
 {
    size_t   n;
    uint8_t *buf = build_minimal_v2_buffer(&n);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    if (!buf) { ASSERT_NONNULL(buf); return; }
    put_u32_le(buf + 4, 1u);  /* header version → 1 */
    idx = dp_idx_open(dup_buf(buf, n), n);
@@ -937,7 +937,7 @@ static void test_v2_rejects_footer_version_mismatch(void)
 {
    size_t   n;
    uint8_t *buf = build_minimal_v2_buffer(&n);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    uint32_t footer_off;
    if (!buf) { ASSERT_NONNULL(buf); return; }
    /* footer_off = total - 12 */
@@ -956,7 +956,7 @@ static void test_v2_rejects_truncated_buffer(void)
 {
    size_t   n;
    uint8_t *buf = build_minimal_v2_buffer(&n);
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    if (!buf) { ASSERT_NONNULL(buf); return; }
    /* Pass `n - 1` for a 1-byte-short buffer — buf_len mismatch
     * fails the layout check immediately. */
@@ -984,7 +984,7 @@ static void test_v2_thumbhash_bounds_clamp(void)
    const uint32_t thumbhash_off = strings_off + strings_size;
    const uint32_t footer_off  = thumbhash_off + thumbhash_size;
    const size_t   total       = footer_off + 12;
-   downplay_thumbs_index_t *idx;
+   pastime_thumbs_index_t *idx;
    uint8_t       *buf = (uint8_t*)calloc(total, 1);
    if (!buf) { ASSERT_NONNULL(buf); return; }
    put_u32_le(buf +  0, magic);
@@ -1015,7 +1015,7 @@ static void test_v2_thumbhash_bounds_clamp(void)
       dp_idx_thumbhash(idx, 0, &th, &thlen);
       ASSERT_TRUE(th == NULL);
       ASSERT_TRUE(thlen == 0);
-      downplay_thumbs_index_free(idx);
+      pastime_thumbs_index_free(idx);
    }
 }
 

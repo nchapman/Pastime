@@ -1,18 +1,18 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdlib.h>
@@ -22,7 +22,7 @@
 #include <file/file_path.h>
 #include <string/stdstring.h>
 
-#include "downplay_defaults.h"
+#include "pastime_defaults.h"
 
 #include "../configuration.h"
 #include "../defaults.h"
@@ -42,17 +42,17 @@ extern char internal_storage_path[];
 extern char internal_storage_app_path[];
 #endif
 
-bool downplay_paths_get_root(char *out, size_t out_len)
+bool pastime_paths_get_root(char *out, size_t out_len)
 {
 #ifdef ANDROID
    if (*internal_storage_path)
    {
-      fill_pathname_join_special(out, internal_storage_path, "Downplay", out_len);
+      fill_pathname_join_special(out, internal_storage_path, "Pastime", out_len);
       return true;
    }
    if (*internal_storage_app_path)
    {
-      fill_pathname_join_special(out, internal_storage_app_path, "Downplay", out_len);
+      fill_pathname_join_special(out, internal_storage_app_path, "Pastime", out_len);
       return true;
    }
    return false;
@@ -61,7 +61,7 @@ bool downplay_paths_get_root(char *out, size_t out_len)
       const char *home = getenv("HOME");
       if (!home || !*home)
          return false;
-      fill_pathname_join_special(out, home, "Downplay", out_len);
+      fill_pathname_join_special(out, home, "Pastime", out_len);
       return true;
    }
 #endif
@@ -73,7 +73,7 @@ bool downplay_paths_get_root(char *out, size_t out_len)
  * us re-apply our overlay on a fresh install where config_load() has
  * already populated the field with RA's defaults rather than leaving it
  * empty (Android does this for SRAM/SAVESTATE/SYSTEM via platform_unix.c). */
-static bool downplay_should_overlay(const char *cur, const char *ra_default)
+static bool pastime_should_overlay(const char *cur, const char *ra_default)
 {
    if (!cur || !*cur)
       return true;
@@ -82,7 +82,7 @@ static bool downplay_should_overlay(const char *cur, const char *ra_default)
    return false;
 }
 
-void downplay_defaults_apply(void)
+void pastime_defaults_apply(void)
 {
    char        root[PATH_MAX_LENGTH];
    char        sub[PATH_MAX_LENGTH];
@@ -92,10 +92,10 @@ void downplay_defaults_apply(void)
       return;
 
    /* Menu driver: unconditional override.  This is the fork — the whole
-    * point is the Downplay UI.  XMB/Ozone are still compiled in for
+    * point is the Pastime UI.  XMB/Ozone are still compiled in for
     * debugging via a different binary or config, but the default ships
-    * Downplay. */
-   strlcpy(settings->arrays.menu_driver, "downplay",
+    * Pastime. */
+   strlcpy(settings->arrays.menu_driver, "pastime",
          sizeof(settings->arrays.menu_driver));
 
 #ifdef ANDROID
@@ -109,7 +109,7 @@ void downplay_defaults_apply(void)
     * VIDEO_GL when HAVE_OPENGLES is set, before HAVE_VULKAN gets a
     * chance) — equality with that string lets us re-overlay on a
     * fresh install without trampling an explicit user choice. */
-   if (downplay_should_overlay(settings->arrays.video_driver, "gl"))
+   if (pastime_should_overlay(settings->arrays.video_driver, "gl"))
       strlcpy(settings->arrays.video_driver, "vulkan",
             sizeof(settings->arrays.video_driver));
 #endif
@@ -125,18 +125,18 @@ void downplay_defaults_apply(void)
     * and the thumbnails in the in-game load picker.  Applied
     * unconditionally — the boolean upstream defaults are all false, so
     * we can't distinguish "user turned it off" from "never set", and
-    * the Downplay UX depends on these being on. */
+    * the Pastime UX depends on these being on. */
    settings->bools.savestate_auto_save        = true;
    settings->bools.savestate_auto_load        = true;
    settings->bools.savestate_thumbnail_enable = true;
 
    /* Box-art on demand.  RA defaults this to false ("download manually
-    * via the in-menu task"), but Downplay's launcher fires the load on
+    * via the in-menu task"), but Pastime's launcher fires the load on
     * row hover — without on-demand, the resolver only checks local
     * disk, every fresh ROM 404s into the placeholder rect, and the
     * user has no visible affordance to fix it.  Applied unconditionally
     * for the same reason as savestate_thumbnail_enable above: the
-    * Downplay UX depends on it being on, and we can't tell "user
+    * Pastime UX depends on it being on, and we can't tell "user
     * disabled" from "never set". */
    settings->bools.network_on_demand_thumbnails = true;
 
@@ -152,7 +152,7 @@ void downplay_defaults_apply(void)
     * locked alternative.  Applied unconditionally since RA's aspect
     * default elsewhere can be ASPECT_RATIO_CONFIG / 16:9 / 4:3
     * depending on platform.  video_smooth is intentionally not pinned
-    * — RA's default is nearest on every Downplay target platform, and
+    * — RA's default is nearest on every Pastime target platform, and
     * the Sharpness row was dropped (Vulkan/GLCore have no runtime
     * filter toggle), so any user-set override should be respected. */
    settings->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
@@ -198,24 +198,24 @@ void downplay_defaults_apply(void)
    settings->bools.menu_enable_widgets              = false;
    settings->bools.video_font_enable                = false;
 
-   if (!downplay_paths_get_root(root, sizeof(root)))
+   if (!pastime_paths_get_root(root, sizeof(root)))
    {
-      RARCH_WARN("[Downplay] could not resolve Downplay/ root; "
+      RARCH_WARN("[Pastime] could not resolve Pastime/ root; "
             "leaving paths at upstream defaults\n");
       return;
    }
 
-   /* Path overlays.  See downplay_should_overlay for the predicate;
+   /* Path overlays.  See pastime_should_overlay for the predicate;
     * each setting compares against the RA platform default it would
     * otherwise have received. */
-   if (downplay_should_overlay(settings->paths.directory_menu_content,
+   if (pastime_should_overlay(settings->paths.directory_menu_content,
             g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT]))
    {
       fill_pathname_join_special(sub, root, "Roms", sizeof(sub));
       strlcpy(settings->paths.directory_menu_content, sub,
             sizeof(settings->paths.directory_menu_content));
    }
-   if (downplay_should_overlay(settings->paths.directory_system,
+   if (pastime_should_overlay(settings->paths.directory_system,
             g_defaults.dirs[DEFAULT_DIR_SYSTEM]))
    {
       fill_pathname_join_special(sub, root, "Bios", sizeof(sub));
@@ -227,7 +227,7 @@ void downplay_defaults_apply(void)
     * "savefile_directory" / "savestate_directory" through dir_get_ptr. */
    {
       char *cur = dir_get_ptr(RARCH_DIR_SAVEFILE);
-      if (downplay_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SRAM]))
+      if (pastime_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SRAM]))
       {
          fill_pathname_join_special(sub, root, "Saves", sizeof(sub));
          dir_set(RARCH_DIR_SAVEFILE, sub);
@@ -235,7 +235,7 @@ void downplay_defaults_apply(void)
    }
    {
       char *cur = dir_get_ptr(RARCH_DIR_SAVESTATE);
-      if (downplay_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]))
+      if (pastime_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]))
       {
          fill_pathname_join_special(sub, root, "States", sizeof(sub));
          dir_set(RARCH_DIR_SAVESTATE, sub);
@@ -243,12 +243,12 @@ void downplay_defaults_apply(void)
    }
 
    /* Box-art / thumbnails landing pad.  Lives under the user-facing
-    * Downplay/ tree because (a) PNGs are user-visible data they may want
+    * Pastime/ tree because (a) PNGs are user-visible data they may want
     * to rsync with their library, and (b) the libretro-thumbnails
     * directory layout (<system>/Named_Boxarts/<label>.png) is portable
     * across any RA-compatible tooling.  Stock RA defaults to
     * <config>/thumbnails/ — overlay only when that's still the value. */
-   if (downplay_should_overlay(settings->paths.directory_thumbnails,
+   if (pastime_should_overlay(settings->paths.directory_thumbnails,
             g_defaults.dirs[DEFAULT_DIR_THUMBNAILS]))
    {
       fill_pathname_join_special(sub, root, "Thumbnails", sizeof(sub));
@@ -263,7 +263,7 @@ void downplay_defaults_apply(void)
       static bool logged = false;
       if (!logged)
       {
-         RARCH_LOG("[Downplay] defaults applied; root=%s\n", root);
+         RARCH_LOG("[Pastime] defaults applied; root=%s\n", root);
          logged = true;
       }
    }

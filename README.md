@@ -1,8 +1,8 @@
-# Downplay
+# Pastime
 
-Downplay is a fork of [RetroArch](https://github.com/libretro/RetroArch) that delivers a [MinUI](https://github.com/shauninman/MinUI)-style experience — no config required, folder-based content, minimalist launcher UX — on modern Android handhelds.
+Pastime is a fork of [RetroArch](https://github.com/libretro/RetroArch) that delivers a [MinUI](https://github.com/shauninman/MinUI)-style experience — no config required, folder-based content, minimalist launcher UX — on modern Android handhelds.
 
-It is built for devices like the Retroid Pocket series, Ayn Odin, Anbernic Win/Android handhelds, and similar hardware that MinUI itself does not target. Downplay piggybacks on RetroArch's mature core ecosystem and platform support, but replaces the front-end UX with something closer in spirit to a Game Boy menu than to XMB.
+It is built for devices like the Retroid Pocket series, Ayn Odin, Anbernic Win/Android handhelds, and similar hardware that MinUI itself does not target. Pastime piggybacks on RetroArch's mature core ecosystem and platform support, but replaces the front-end UX with something closer in spirit to a Game Boy menu than to XMB.
 
 ## Status
 
@@ -10,10 +10,10 @@ Early. See [`PLAN.md`](PLAN.md) for the roadmap and current milestone.
 
 ## How it works
 
-The filesystem is the configuration. Downplay looks for a `Downplay/` directory at storage root:
+The filesystem is the configuration. Pastime looks for a `Pastime/` directory at storage root:
 
 ```
-Downplay/
+Pastime/
    Roms/
       Super Nintendo (snes9x)/
          Chrono Trigger.smc
@@ -28,9 +28,9 @@ System folders inside `Roms/` are named freely, with a `(<core_ident>)` suffix t
 
 Internally:
 
-- The Downplay UI is implemented as a new RetroArch **menu driver** (`menu/drivers/downplay.c`), alongside XMB / Ozone / RGUI.
-- Storage layout, folder parsing, and core auto-download live in a self-contained `downplay/` module.
-- Edits to upstream RetroArch files are kept minimal, marked with `/* DOWNPLAY: ... */`, and enumerated in `PLAN.md`. The goal is a fork that can rebase cleanly on upstream master indefinitely.
+- The Pastime UI is implemented as a new RetroArch **menu driver** (`menu/drivers/pastime.c`), alongside XMB / Ozone / RGUI.
+- Storage layout, folder parsing, and core auto-download live in a self-contained `pastime/` module.
+- Edits to upstream RetroArch files are kept minimal, marked with `/* PASTIME: ... */`, and enumerated in `PLAN.md`. The goal is a fork that can rebase cleanly on upstream master indefinitely.
 
 ## Building
 
@@ -38,7 +38,7 @@ Same as upstream RetroArch — `./configure && make` for desktop, per-platform `
 
 ## Relationship to upstream
 
-Downplay tracks `libretro/RetroArch` master and rebases periodically. Bug fixes and improvements to RetroArch internals that aren't Downplay-specific should be sent upstream rather than carried as fork patches.
+Pastime tracks `libretro/RetroArch` master and rebases periodically. Bug fixes and improvements to RetroArch internals that aren't Pastime-specific should be sent upstream rather than carried as fork patches.
 
 The upstream RetroArch project, libretro API, and all included cores are the work of the libretro team and contributors. See `AUTHORS.h` and the upstream repository for credits.
 

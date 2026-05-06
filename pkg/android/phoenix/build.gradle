@@ -27,11 +27,15 @@ apply plugin: 'com.android.application'
 android {
   compileSdkVersion 31
   buildToolsVersion "30.0.3"
-  ndkVersion "26.1.10909125" /* DOWNPLAY: r22 has no arm64 macOS host; bumped to a host-arm64-capable NDK */
+  ndkVersion "26.1.10909125" /* PASTIME: r22 has no arm64 macOS host; bumped to a host-arm64-capable NDK */
 
   flavorDimensions "variant"
 
   defaultConfig {
+    /* PASTIME: split applicationId (install identity, our brand) from
+     * the manifest "package" attribute (R/BuildConfig namespace, kept
+     * as com.retroarch so existing Java imports still resolve). */
+    applicationId "gg.pastime"
     minSdkVersion 16
     externalNativeBuild {
       ndkBuild {
@@ -45,14 +49,14 @@ android {
 
   productFlavors {
     normal {
-      resValue "string", "app_name", "RetroArch"
+      resValue "string", "app_name", "Pastime"
       buildConfigField "boolean", "PLAY_STORE_BUILD", "false"
 
       dimension "variant"
     }
     aarch64 {
       applicationIdSuffix '.aarch64'
-      resValue "string", "app_name", "RetroArch (AArch64)"
+      resValue "string", "app_name", "Pastime (AArch64)"
       buildConfigField "boolean", "PLAY_STORE_BUILD", "false"
 
       dimension "variant"
@@ -62,7 +66,7 @@ android {
     }
     ra32 {
       applicationIdSuffix '.ra32'
-      resValue "string", "app_name", "RetroArch (32-bit)"
+      resValue "string", "app_name", "Pastime (32-bit)"
       buildConfigField "boolean", "PLAY_STORE_BUILD", "false"
 
       dimension "variant"
@@ -76,7 +80,7 @@ android {
       versionCode getPlayStoreVersionCode()
       versionName getPlayStoreVersionName()
 
-      resValue "string", "app_name", "RetroArch"
+      resValue "string", "app_name", "Pastime"
       buildConfigField "boolean", "PLAY_STORE_BUILD", "true"
 
       dimension "variant"
@@ -88,7 +92,7 @@ android {
       versionName getPlayStoreVersionName()
 
       applicationIdSuffix '.aarch64'
-      resValue "string", "app_name", "RetroArch Plus"
+      resValue "string", "app_name", "Pastime Plus"
       buildConfigField "boolean", "PLAY_STORE_BUILD", "true"
 
       dimension "variant"
@@ -192,21 +196,21 @@ tasks.register("outputVersionCode") {
   }
 }
 
-/* DOWNPLAY: Copy our bundled assets (font, etc.) into the merged
- * assets at assets/downplay/, so the APK ends up with
- * assets/assets/downplay/InterTight-Bold.ttf.  RA's first-launch
+/* PASTIME: Copy our bundled assets (font, etc.) into the merged
+ * assets at assets/pastime/, so the APK ends up with
+ * assets/assets/pastime/InterTight-Bold.ttf.  RA's first-launch
  * bundle extractor (UserPreferences.java + task_decompress) strips
  * the leading "assets/" subdir, landing the file at
- * <app_dir>/assets/downplay/InterTight-Bold.ttf — which is where
- * downplay_resolve_font_path looks for it.  Source-of-truth lives
- * at downplay/assets/downplay/InterTight-Bold.ttf (same path the
+ * <app_dir>/assets/pastime/InterTight-Bold.ttf — which is where
+ * pastime_resolve_font_path looks for it.  Source-of-truth lives
+ * at pastime/assets/pastime/InterTight-Bold.ttf (same path the
  * macOS rebuild-assets.sh consumes). */
 android.applicationVariants.all { variant ->
   variant.mergeAssetsProvider.configure { mergeTask ->
     mergeTask.doLast {
       copy {
-        from "${rootDir}/../../../downplay/assets/downplay"
-        into "${mergeTask.outputDir.get().asFile}/assets/downplay"
+        from "${rootDir}/../../../pastime/assets/pastime"
+        into "${mergeTask.outputDir.get().asFile}/assets/pastime"
       }
     }
   }

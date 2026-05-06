@@ -1,22 +1,22 @@
-/*  Downplay - a fork of RetroArch.
- *  Copyright (C) 2026 - Downplay contributors.
+/*  Pastime - a fork of RetroArch.
+ *  Copyright (C) 2026 - Pastime contributors.
  *
- *  Downplay is free software: you can redistribute it and/or modify it under
+ *  Pastime is free software: you can redistribute it and/or modify it under
  *  the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
  *
- *  Downplay is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  Pastime is distributed in the hope that it will be useful, but WITHOUT ANY
  *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  *  FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
  *  details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with Downplay. If not, see <http://www.gnu.org/licenses/>.
+ *  with Pastime. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef DOWNPLAY_NAV_H
-#define DOWNPLAY_NAV_H
+#ifndef PASTIME_NAV_H
+#define PASTIME_NAV_H
 
 #include <stddef.h>
 #include <boolean.h>
@@ -26,17 +26,17 @@ RETRO_BEGIN_DECLS
 
 /* The set of view-identity tags carried by every nav frame.  Used
  * by the renderer's per-frame dispatch (TOP / SYSTEM / RECENTS go
- * through downplay_draw_list; SETTINGS / CONFIRM have dedicated
+ * through pastime_draw_list; SETTINGS / CONFIRM have dedicated
  * draw functions) and by input handlers that branch on view. */
-enum downplay_view
+enum pastime_view
 {
-   DOWNPLAY_VIEW_TOP = 0,    /* recents header + system list */
-   DOWNPLAY_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
-   DOWNPLAY_VIEW_RECENTS,    /* drilled into recents history */
-   DOWNPLAY_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
-   DOWNPLAY_VIEW_SAVE_PICKER,/* drilled into save-state list */
-   DOWNPLAY_VIEW_SETTINGS,   /* settings-style list (Options → core opts) */
-   DOWNPLAY_VIEW_CONFIRM     /* modal confirm/ack screen */
+   PASTIME_VIEW_TOP = 0,    /* recents header + system list */
+   PASTIME_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
+   PASTIME_VIEW_RECENTS,    /* drilled into recents history */
+   PASTIME_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
+   PASTIME_VIEW_SAVE_PICKER,/* drilled into save-state list */
+   PASTIME_VIEW_SETTINGS,   /* settings-style list (Options → core opts) */
+   PASTIME_VIEW_CONFIRM     /* modal confirm/ack screen */
 };
 
 /* Per-frame dispose hook.  Runs on pop.  Receives the host's user
@@ -55,7 +55,7 @@ typedef void (*dp_nav_after_change_fn)(void *user);
 
 typedef struct
 {
-   enum downplay_view view;
+   enum pastime_view view;
    size_t             selection;
    void              *side;     /* nullable; per-frame side data */
    dp_nav_dispose_fn  dispose;  /* nullable; runs on pop */
@@ -74,7 +74,7 @@ typedef struct
     * sites use these directly so callers don't need to deference
     * the top frame on every access; the helpers below are the only
     * writers, so the cache can't drift. */
-   enum downplay_view      view;
+   enum pastime_view      view;
    size_t                  selection;
    /* Optional after-change hook + opaque user pointer passed to it
     * and to every dispose hook. */
@@ -86,14 +86,14 @@ typedef struct
  * frame, never popped).  `user` is captured and forwarded to every
  * after_change call and every dispose hook.  Both callbacks may be
  * NULL. */
-void dp_nav_init(dp_nav_state_t *s, enum downplay_view ground,
+void dp_nav_init(dp_nav_state_t *s, enum pastime_view ground,
       dp_nav_after_change_fn after_change, void *user);
 
 /* Push a frame.  Selection starts at 0; callers that want a
  * different initial selection use dp_nav_set_selection right after.
  * Drops the push (and immediately disposes the orphan `side`) if
  * the stack is full. */
-void dp_nav_push(dp_nav_state_t *s, enum downplay_view view,
+void dp_nav_push(dp_nav_state_t *s, enum pastime_view view,
       void *side, dp_nav_dispose_fn dispose);
 
 /* Pop the top frame.  No-op at depth 1 (the seed frame is the
@@ -107,7 +107,7 @@ void dp_nav_pop(dp_nav_state_t *s);
  * the stack the loop strips down to the ground frame instead, and
  * warns so a caller passing an absent target doesn't silently
  * flatten the stack. */
-void dp_nav_pop_to(dp_nav_state_t *s, enum downplay_view view);
+void dp_nav_pop_to(dp_nav_state_t *s, enum pastime_view view);
 
 /* Top frame, or NULL if the stack is empty. */
 dp_nav_frame_t *dp_nav_top(dp_nav_state_t *s);
@@ -118,7 +118,7 @@ dp_nav_frame_t *dp_nav_top(dp_nav_state_t *s);
  * INGAME and we want to snap to TOP if the core dies) from
  * launcher-rooted ones.  Returns the ground view if only the seed
  * frame is on the stack. */
-enum downplay_view dp_nav_root_view(const dp_nav_state_t *s);
+enum pastime_view dp_nav_root_view(const dp_nav_state_t *s);
 
 /* Update the cached selection AND the top frame's selection
  * together.  Use this for any cursor move (UP/DOWN cycling, in-place
