@@ -72,6 +72,8 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/pastime.c \
 							$(RARCH_DIR)/pastime/pastime_nav.c \
 							$(RARCH_DIR)/pastime/pastime_metadata_disambig.c \
 							$(RARCH_DIR)/pastime/pastime_display_name.c \
+							$(RARCH_DIR)/pastime/pastime_external.c \
+							$(RARCH_DIR)/pastime/pastime_external_android.c \
 							$(RARCH_DIR)/pastime/pastime_thumbs.c \
 							$(RARCH_DIR)/pastime/pastime_thumbs_index.c \
 							$(RARCH_DIR)/pastime/pastime_thumbhash.c \

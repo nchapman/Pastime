@@ -55,6 +55,7 @@
 
 #include "../../pastime/pastime_cores.h"
 #include "../../pastime/pastime_display_name.h"
+#include "../../pastime/pastime_external.h"
 #include "../../pastime/pastime_metadata.h"
 #include "../../pastime/pastime_nav.h"
 #include "../../pastime/pastime_setup.h"
@@ -93,6 +94,10 @@ typedef struct
    char *core_ident;
    char *full_path;
    char *db_name;
+   /* When non-NULL, this folder uses an external Android emulator
+    * (folder name ended in "(ext:<package>)") and core_ident is NULL.
+    * Pointer aliases into the static preset table; do not free. */
+   const pastime_external_spec_t *external;
 } pastime_system_t;
 
 /* One ROM file inside a system folder, expanded for the system view.
@@ -666,15 +671,26 @@ static const char *pastime_row_label(const pastime_handle_t *dp, size_t row)
    return "";
 }
 
-/* Parse a Roms/ subfolder name per the convention from PLAN.md:
- *   "Display Name (core_ident)"
+/* Parse a Roms/ subfolder name per the convention from PLAN.md.
  *
- * core_ident must be non-empty and contain only [a-z0-9_].  On match,
- * heap-allocates display_name and core_ident (caller frees) and returns
- * true.  Folders that don't match the pattern are silently rejected —
- * strict convention is the feature; there is no fallback. */
+ * Folder name → (display_name, libretro core_ident) OR
+ * (display_name, external preset).
+ *
+ *   "Super Nintendo (snes9x)"          → display="Super Nintendo",
+ *                                        ident="snes9x", external=NULL
+ *   "Dreamcast (ext:com.flycast.emulator)"
+ *                                      → display="Dreamcast",
+ *                                        ident=NULL,
+ *                                        external=<preset row>
+ *
+ * Returns false (and the caller hides the folder) when the trailing
+ * parenthetical is missing/malformed, or when an `ext:` marker names a
+ * package that isn't in our generated preset table — strict folder
+ * convention, same as today for unknown core_idents.
+ */
 static bool pastime_parse_system_folder(const char *folder,
-      char **display_out, char **ident_out)
+      char **display_out, char **ident_out,
+      const pastime_external_spec_t **external_out)
 {
    const char *open;
    const char *ident_start;
@@ -682,8 +698,13 @@ static bool pastime_parse_system_folder(const char *folder,
    size_t      display_len;
    size_t      ident_len;
    size_t      i;
-   char       *display;
-   char       *ident;
+   bool        is_external = false;
+   char       *display     = NULL;
+   char       *ident       = NULL;
+   const pastime_external_spec_t *spec = NULL;
+
+   if (external_out)
+      *external_out = NULL;
 
    if (!folder)
       return false;
@@ -710,33 +731,77 @@ static bool pastime_parse_system_folder(const char *folder,
    ident_len   = (folder + folder_len - 1) - ident_start;
    if (ident_len == 0)
       return false;
-   for (i = 0; i < ident_len; i++)
+
+   /* Materialise the parenthetical into a NUL-terminated string before
+    * dispatching — both the external marker parser and the libretro
+    * char-class check consume a real C string. */
+   if (!(ident = (char*)malloc(ident_len + 1)))
+      return false;
+   memcpy(ident, ident_start, ident_len);
+   ident[ident_len] = '\0';
+
+   if (ident_len > 4 && strncmp(ident, "ext:", 4) == 0)
    {
-      char c = ident_start[i];
-      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+      const char *pkg = NULL;
+      is_external = true;
+      if (!pastime_external_parse_marker(ident, &pkg))
+      {
+         RARCH_WARN("[Pastime] malformed ext: marker in folder '%s'\n",
+               folder);
+         free(ident);
          return false;
+      }
+      if (!(spec = pastime_external_lookup(pkg)))
+      {
+         RARCH_WARN("[Pastime] external emulator package '%s' is not in "
+               "the preset table; hiding folder '%s'\n", pkg, folder);
+         free(ident);
+         return false;
+      }
+   }
+   else
+   {
+      /* libretro core_ident: strict [a-z0-9_]+ */
+      for (i = 0; i < ident_len; i++)
+      {
+         char c = ident[i];
+         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+         {
+            free(ident);
+            return false;
+         }
+      }
    }
 
    /* Display name is everything before the " (".  open points at '(', so
     * the trailing space sits at open - 1; strip it. */
    display_len = (size_t)(open - 1 - folder);
    if (display_len == 0)
+   {
+      free(ident);
       return false;
+   }
 
    if (!(display = (char*)malloc(display_len + 1)))
-      return false;
-   if (!(ident = (char*)malloc(ident_len + 1)))
    {
-      free(display);
+      free(ident);
       return false;
    }
    memcpy(display, folder, display_len);
    display[display_len] = '\0';
-   memcpy(ident, ident_start, ident_len);
-   ident[ident_len] = '\0';
 
    *display_out = display;
-   *ident_out   = ident;
+   if (is_external)
+   {
+      free(ident);
+      *ident_out    = NULL;
+      *external_out = spec;
+   }
+   else
+   {
+      *ident_out    = ident;
+      *external_out = NULL;
+   }
    return true;
 }
 
@@ -844,11 +909,12 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
       char  base[NAME_MAX_LENGTH];
       char *display = NULL;
       char *ident   = NULL;
+      const pastime_external_spec_t *external = NULL;
 
       if (raw->elems[i].attr.i != RARCH_DIRECTORY)
          continue;
       fill_pathname_base(base, raw->elems[i].data, sizeof(base));
-      if (!pastime_parse_system_folder(base, &display, &ident))
+      if (!pastime_parse_system_folder(base, &display, &ident, &external))
          continue;
       if (!pastime_folder_has_content(raw->elems[i].data))
       {
@@ -883,13 +949,17 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
          systems[count].display_name = display;
          systems[count].core_ident   = ident;
          systems[count].full_path    = full;
+         systems[count].external     = external;
          /* db_name resolution is best-effort: NULL means we don't have
           * a libretro-thumbnails-canonical name for this folder, so
           * matching + art look-up will be disabled for it.  The user
           * either typed an unknown display name or the core's .info
           * isn't loaded yet.  Survivable; recovers on next rebuild
-          * once core_info catches up. */
-         db = pastime_metadata_resolve_db_name(display, ident);
+          * once core_info catches up.  External (Android-emulator)
+          * folders are not in libretro-thumbnails so we skip the
+          * lookup entirely; their tile renders display-name-only. */
+         db = external ? NULL
+                       : pastime_metadata_resolve_db_name(display, ident);
          systems[count].db_name = db ? strdup(db) : NULL;
          count++;
       }
@@ -1136,8 +1206,9 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
       {
          char         parent_dir[PATH_MAX_LENGTH];
          const char  *folder;
-         char        *display = NULL;
-         char        *ident   = NULL;
+         char        *display  = NULL;
+         char        *ident    = NULL;
+         const pastime_external_spec_t *external = NULL;
          const char  *basename;
 
          basename = path_basename(entry->path);
@@ -1156,11 +1227,20 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
          }
          folder = path_basename(parent_dir);
          if (folder && *folder
-               && pastime_parse_system_folder(folder, &display, &ident))
+               && pastime_parse_system_folder(folder, &display, &ident,
+                  &external))
          {
-            const char *db = pastime_metadata_resolve_db_name(display, ident);
-            if (db && *db)
-               out[count].db_name = strdup(db);
+            /* Recents are libretro-only for v1; external launches are
+             * fire-and-forget and never recorded.  Defensive: should
+             * never trigger, but if a stray external folder ever lands
+             * in the playlist, just skip the db_name lookup. */
+            if (!external)
+            {
+               const char *db = pastime_metadata_resolve_db_name(display,
+                     ident);
+               if (db && *db)
+                  out[count].db_name = strdup(db);
+            }
             free(display);
             free(ident);
          }
@@ -6118,7 +6198,14 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          {
             const pastime_system_t *sys = &dp->systems[dp->active_system];
             const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
-            pastime_launch_rom(dp, sys->core_ident, rom->full_path);
+            /* sys->external is mutually exclusive with sys->core_ident:
+             * the parser sets exactly one based on the folder marker.
+             * External launches are fire-and-forget — the Java helper
+             * surfaces toast on failure (package missing, etc.). */
+            if (sys->external)
+               pastime_external_launch(sys->external, rom->full_path);
+            else
+               pastime_launch_rom(dp, sys->core_ident, rom->full_path);
             return 0;
          }
          if (dp->nav.view == PASTIME_VIEW_RECENTS)
@@ -6237,10 +6324,15 @@ static void *pastime_menu_init(void **userdata, bool video_is_threaded)
             dp->system_count * sizeof(*idents));
       if (idents)
       {
-         size_t i;
+         size_t i, n = 0;
+         /* External-emulator folders have core_ident == NULL — they're
+          * launched via Android Intent, not a libretro core, so skip
+          * them in the eager core-install plan. */
          for (i = 0; i < dp->system_count; i++)
-            idents[i] = dp->systems[i].core_ident;
-         pastime_setup_plan_boot(idents, dp->system_count);
+            if (dp->systems[i].core_ident)
+               idents[n++] = dp->systems[i].core_ident;
+         if (n > 0)
+            pastime_setup_plan_boot(idents, n);
          free(idents);
       }
    }

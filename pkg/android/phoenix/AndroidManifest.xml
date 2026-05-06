@@ -14,6 +14,10 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- PASTIME: needed for `killFirst` external-emulator launches —
+         a normal-permission no-op kill of stale background instances
+         that won't pick up new ROM extras otherwise (AetherSX2 family). -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
 
     <application
         android:name="com.retroarch.playcore.RetroArchApplication"
@@ -45,6 +49,15 @@
                 <action android:name="com.retroarch.QUERY_INSTALLED_CORES" />
             </intent-filter>
         </receiver>
+      <!-- PASTIME: ContentProvider that publishes Pastime/Roms files as
+           content:// URIs for external emulators we launch via Intent.
+           Not exported; access is granted per-Intent via
+           FLAG_GRANT_READ_URI_PERMISSION in pastimeLaunchExternal(). -->
+      <provider
+        android:name="com.retroarch.browser.pastime.PastimeRomProvider"
+        android:authorities="${applicationId}.romprovider"
+        android:exported="false"
+        android:grantUriPermissions="true" />
       <provider
         android:name="com.retroarch.browser.provider.RetroDocumentsProvider"
         android:authorities="${applicationId}.documents"

@@ -57,6 +57,13 @@ $CC $CFLAGS $INC \
     -o test_cores_extras
 BUILT+=(test_cores_extras)
 
+# --- external-emulator preset table + marker parser ---
+echo "== building test_external"
+$CC $CFLAGS -DPASTIME_EXTERNAL_TEST_BUILD $INC \
+    test_external.c ../pastime_external.c \
+    -o test_external
+BUILT+=(test_external)
+
 # --- thumbnail match cascade ---
 # Pure side only: pastime_thumbs_index.c carries the parse + match
 # cascade with no HTTP/IO/log dependencies, so we link it directly

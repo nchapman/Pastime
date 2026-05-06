@@ -56,6 +56,23 @@ Roms/
 - **Folders whose core ident isn't in the libretro buildbot's available list are also hidden.** No "broken folder" UX.
 - Multiple folders may resolve to the same core; that's a feature (e.g., separate "official" and "hacks" libraries).
 
+**External Android emulators (`(ext:<package>)` marker):**
+
+Folders whose marker starts with `ext:` instead of a libretro core ident launch an external Android app via `Intent` rather than loading a libretro core. The marker payload is the full Android package name.
+
+```
+Roms/
+   Dreamcast (ext:com.flycast.emulator)/
+   Nintendo GameCube (ext:org.dolphinemu.dolphinemu)/
+   Sony PlayStation (ext:com.github.stenzek.duckstation)/
+```
+
+- Pattern: `^(.+) \(ext:([a-zA-Z0-9._]+)\)$` with at least one `.` in the package.
+- The package is looked up in `pastime/pastime_external_presets.h`, a generated table of `(component, action, category, extra-key, MIME, kill-first)` tuples synced from Daijishou (`TapiocaFox/Daijishou`, MIT). Resync via `python3 pastime/tools/sync_external_presets.py` and commit the regenerated header.
+- **Folders whose package isn't in the preset table are hidden** (same strict-convention behavior as unknown core idents). The sync script's stderr summary is the right place to see what's covered.
+- ROM payload is handed to the receiving emulator as a `content://` URI through `PastimeRomProvider` with `FLAG_GRANT_READ_URI_PERMISSION`, so it works under modern Android scoped storage.
+- Android-only. On desktop, external folders appear in the UI but selecting a ROM is a no-op. Recents integration and friendly shortname aliasing are out of scope for v1.
+
 ### Cores
 
 Cores are not bundled. Pastime queries the libretro buildbot on boot, caches the available-core list, and:
@@ -93,6 +110,9 @@ This means: standard MinUI navigation (up / down / select / back / page) fits cl
 | `retroarch.c` `retroarch_main_init()` (immediately after the `pastime_defaults_apply()` call) | Call `pastime_bootstrap()` once. Defaults are now in place, paths resolve correctly, drivers haven't been initialized yet. | 1–2 lines |
 | `tasks/task_core_updater.c` (~L511, `cb_task_core_updater_download`) and `tasks/tasks_internal.h` | Add a setter `task_core_updater_set_download_callback(retro_task_callback_t)` so Pastime can hook "core finished installing → launch the pending ROM". The existing callback is hardcoded; this is the smallest additive change that avoids polling. | ~10 lines |
 | `pkg/apple/rebuild-assets.sh` | Overlay `pastime/assets/*` (e.g. `assets/pastime/InterTight-Bold.ttf`) into the macOS `.app`'s `assets.zip` before zipping, so the bundled-assets pipeline ships our font. | ~6 lines |
+| `frontend/drivers/platform_unix.c` (after `jni_thread_getenv`) | Add `pastime_jni_get_activity_clazz()` accessor returning `g_android->activity->clazz`. Lets `pastime/pastime_external_android.c` (separate TU, can't include `platform_unix.h` because of duplicate-storage decls) reach the activity jobject without seeing struct layout. | ~6 lines |
+| `pkg/android/phoenix-common/src/com/retroarch/browser/retroactivity/RetroActivityCommon.java` (end of class) | Add `boolean pastimeLaunchExternal(...)` Java helper that builds and fires the Intent for external-emulator launches. Called from `pastime_external_android.c` via JNI. | ~120 lines (one new method) |
+| `pkg/android/phoenix/AndroidManifest.xml` (inside `<application>`) | Declare `PastimeRomProvider` with authority `${applicationId}.romprovider`, `exported=false`, `grantUriPermissions=true`. | ~6 lines |
 
 **Contingent (only if proven necessary):**
 

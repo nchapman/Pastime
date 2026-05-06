@@ -1125,4 +1125,153 @@ public class RetroActivityCommon extends NativeActivity
   public void accessibilitySpeak(String message) {
     getWindow().getDecorView().announceForAccessibility(message);
   }
+
+  /* PASTIME: external-emulator launch helper.
+   *
+   * Called from pastime/pastime_external_android.c via JNI when the
+   * user picks a ROM from a folder marked `(ext:<package>)`.  The
+   * native side has already resolved the package against a generated
+   * preset table — our job is to build and fire the Intent.
+   *
+   * Two URI-passing shapes are covered, matching Daijishou's preset
+   * conventions (the preset table is generated from theirs):
+   *
+   *   extraKey == null  → setData(content_uri)   (e.g. Flycast, Drastic)
+   *   extraKey != null  → putExtra(extraKey, uri.toString()) +
+   *                       setClipData(ClipData.newRawUri(...))
+   *                                              (e.g. Dolphin, DuckStation)
+   *
+   * The ClipData attachment in the extra-key path is load-bearing.
+   * FLAG_GRANT_READ_URI_PERMISSION only propagates the grant to URIs
+   * reachable from Intent.getData(), typed Uri extras, or ClipData —
+   * a content://-string in a String extra is just text to the grant
+   * resolver, and the receiving emulator hits SecurityException on
+   * Android 6+ when it tries to open the URI.  ClipData is the
+   * standard idiom: receivers still see the toString() in their
+   * extra (since most emulators do getStringExtra()), and the grant
+   * flows.
+   *
+   * Fire-and-forget: returns immediately to native after posting onto
+   * the UI thread.  startActivity from RA's NativeActivity worker
+   * thread races Android 11+ Doze foreground checks during the binder
+   * grant transaction; runOnUiThread eliminates that class of bug.
+   * Failure surfaces as a Toast inside the posted Runnable — the
+   * native side has no useful response to launch failure anyway.
+   */
+  public void pastimeLaunchExternal(final String pkg,
+                                    final String component,
+                                    final String action,
+                                    final String category,
+                                    final String extraKey,
+                                    final String mimeType,
+                                    final boolean killFirst,
+                                    final String romPath) {
+    if (pkg == null || component == null || romPath == null) {
+      Log.e("Pastime", "pastimeLaunchExternal: null required arg");
+      return;
+    }
+
+    runOnUiThread(new Runnable() {
+      @Override public void run() {
+        doLaunch(pkg, component, action, category,
+                 extraKey, mimeType, killFirst, romPath);
+      }
+    });
+  }
+
+  private void doLaunch(String pkg, String component, String action,
+                        String category, String extraKey, String mimeType,
+                        boolean killFirst, String romPath) {
+    Intent intent;
+    try {
+      intent = new Intent();
+      /* Component path may be relative (".MainActivity") or fully
+       * qualified ("org.foo.SomeActivity").  createRelative handles
+       * both; setComponent binds the Intent to a specific package, so
+       * a fully-qualified class can't redirect to a different app. */
+      intent.setComponent(android.content.ComponentName.createRelative(
+          pkg, component));
+    } catch (Exception e) {
+      Log.e("Pastime", "doLaunch: bad component "
+          + pkg + "/" + component + ": " + e);
+      toast("Invalid emulator entry");
+      return;
+    }
+
+    if (action != null)   intent.setAction(action);
+    if (category != null) intent.addCategory(category);
+
+    Uri romUri;
+    try {
+      romUri = com.retroarch.browser.pastime.PastimeRomProvider
+          .uriForFile(this, new File(romPath));
+    } catch (Exception e) {
+      Log.e("Pastime", "doLaunch: provider URI failed for "
+          + romPath + ": " + e);
+      toast("Could not publish ROM URI");
+      return;
+    }
+
+    if (extraKey == null) {
+      intent.setDataAndType(romUri, mimeType);  /* mimeType may be null */
+    } else {
+      /* String extra (what most emulators getStringExtra() for) plus
+       * ClipData (carries the grant — see method comment).  ClipData
+       * also takes the MIME if the preset specifies one; pass null
+       * for "any" rather than synthesising a MIME we don't know. */
+      intent.putExtra(extraKey, romUri.toString());
+      String[] mimes = mimeType != null
+          ? new String[] { mimeType } : new String[] { "*/*" };
+      android.content.ClipData clip = new android.content.ClipData(
+          new android.content.ClipDescription("rom", mimes),
+          new android.content.ClipData.Item(romUri));
+      intent.setClipData(clip);
+      if (mimeType != null) intent.setType(mimeType);
+    }
+
+    /* NEW_TASK is required for startActivity from a singleInstance
+     * activity into a different package — without it Android refuses
+     * with AndroidRuntimeException. CLEAR_TOP is omitted intentionally:
+     * cross-task it's a no-op, and within-task it has been observed to
+     * extend URI-grant lifetime when the receiver crashes/restarts. */
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                  | Intent.FLAG_ACTIVITY_NEW_TASK);
+
+    if (killFirst) {
+      /* Some emulators (notably the AetherSX2/EmuCoreX family) won't
+       * pick up new ROM extras if an instance is already running.  We
+       * declare KILL_BACKGROUND_PROCESSES in the manifest so this is
+       * a normal-permission no-op, not a runtime grant prompt.  On
+       * Android 14+ this is reportedly a no-op for recently-foreground
+       * processes — that's exactly the not-our-scenario case (we want
+       * to clear stale background instances), so the degradation is
+       * benign. */
+      try {
+        android.app.ActivityManager am = (android.app.ActivityManager)
+            getSystemService(Context.ACTIVITY_SERVICE);
+        if (am != null) am.killBackgroundProcesses(pkg);
+      } catch (Exception e) {
+        Log.w("Pastime", "doLaunch: killBackgroundProcesses failed for "
+            + pkg + ": " + e);
+      }
+    }
+
+    try {
+      startActivity(intent);
+    } catch (android.content.ActivityNotFoundException e) {
+      Log.w("Pastime", "doLaunch: " + pkg + " not installed");
+      toast("Emulator not installed: " + pkg);
+    } catch (SecurityException e) {
+      Log.e("Pastime", "doLaunch: " + pkg + " refused launch: " + e);
+      toast("Emulator refused launch");
+    } catch (Exception e) {
+      Log.e("Pastime", "doLaunch: startActivity failed: " + e);
+      toast("Launch failed");
+    }
+  }
+
+  private void toast(String msg) {
+    android.widget.Toast.makeText(this, msg,
+        android.widget.Toast.LENGTH_SHORT).show();
+  }
 }

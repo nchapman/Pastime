@@ -410,6 +410,19 @@ JNIEnv *jni_thread_getenv(void)
    return env;
 }
 
+/* PASTIME: minimal accessor used by pastime/pastime_external_android.c.
+ * That file is a separate TU (not unity-built via griffin) and can't
+ * include platform_unix.h — the header has variable storage decls that
+ * double-define on multi-TU links — so it can't see struct android_app's
+ * layout to grab activity->clazz on its own.  Returning the jobject from
+ * here keeps that file struct-agnostic. */
+jobject pastime_jni_get_activity_clazz(void)
+{
+   if (!g_android || !g_android->activity)
+      return NULL;
+   return g_android->activity->clazz;
+}
+
 static void jni_thread_destruct(void *value)
 {
    JNIEnv *env = (JNIEnv*)value;
