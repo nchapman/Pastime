@@ -80,24 +80,33 @@
 
 #define PASTIME_RECENTS_LABEL "Recently Played"
 
-/* One Roms/<folder> that conformed to the "Display Name (core_ident)"
- * convention.  Folders without that suffix are dropped during scan, so
- * by the time a pastime_system_t exists, display_name + core_ident +
- * full_path are non-empty.  db_name is the canonical system name (e.g.
- * "Nintendo - Super Nintendo Entertainment System"), used to key the
- * Pastime thumbnail index + cache subdir.  May be NULL when
- * the user's folder name doesn't hit the disambiguation table AND no
- * matching core_info entry is loaded. */
+/* One Roms/<folder> that conformed to the convention.  Multiple sources
+ * fold into one pastime_system_t when their display names match exactly
+ * (case-sensitive); each source remembers its own backend so per-ROM
+ * dispatch picks the right launcher.  Exactly one of core_ident /
+ * external is set per source — the parser enforces it. */
 typedef struct
 {
-   char *display_name;
-   char *core_ident;
-   char *full_path;
-   char *db_name;
-   /* When non-NULL, this folder uses an external Android emulator
-    * (folder name ended in "(ext-<package>)") and core_ident is NULL.
-    * Pointer aliases into the static preset table; do not free. */
+   char *full_path;     /* owned: absolute path to the folder */
+   char *core_ident;    /* owned: libretro ident, NULL when external */
+   /* aliases into the static preset table when non-NULL; do not free */
    const pastime_external_spec_t *external;
+} pastime_source_t;
+
+/* One row in the system list.  display_name is the merge key — folders
+ * sharing it become sources of the same system, ROMs from all of them
+ * appear in the merged listing under "Sony PlayStation".  db_name is
+ * the canonical system name (e.g. "Nintendo - Super Nintendo
+ * Entertainment System") used to key the Pastime thumbnail index +
+ * cache subdir; resolved against the first libretro source's
+ * core_ident when a system has any libretro source, NULL otherwise
+ * (external-only systems don't have libretro-thumbnails coverage). */
+typedef struct
+{
+   char             *display_name;
+   char             *db_name;
+   pastime_source_t *sources;       /* owned; source_count >= 1 */
+   size_t            source_count;
 } pastime_system_t;
 
 /* One ROM file inside a system folder, expanded for the system view.
@@ -124,6 +133,12 @@ typedef struct
     * the right-pane height budget (see pastime_image_pane_width). */
    uint16_t         image_w;
    uint16_t         image_h;
+   /* Index into pastime_system_t.sources for this ROM's launch backend.
+    * When a system has multiple sources (merge case), this remembers
+    * which folder the ROM was scanned from so the launch site dispatches
+    * to the right core/external app.  Single-source systems (the common
+    * case) always have source_idx == 0. */
+   uint8_t          source_idx;
 } pastime_rom_t;
 
 /* One row in the recents view.  pl_idx is the entry's index in
@@ -828,6 +843,20 @@ static int pastime_system_cmp(const void *a, const void *b)
    return strcasecmp(sa->display_name, sb->display_name);
 }
 
+static void pastime_sources_free(pastime_source_t *sources, size_t count)
+{
+   size_t i;
+   if (!sources)
+      return;
+   for (i = 0; i < count; i++)
+   {
+      free(sources[i].full_path);
+      free(sources[i].core_ident);
+      /* external aliases the static preset table — do not free */
+   }
+   free(sources);
+}
+
 static void pastime_systems_free(pastime_system_t *systems, size_t count)
 {
    size_t i;
@@ -836,9 +865,8 @@ static void pastime_systems_free(pastime_system_t *systems, size_t count)
    for (i = 0; i < count; i++)
    {
       free(systems[i].display_name);
-      free(systems[i].core_ident);
-      free(systems[i].full_path);
       free(systems[i].db_name);
+      pastime_sources_free(systems[i].sources, systems[i].source_count);
    }
    free(systems);
 }
@@ -899,9 +927,63 @@ static bool pastime_folder_has_content(const char *full_path)
    return found;
 }
 
+/* Append a source to the named system.  Returns false on OOM. */
+static bool pastime_system_append_source(pastime_system_t *sys,
+      char *full_path, char *core_ident,
+      const pastime_external_spec_t *external)
+{
+   pastime_source_t *grown = (pastime_source_t*)realloc(sys->sources,
+         (sys->source_count + 1) * sizeof(*sys->sources));
+   if (!grown)
+      return false;
+   sys->sources = grown;
+   sys->sources[sys->source_count].full_path  = full_path;
+   sys->sources[sys->source_count].core_ident = core_ident;
+   sys->sources[sys->source_count].external   = external;
+   sys->source_count++;
+   return true;
+}
+
+/* Find an existing system by exact-match display_name (case-sensitive).
+ * Returns NULL when no match — caller creates a new system row. */
+static pastime_system_t *pastime_systems_find_by_display(
+      pastime_system_t *systems, size_t count, const char *display)
+{
+   size_t i;
+   for (i = 0; i < count; i++)
+   {
+      if (string_is_equal(systems[i].display_name, display))
+         return &systems[i];
+   }
+   return NULL;
+}
+
+/* Resolve db_name from a system's sources: first libretro source with
+ * a hit wins.  All-external systems return NULL (no libretro-thumbnails
+ * coverage; the tile renders display-name-only). */
+static char *pastime_resolve_db_for_system(const pastime_system_t *sys)
+{
+   size_t i;
+   for (i = 0; i < sys->source_count; i++)
+   {
+      const char *ident = sys->sources[i].core_ident;
+      if (!ident)
+         continue;
+      {
+         const char *db = pastime_metadata_resolve_db_name(
+               sys->display_name, ident);
+         if (db)
+            return strdup(db);
+      }
+   }
+   return NULL;
+}
+
 /* Scan Roms/ for conforming subfolders.  Drops files, drops folders that
- * don't match "Display Name (core_ident)", and drops folders with no
- * content inside.  Returns NULL + count==0 when nothing qualifies. */
+ * don't match the convention, and drops folders with no content.  Multi-
+ * folder merge: folders sharing a display_name (case-sensitive) become
+ * sources of the same system row, and per-ROM dispatch (see
+ * pastime_rom_t.source_idx) picks the right backend at launch time. */
 static pastime_system_t *pastime_scan_systems(const char *content_root,
       size_t *out_count)
 {
@@ -920,12 +1002,20 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
    if (!raw)
       return NULL;
 
+   /* Sort the raw folder listing alphabetically so source ordering
+    * within a merged system is deterministic — first-source-wins for
+    * duplicate ROM filenames depends on this being stable. */
+   if (raw->size > 1)
+      dir_list_sort(raw, false);
+
    for (i = 0; i < raw->size; i++)
    {
       char  base[NAME_MAX_LENGTH];
       char *display = NULL;
       char *ident   = NULL;
+      char *full;
       const pastime_external_spec_t *external = NULL;
+      pastime_system_t *existing;
 
       if (raw->elems[i].attr.i != RARCH_DIRECTORY)
          continue;
@@ -938,6 +1028,29 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
          free(ident);
          continue;
       }
+      if (!(full = strdup(raw->elems[i].data)))
+      {
+         free(display);
+         free(ident);
+         break;
+      }
+
+      /* Merge into an existing system with the same display_name; else
+       * grow the systems array and create a new row. */
+      existing = pastime_systems_find_by_display(systems, count, display);
+      if (existing)
+      {
+         /* display already in use by another folder — discard this dup
+          * and append our source to the existing row. */
+         free(display);
+         if (!pastime_system_append_source(existing, full, ident, external))
+         {
+            free(full);
+            free(ident);
+            break;
+         }
+         continue;
+      }
 
       if (count == cap)
       {
@@ -948,39 +1061,31 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
          {
             free(display);
             free(ident);
+            free(full);
             break;
          }
          systems = grown;
          cap     = new_cap;
       }
+      memset(&systems[count], 0, sizeof(systems[count]));
+      systems[count].display_name = display;
+      if (!pastime_system_append_source(&systems[count], full, ident, external))
       {
-         char       *full = strdup(raw->elems[i].data);
-         const char *db;
-         if (!full)
-         {
-            free(display);
-            free(ident);
-            break;
-         }
-         systems[count].display_name = display;
-         systems[count].core_ident   = ident;
-         systems[count].full_path    = full;
-         systems[count].external     = external;
-         /* db_name resolution is best-effort: NULL means we don't have
-          * a libretro-thumbnails-canonical name for this folder, so
-          * matching + art look-up will be disabled for it.  The user
-          * either typed an unknown display name or the core's .info
-          * isn't loaded yet.  Survivable; recovers on next rebuild
-          * once core_info catches up.  External (Android-emulator)
-          * folders are not in libretro-thumbnails so we skip the
-          * lookup entirely; their tile renders display-name-only. */
-         db = external ? NULL
-                       : pastime_metadata_resolve_db_name(display, ident);
-         systems[count].db_name = db ? strdup(db) : NULL;
-         count++;
+         free(display);
+         free(ident);
+         free(full);
+         break;
       }
+      count++;
    }
    string_list_free(raw);
+
+   /* Resolve db_name for each merged system.  Done in a second pass
+    * because multi-source resolution needs the full sources list — the
+    * first libretro source's core_ident wins, all-external systems
+    * land NULL. */
+   for (i = 0; i < count; i++)
+      systems[i].db_name = pastime_resolve_db_for_system(&systems[i]);
 
    if (count > 1)
       qsort(systems, count, sizeof(*systems), pastime_system_cmp);
@@ -998,91 +1103,131 @@ static int pastime_rom_cmp(const void *a, const void *b)
    return strcmp(ka, kb);
 }
 
-/* Scan one system folder for ROMs.  Top-level files only (subfolders
- * deferred); .zip and other archives included since libretro cores
- * read them directly via the VFS layer. */
-static pastime_rom_t *pastime_scan_roms(const char *system_path,
+/* Scan all sources of a merged system for ROMs.  Top-level files only;
+ * .zip and other archives included since libretro cores read them
+ * directly via the VFS layer.  Multi-source dedup: if the same ROM
+ * basename appears in more than one source, the *first* source (in
+ * the system's source order) wins; later sources log + skip the
+ * duplicate.  Source order is alphabetical by folder path (set during
+ * scan_systems), so dedup is deterministic across boots. */
+static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
       size_t *out_count)
 {
-   struct string_list *raw;
-   pastime_rom_t     *roms  = NULL;
-   size_t              cap   = 0;
-   size_t              count = 0;
-   size_t              i;
+   pastime_rom_t *roms  = NULL;
+   size_t         cap   = 0;
+   size_t         count = 0;
+   size_t         src_i, i, j;
 
    *out_count = 0;
-   if (!system_path || !*system_path)
+   if (!sys || !sys->sources || sys->source_count == 0)
       return NULL;
 
-   raw = dir_list_new(system_path, NULL,
-         false /* include_dirs */, false, false, false /* not recursive */);
-   if (!raw)
-      return NULL;
-
-   for (i = 0; i < raw->size; i++)
+   for (src_i = 0; src_i < sys->source_count; src_i++)
    {
-      const char *full = raw->elems[i].data;
-      char        base[NAME_MAX_LENGTH];
-      char       *display;
+      const char         *system_path = sys->sources[src_i].full_path;
+      struct string_list *raw;
 
-      if (!full || !*full)
+      if (!system_path || !*system_path)
          continue;
-      fill_pathname_base(base, full, sizeof(base));
-      if (!*base || base[0] == '.')
-         continue;
-      pastime_display_name_strip_rom_extension(base);
-      if (!*base)
+      raw = dir_list_new(system_path, NULL,
+            false /* include_dirs */, false, false, false /* recursive */);
+      if (!raw)
          continue;
 
-      if (count == cap)
+      for (i = 0; i < raw->size; i++)
       {
-         size_t          new_cap = cap ? cap * 2 : 16;
-         pastime_rom_t *grown   = (pastime_rom_t*)realloc(roms,
-               new_cap * sizeof(*roms));
-         if (!grown)
-            break;
-         roms = grown;
-         cap  = new_cap;
-      }
-      {
-         char       *path_dup;
-         char       *sort_dup;
-         char        clean[NAME_MAX_LENGTH];
-         char        sort_buf[NAME_MAX_LENGTH];
-         /* Strip No-Intro / Redump trailing tags here so the user sees
-          * "Super Mario Bros. 3" not "Super Mario Bros. 3 (USA) (Rev A)".
-          * sort_key folds case + drops a leading article so "The Legend
-          * of Zelda" sorts under L.  See pastime_display_name.h. */
-         pastime_display_name_clean(base, clean, sizeof(clean));
-         if (!*clean)
+         const char *full = raw->elems[i].data;
+         char        base[NAME_MAX_LENGTH];
+         char       *display;
+         bool        is_dup = false;
+
+         if (!full || !*full)
             continue;
-         pastime_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
-         if (!(display = strdup(clean)))
-            break;
-         if (!(sort_dup = strdup(sort_buf)))
+         fill_pathname_base(base, full, sizeof(base));
+         if (!*base || base[0] == '.')
+            continue;
+         pastime_display_name_strip_rom_extension(base);
+         if (!*base)
+            continue;
+
+         /* First-source-wins dedup.  Compare against already-collected
+          * ROMs from earlier sources by basename (extension included
+          * via the un-stripped raw filename — but our stripped `base`
+          * is what we render, so dedupe on that for user-visible
+          * uniqueness).  O(N*M) in the worst case; rom counts per
+          * system are small enough that a hash isn't worth it. */
+         for (j = 0; j < count; j++)
          {
-            free(display);
-            break;
+            char other_base[NAME_MAX_LENGTH];
+            fill_pathname_base(other_base, roms[j].full_path,
+                  sizeof(other_base));
+            pastime_display_name_strip_rom_extension(other_base);
+            if (string_is_equal(other_base, base))
+            {
+               is_dup = true;
+               break;
+            }
          }
-         if (!(path_dup = strdup(full)))
+         if (is_dup)
          {
-            free(display);
-            free(sort_dup);
-            break;
+            RARCH_LOG("[Pastime] '%s' shadowed by source[%u] in merged "
+                  "system '%s' (this source[%u] entry skipped)\n",
+                  base, (unsigned)roms[j].source_idx,
+                  sys->display_name, (unsigned)src_i);
+            continue;
          }
-         memset(&roms[count], 0, sizeof(roms[count]));
-         roms[count].display_name = display;
-         roms[count].sort_key     = sort_dup;
-         roms[count].full_path    = path_dup;
-         gfx_thumbnail_init_blank(&roms[count].thumbnail);
-         /* image_w/image_h left zero by the memset above — populated
-          * once by the dim warm-up in pastime_open_system after the
-          * thumbnail manager is opened, and (in the cold-fetch case)
-          * re-populated by the per-frame drive once the index lands. */
-         count++;
+
+         if (count == cap)
+         {
+            size_t          new_cap = cap ? cap * 2 : 16;
+            pastime_rom_t *grown   = (pastime_rom_t*)realloc(roms,
+                  new_cap * sizeof(*roms));
+            if (!grown)
+               break;
+            roms = grown;
+            cap  = new_cap;
+         }
+         {
+            char       *path_dup;
+            char       *sort_dup;
+            char        clean[NAME_MAX_LENGTH];
+            char        sort_buf[NAME_MAX_LENGTH];
+            /* Strip No-Intro / Redump trailing tags here so the user
+             * sees "Super Mario Bros. 3" not "...(USA) (Rev A)".
+             * sort_key folds case + drops a leading article so
+             * "The Legend of Zelda" sorts under L. */
+            pastime_display_name_clean(base, clean, sizeof(clean));
+            if (!*clean)
+               continue;
+            pastime_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
+            if (!(display = strdup(clean)))
+               break;
+            if (!(sort_dup = strdup(sort_buf)))
+            {
+               free(display);
+               break;
+            }
+            if (!(path_dup = strdup(full)))
+            {
+               free(display);
+               free(sort_dup);
+               break;
+            }
+            memset(&roms[count], 0, sizeof(roms[count]));
+            roms[count].display_name = display;
+            roms[count].sort_key     = sort_dup;
+            roms[count].full_path    = path_dup;
+            roms[count].source_idx   = (uint8_t)src_i;
+            gfx_thumbnail_init_blank(&roms[count].thumbnail);
+            /* image_w/image_h left zero by memset — populated by the
+             * dim warm-up in pastime_open_system after the thumbnail
+             * manager opens, and re-populated by the per-frame drive
+             * once the index lands. */
+            count++;
+         }
       }
+      string_list_free(raw);
    }
-   string_list_free(raw);
 
    if (count > 1)
       qsort(roms, count, sizeof(*roms), pastime_rom_cmp);
@@ -1803,7 +1948,7 @@ static void pastime_open_system(pastime_handle_t *dp, size_t sys_idx)
    dp->thumb_prev_selection_sys = SIZE_MAX;
 
    sys           = &dp->systems[sys_idx];
-   dp->roms      = pastime_scan_roms(sys->full_path, &dp->rom_count);
+   dp->roms      = pastime_scan_roms(sys, &dp->rom_count);
    dp->active_system = sys_idx;
 
    /* Open the pastime.gg-backed thumbnail manager.  Closes the prior
@@ -6214,14 +6359,19 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          {
             const pastime_system_t *sys = &dp->systems[dp->active_system];
             const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
-            /* sys->external is mutually exclusive with sys->core_ident:
-             * the parser sets exactly one based on the folder marker.
-             * External launches are fire-and-forget — the Java helper
-             * surfaces toast on failure (package missing, etc.). */
-            if (sys->external)
-               pastime_external_launch(sys->external, rom->full_path);
+            const pastime_source_t *src;
+            /* Multi-source merge: each ROM remembers which source folder
+             * it came from, so the launch backend is per-ROM, not per-
+             * system.  source_idx is bounded by source_count at scan
+             * time; no runtime check needed. */
+            src = &sys->sources[rom->source_idx];
+            /* core_ident vs external is mutually exclusive per source —
+             * parser invariant.  External launches are fire-and-forget;
+             * the Java helper surfaces toast on failure. */
+            if (src->external)
+               pastime_external_launch(src->external, rom->full_path);
             else
-               pastime_launch_rom(dp, sys->core_ident, rom->full_path);
+               pastime_launch_rom(dp, src->core_ident, rom->full_path);
             return 0;
          }
          if (dp->nav.view == PASTIME_VIEW_RECENTS)
@@ -6331,22 +6481,25 @@ static void *pastime_menu_init(void **userdata, bool video_is_threaded)
    pastime_rebuild_lists(dp);
 
    /* Eager-on-boot core install (PLAN.md M3).  Collect every core_ident
-    * referenced by a non-empty system folder, hand them to the cores
-    * module — it dedupes, drops already-installed ones, and kicks the
-    * buildbot list fetch.  Splash UI takes over while this is running. */
+    * referenced by a source of any non-empty system folder, hand them
+    * to the cores module — it dedupes, drops already-installed ones,
+    * and kicks the buildbot list fetch.  Splash UI takes over while
+    * this is running.  Multi-source merge: walk each system's sources
+    * list (could be 1 or many); external sources have core_ident == NULL
+    * and are skipped. */
    if (dp->system_count > 0)
    {
-      const char **idents = (const char**)malloc(
-            dp->system_count * sizeof(*idents));
+      size_t i, j, total_sources = 0, n = 0;
+      const char **idents;
+      for (i = 0; i < dp->system_count; i++)
+         total_sources += dp->systems[i].source_count;
+      idents = (const char**)malloc(total_sources * sizeof(*idents));
       if (idents)
       {
-         size_t i, n = 0;
-         /* External-emulator folders have core_ident == NULL — they're
-          * launched via Android Intent, not a libretro core, so skip
-          * them in the eager core-install plan. */
          for (i = 0; i < dp->system_count; i++)
-            if (dp->systems[i].core_ident)
-               idents[n++] = dp->systems[i].core_ident;
+            for (j = 0; j < dp->systems[i].source_count; j++)
+               if (dp->systems[i].sources[j].core_ident)
+                  idents[n++] = dp->systems[i].sources[j].core_ident;
          if (n > 0)
             pastime_setup_plan_boot(idents, n);
          free(idents);
