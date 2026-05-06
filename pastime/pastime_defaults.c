@@ -32,6 +32,8 @@
 #include "../gfx/video_defines.h"
 
 #ifdef ANDROID
+#include <unistd.h>      /* access(), R_OK / W_OK */
+#include <errno.h>       /* errno, for the EACCES probe diagnostics */
 /* These globals live in platform_unix.c.  We declare extern locally
  * rather than including platform_unix.h because that header *defines*
  * (not declares) the arrays — including it from a separate TU would
@@ -40,11 +42,56 @@
  * keeping the definition in the .c file, but that's an upstream PR. */
 extern char internal_storage_path[];
 extern char internal_storage_app_path[];
+/* Pastime-owned helpers defined alongside the JNI extra-reading site in
+ * platform_unix.c.  Returns the count of removable mounts the Java side
+ * discovered (StorageManager.getStorageVolumes()) and the i-th path. */
+extern unsigned    pastime_removable_storage_count_get(void);
+extern const char *pastime_removable_storage_path_get(unsigned i);
 #endif
 
 bool pastime_paths_get_root(char *out, size_t out_len)
 {
 #ifdef ANDROID
+   /* Removable storage first.  We *only* adopt a card when it already
+    * has a Pastime/ directory on it — never auto-bootstrap onto removable
+    * media.  Card adoption is user-driven: stage the tree from a PC,
+    * plug the card in, the launcher picks it up.  Internal storage stays
+    * the default for fresh installs.  Adoptable-storage cards (encrypted
+    * into the internal pool) don't appear here as separate entries — by
+    * design, since they aren't portable across devices anyway. */
+   {
+      unsigned i, n = pastime_removable_storage_count_get();
+      for (i = 0; i < n; i++)
+      {
+         char        candidate[PATH_MAX_LENGTH];
+         const char *root = pastime_removable_storage_path_get(i);
+         if (!root || !*root)
+            continue;
+         fill_pathname_join_special(candidate, root, "Pastime",
+               sizeof(candidate));
+         if (!path_is_directory(candidate))
+            continue;
+         /* MES grant doesn't guarantee FUSE/sdcardfs lets us read+write
+          * — some OEM builds (Samsung primarily, but seen in the wild
+          * on weird vendor forks) fence off `/storage/<UUID>/` to SAF
+          * regardless of the granted permission.  Probe with access()
+          * before adopting; on EACCES, fall through to internal so the
+          * user has a working launcher rather than a tree they can
+          * see-but-not-write.  access() is preferred over open() — no
+          * file descriptor to leak, no TOCTOU footgun. */
+         if (access(candidate, R_OK | W_OK) != 0)
+         {
+            RARCH_WARN("[Pastime] removable Pastime/ at %s exists but "
+                  "is not read+write accessible (errno=%d %s); "
+                  "falling back to internal storage.\n",
+                  candidate, errno, strerror(errno));
+            continue;
+         }
+         strlcpy(out, candidate, out_len);
+         return true;
+      }
+   }
+
    if (*internal_storage_path)
    {
       fill_pathname_join_special(out, internal_storage_path, "Pastime", out_len);
@@ -80,6 +127,56 @@ static bool pastime_should_overlay(const char *cur, const char *ra_default)
    if (ra_default && *ra_default && string_is_equal(cur, ra_default))
       return true;
    return false;
+}
+
+/* True iff `cur` looks like a path Pastime itself wrote on a prior boot
+ * — i.e. it ends with "/Pastime/<leaf>".  We need this in addition to
+ * pastime_should_overlay because the bare predicate is sticky: once
+ * we've written `/storage/emulated/0/Pastime/Roms` to retroarch.cfg,
+ * the next boot sees a non-empty, non-RA-default value there and skips
+ * re-overlay — even when the user has now plugged in an SD card whose
+ * `Pastime/Roms` should win.  Detecting "this is a Pastime tree path"
+ * lets pastime_paths_get_root drive where the tree lives every boot,
+ * not just on first run.  Explicit user overrides — paths that don't
+ * end in `/Pastime/<leaf>` — are still respected. */
+static bool pastime_owns_path(const char *cur, const char *leaf)
+{
+   /* "/Pastime/" + leaf, e.g. "/Pastime/Roms". */
+   static const char prefix[] = "/Pastime/";
+   const size_t      prefix_len = sizeof(prefix) - 1;
+   size_t            cur_len, leaf_len, suffix_len;
+   const char       *suffix;
+
+   if (!cur || !*cur || !leaf || !*leaf)
+      return false;
+
+   cur_len    = strlen(cur);
+   leaf_len   = strlen(leaf);
+   suffix_len = prefix_len + leaf_len;
+   if (cur_len < suffix_len)
+      return false;
+
+   suffix = cur + cur_len - suffix_len;
+   /* The leading '/' in `prefix` IS the path-component boundary —
+    * strncmp requires the trailing slice to begin with '/', so a string
+    * like "/foo/NotPastime/Roms" doesn't match (its trailing 13 chars
+    * are "tPastime/Roms", which fails the prefix compare).  No further
+    * boundary check is needed. */
+   if (strncmp(suffix, prefix, prefix_len) != 0)
+      return false;
+   return string_is_equal(suffix + prefix_len, leaf);
+}
+
+/* Combined predicate used at every path overlay site: write the
+ * Pastime-rooted path when either (a) the user hasn't picked an
+ * explicit override (pastime_should_overlay), or (b) the current value
+ * is a path Pastime wrote previously and that we're now re-resolving
+ * against a (possibly different) root. */
+static bool pastime_should_route_path(const char *cur, const char *ra_default,
+      const char *leaf)
+{
+   return    pastime_should_overlay(cur, ra_default)
+          || pastime_owns_path(cur, leaf);
 }
 
 void pastime_defaults_apply(void)
@@ -213,18 +310,20 @@ void pastime_defaults_apply(void)
       return;
    }
 
-   /* Path overlays.  See pastime_should_overlay for the predicate;
-    * each setting compares against the RA platform default it would
-    * otherwise have received. */
-   if (pastime_should_overlay(settings->paths.directory_menu_content,
-            g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT]))
+   /* Path overlays.  pastime_should_route_path covers two cases: a
+    * fresh install where the value is empty/RA-default, and a re-boot
+    * where the value is a path *we* wrote previously — letting an SD
+    * card with Pastime/ on it win over an internal-storage tree we
+    * baked into the cfg on a prior boot. */
+   if (pastime_should_route_path(settings->paths.directory_menu_content,
+            g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT], "Roms"))
    {
       fill_pathname_join_special(sub, root, "Roms", sizeof(sub));
       strlcpy(settings->paths.directory_menu_content, sub,
             sizeof(settings->paths.directory_menu_content));
    }
-   if (pastime_should_overlay(settings->paths.directory_system,
-            g_defaults.dirs[DEFAULT_DIR_SYSTEM]))
+   if (pastime_should_route_path(settings->paths.directory_system,
+            g_defaults.dirs[DEFAULT_DIR_SYSTEM], "Bios"))
    {
       fill_pathname_join_special(sub, root, "Bios", sizeof(sub));
       strlcpy(settings->paths.directory_system, sub,
@@ -235,7 +334,8 @@ void pastime_defaults_apply(void)
     * "savefile_directory" / "savestate_directory" through dir_get_ptr. */
    {
       char *cur = dir_get_ptr(RARCH_DIR_SAVEFILE);
-      if (pastime_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SRAM]))
+      if (pastime_should_route_path(cur,
+               g_defaults.dirs[DEFAULT_DIR_SRAM], "Saves"))
       {
          fill_pathname_join_special(sub, root, "Saves", sizeof(sub));
          dir_set(RARCH_DIR_SAVEFILE, sub);
@@ -243,7 +343,8 @@ void pastime_defaults_apply(void)
    }
    {
       char *cur = dir_get_ptr(RARCH_DIR_SAVESTATE);
-      if (pastime_should_overlay(cur, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]))
+      if (pastime_should_route_path(cur,
+               g_defaults.dirs[DEFAULT_DIR_SAVESTATE], "States"))
       {
          fill_pathname_join_special(sub, root, "States", sizeof(sub));
          dir_set(RARCH_DIR_SAVESTATE, sub);
@@ -255,9 +356,10 @@ void pastime_defaults_apply(void)
     * to rsync with their library, and (b) the libretro-thumbnails
     * directory layout (<system>/Named_Boxarts/<label>.png) is portable
     * across any RA-compatible tooling.  Stock RA defaults to
-    * <config>/thumbnails/ — overlay only when that's still the value. */
-   if (pastime_should_overlay(settings->paths.directory_thumbnails,
-            g_defaults.dirs[DEFAULT_DIR_THUMBNAILS]))
+    * <config>/thumbnails/ — re-route either when that's still the
+    * value or when we previously wrote a Pastime/Thumbnails path. */
+   if (pastime_should_route_path(settings->paths.directory_thumbnails,
+            g_defaults.dirs[DEFAULT_DIR_THUMBNAILS], "Thumbnails"))
    {
       fill_pathname_join_special(sub, root, "Thumbnails", sizeof(sub));
       strlcpy(settings->paths.directory_thumbnails, sub,

@@ -423,6 +423,63 @@ jobject pastime_jni_get_activity_clazz(void)
    return g_android->activity->clazz;
 }
 
+/* PASTIME: removable-storage roots captured from the Java side
+ * (MainMenuActivity.pastimeCollectRemovableStorage()).  Storage lives
+ * here because the JNI extra-reading site does; pastime/ code reads via
+ * the accessors below so it never sees the cap.  Cap is small because
+ * Android handhelds with >1 SD card are essentially nonexistent — bump
+ * if a real device proves otherwise. */
+#define PASTIME_REMOVABLE_STORAGE_MAX 4
+static char pastime_removable_storage_paths
+   [PASTIME_REMOVABLE_STORAGE_MAX][PATH_MAX_LENGTH];
+static unsigned pastime_removable_storage_count;
+
+void pastime_removable_storage_paths_set(const char *joined)
+{
+   const char *p   = joined;
+   const char *sep;
+   size_t      n;
+
+   pastime_removable_storage_count = 0;
+   if (!p || !*p)
+      return;
+
+   while (*p
+          && pastime_removable_storage_count < PASTIME_REMOVABLE_STORAGE_MAX)
+   {
+      sep = strchr(p, ';');
+      n   = sep ? (size_t)(sep - p) : strlen(p);
+      if (n > 0 && n < PATH_MAX_LENGTH)
+      {
+         memcpy(pastime_removable_storage_paths
+                  [pastime_removable_storage_count], p, n);
+         pastime_removable_storage_paths
+            [pastime_removable_storage_count][n] = '\0';
+         __android_log_print(ANDROID_LOG_INFO, "RetroArch",
+            "[ENV] Pastime removable storage[%u]: \"%s\".\n",
+            pastime_removable_storage_count,
+            pastime_removable_storage_paths
+               [pastime_removable_storage_count]);
+         pastime_removable_storage_count++;
+      }
+      if (!sep)
+         break;
+      p = sep + 1;
+   }
+}
+
+unsigned pastime_removable_storage_count_get(void)
+{
+   return pastime_removable_storage_count;
+}
+
+const char *pastime_removable_storage_path_get(unsigned i)
+{
+   if (i >= pastime_removable_storage_count)
+      return NULL;
+   return pastime_removable_storage_paths[i];
+}
+
 static void jni_thread_destruct(void *value)
 {
    JNIEnv *env = (JNIEnv*)value;
@@ -1737,6 +1794,23 @@ static void frontend_unix_get_env(int *argc,
             "RetroArch", "[ENV] Android external files location \"%s\".\n",
             internal_storage_app_path);
       }
+   }
+
+   /* PASTIME: removable-storage roots — semicolon-joined list of mount
+    * paths (e.g. /storage/<UUID>) discovered Java-side via
+    * StorageManager.getStorageVolumes().  Empty when no card is mounted.
+    * Consumed by pastime_paths_get_root() so a card with an existing
+    * Pastime/ tree on it wins over internal storage. */
+   CALL_OBJ_METHOD_PARAM(env, jstr, obj, android_app->getStringExtra,
+         (*env)->NewStringUTF(env, "REMOVABLE_STORAGE"));
+
+   if (android_app->getStringExtra && jstr)
+   {
+      const char *argv = (*env)->GetStringUTFChars(env, jstr, 0);
+
+      pastime_removable_storage_paths_set(argv);
+
+      (*env)->ReleaseStringUTFChars(env, jstr, argv);
    }
 
    /* Content. */

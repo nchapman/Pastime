@@ -1129,7 +1129,7 @@ public class RetroActivityCommon extends NativeActivity
   /* PASTIME: external-emulator launch helper.
    *
    * Called from pastime/pastime_external_android.c via JNI when the
-   * user picks a ROM from a folder marked `(ext:<package>)`.  The
+   * user picks a ROM from a folder marked `(ext-<package>)`.  The
    * native side has already resolved the package against a generated
    * preset table — our job is to build and fire the Intent.
    *

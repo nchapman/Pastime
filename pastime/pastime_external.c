@@ -34,7 +34,19 @@ bool pastime_external_parse_marker(const char *inside_parens,
 
    if (!inside_parens)
       return false;
-   if (strncmp(inside_parens, "ext:", 4) != 0)
+   /* Marker form: "ext-<package>".  Dash specifically because:
+    *   - colon is illegal on exFAT/FAT32 (the universal SD card formats
+    *     and the way users will stage portable libraries from a desktop)
+    *   - tilde is shell-expansion-prone and ugly in folder names
+    *   - underscore and dot are legal *within* Android package names
+    *     (e.g. "com.foo_bar.baz") so they aren't unambiguous separators
+    *   - dash is filesystem-universal and is illegal in Java packages,
+    *     making "ext-com.foo.bar" unambiguous from a libretro core
+    *     ident (which is [a-z0-9_]+, no dashes either).
+    * No back-compat for prior `ext:` / `ext~` forms — Pastime has no
+    * deployed users yet; one separator is simpler and the migration is
+    * a folder rename. */
+   if (strncmp(inside_parens, "ext-", 4) != 0)
       return false;
    pkg = inside_parens + 4;
    len = strlen(pkg);

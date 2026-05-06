@@ -1,6 +1,6 @@
 /* Pastime external-emulator launch.
  *
- * A `Roms/<system>/` folder whose name ends in `(ext:<package>)` instead
+ * A `Roms/<system>/` folder whose name ends in `(ext-<package>)` instead
  * of `(<core_ident>)` resolves to an external Android emulator app rather
  * than a libretro core.  At ROM-pick time we look the package up in a
  * generated preset table (see pastime_external_presets.h, synced from
@@ -8,7 +8,7 @@
  *
  * Pure C; the Android intent firing lives in pastime_external_android.c
  * and is reached via pastime_external_launch().  On non-Android builds
- * the launch helper logs and returns false — folders with `(ext:…)`
+ * the launch helper logs and returns false — folders with `(ext-…)`
  * markers still appear in the system list (so a desktop dev can see
  * them) but selecting one is a no-op.
  */
@@ -44,13 +44,13 @@ typedef struct
    bool        kill_first;  /* forceStop the package before startActivity */
 } pastime_external_spec_t;
 
-/* If `inside_parens` starts with "ext:", validate the rest as an Android
+/* If `inside_parens` starts with "ext-", validate the rest as an Android
  * package name (`[a-zA-Z0-9._]+` containing at least one '.') and return
  * a pointer to the package in `*package_out`.  The pointer aliases into
  * the input — caller owns the buffer's lifetime.
  *
  * Returns false (and leaves *package_out unset) if the marker isn't an
- * `ext:` form, or if the package fails validation.  The caller should
+ * `ext-` form, or if the package fails validation.  The caller should
  * fall through to the existing `(<core_ident>)` parsing on false.
  */
 bool pastime_external_parse_marker(const char *inside_parens,

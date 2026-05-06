@@ -95,7 +95,7 @@ typedef struct
    char *full_path;
    char *db_name;
    /* When non-NULL, this folder uses an external Android emulator
-    * (folder name ended in "(ext:<package>)") and core_ident is NULL.
+    * (folder name ended in "(ext-<package>)") and core_ident is NULL.
     * Pointer aliases into the static preset table; do not free. */
    const pastime_external_spec_t *external;
 } pastime_system_t;
@@ -678,13 +678,13 @@ static const char *pastime_row_label(const pastime_handle_t *dp, size_t row)
  *
  *   "Super Nintendo (snes9x)"          → display="Super Nintendo",
  *                                        ident="snes9x", external=NULL
- *   "Dreamcast (ext:com.flycast.emulator)"
+ *   "Dreamcast (ext-com.flycast.emulator)"
  *                                      → display="Dreamcast",
  *                                        ident=NULL,
  *                                        external=<preset row>
  *
  * Returns false (and the caller hides the folder) when the trailing
- * parenthetical is missing/malformed, or when an `ext:` marker names a
+ * parenthetical is missing/malformed, or when an `ext-` marker names a
  * package that isn't in our generated preset table — strict folder
  * convention, same as today for unknown core_idents.
  */
@@ -740,13 +740,13 @@ static bool pastime_parse_system_folder(const char *folder,
    memcpy(ident, ident_start, ident_len);
    ident[ident_len] = '\0';
 
-   if (ident_len > 4 && strncmp(ident, "ext:", 4) == 0)
+   if (ident_len > 4 && strncmp(ident, "ext-", 4) == 0)
    {
       const char *pkg = NULL;
       is_external = true;
       if (!pastime_external_parse_marker(ident, &pkg))
       {
-         RARCH_WARN("[Pastime] malformed ext: marker in folder '%s'\n",
+         RARCH_WARN("[Pastime] malformed ext- marker in folder '%s'\n",
                folder);
          free(ident);
          return false;

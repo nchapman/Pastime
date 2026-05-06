@@ -18,6 +18,15 @@
          a normal-permission no-op kill of stale background instances
          that won't pick up new ROM extras otherwise (AetherSX2 family). -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <!-- PASTIME: All Files Access.  Filesystem-as-configuration is the
+         whole UX model — folders under Pastime/Roms/<system>/ ARE the
+         library, libretro cores want raw POSIX paths, and removable SD
+         cards are a first-class portable-library mechanism.  SAF would
+         require a translation layer at every disk-touching site.  We
+         ship via APK (no Play Store policy review) so the special-
+         permission posture is fine.  Hard-gated in MainMenuActivity. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
     <application
         android:name="com.retroarch.playcore.RetroArchApplication"

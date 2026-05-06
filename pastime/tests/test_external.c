@@ -68,17 +68,17 @@ static int g_fail;
 static void test_parse_marker_accepts_well_formed_packages(void)
 {
    const char *out = NULL;
-   ASSERT_TRUE(pastime_external_parse_marker("ext:com.flycast.emulator", &out));
+   ASSERT_TRUE(pastime_external_parse_marker("ext-com.flycast.emulator", &out));
    ASSERT_STREQ(out, "com.flycast.emulator");
 
    out = NULL;
-   ASSERT_TRUE(pastime_external_parse_marker("ext:org.dolphinemu.dolphinemu",
+   ASSERT_TRUE(pastime_external_parse_marker("ext-org.dolphinemu.dolphinemu",
          &out));
    ASSERT_STREQ(out, "org.dolphinemu.dolphinemu");
 
    /* Mixed case + digits + underscores survive. */
    out = NULL;
-   ASSERT_TRUE(pastime_external_parse_marker("ext:io.github.Lime3DS_v2.app",
+   ASSERT_TRUE(pastime_external_parse_marker("ext-io.github.Lime3DS_v2.app",
          &out));
    ASSERT_STREQ(out, "io.github.Lime3DS_v2.app");
 }
@@ -87,8 +87,15 @@ static void test_parse_marker_rejects_non_ext_prefix(void)
 {
    const char *out = (const char*)0xdeadbeef;
    ASSERT_FALSE(pastime_external_parse_marker("snes9x", &out));
-   ASSERT_FALSE(pastime_external_parse_marker("android:com.foo.bar", &out));
-   ASSERT_FALSE(pastime_external_parse_marker("ex:com.foo.bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("android-com.foo.bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ex-com.foo.bar", &out));
+   /* Pre-dash separator forms (`:` colon and `~` tilde) are no longer
+    * accepted — the convention canonicalised on `-` once SD-card
+    * staging revealed that exFAT silently mangles colons.  Rejecting
+    * them loudly is better than silently parsing into an inconsistent
+    * marker form across users. */
+   ASSERT_FALSE(pastime_external_parse_marker("ext:com.foo.bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext~com.foo.bar", &out));
    ASSERT_FALSE(pastime_external_parse_marker("", &out));
    ASSERT_FALSE(pastime_external_parse_marker(NULL, &out));
 }
@@ -98,23 +105,23 @@ static void test_parse_marker_requires_dot(void)
    const char *out = NULL;
    /* Single-segment "package" is a libretro-style ident, not an Android
     * package — caller must fall through to the existing parser. */
-   ASSERT_FALSE(pastime_external_parse_marker("ext:standalone", &out));
-   ASSERT_FALSE(pastime_external_parse_marker("ext:nodot_here", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-standalone", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-nodot_here", &out));
 }
 
 static void test_parse_marker_rejects_bad_chars(void)
 {
    const char *out = NULL;
-   ASSERT_FALSE(pastime_external_parse_marker("ext:com.foo bar", &out));
-   ASSERT_FALSE(pastime_external_parse_marker("ext:com.foo/bar", &out));
-   ASSERT_FALSE(pastime_external_parse_marker("ext:com.foo-bar", &out));
-   ASSERT_FALSE(pastime_external_parse_marker("ext:com.foo!bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-com.foo bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-com.foo/bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-com.foo-bar", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-com.foo!bar", &out));
 }
 
 static void test_parse_marker_rejects_empty_payload(void)
 {
    const char *out = NULL;
-   ASSERT_FALSE(pastime_external_parse_marker("ext:", &out));
+   ASSERT_FALSE(pastime_external_parse_marker("ext-", &out));
 }
 
 /* ---------- preset lookup ---------- */

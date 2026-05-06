@@ -25,7 +25,14 @@ Pastime's entire content model is defined by directory structure on disk. There 
 
 ### Top-level
 
-A `Pastime/` directory at a known storage root. On Android, "storage root" is resolved through RetroArch's three-tier permission model (`frontend/drivers/platform_unix.c:105–109`) — full external storage, scoped app-external, or app-private — picking the first writable tier where `Pastime/` exists or can be created. On desktop, `~/Pastime/` (or an explicit path via config).
+A `Pastime/` directory at a known storage root. On Android, the resolver (`pastime/pastime_defaults.c:pastime_paths_get_root`) walks two tiers in order: **(1) any removable SD card with an existing `Pastime/` directory on it**, then **(2) RetroArch's internal-storage tiers** (`frontend/drivers/platform_unix.c:105–109` — full external storage, scoped app-external, or app-private). Card adoption is user-driven: the launcher never auto-bootstraps onto removable media. To use a card as your library, stage `Pastime/{Roms,Bios,Saves,States}/...` from a PC, plug the card in, and the launcher picks it up. The card moves between Android handhelds; internal storage is the per-device fallback. On desktop, `~/Pastime/` (or an explicit path via config).
+
+Removable-storage discovery requires `MANAGE_EXTERNAL_STORAGE` ("All Files Access"), gated at first launch by `MainMenuActivity`. SAF was rejected — every libretro core, every save path, every bootstrap call wants real POSIX paths, and a translation layer is incompatible with our "filesystem is the configuration" model. We ship via APK, so the special-permission posture has no Play Store policy implications.
+
+Two edge cases worth knowing:
+
+- **Path overrides aren't preserved across card adoptions.** `pastime_owns_path()` treats any path ending in `/Pastime/<leaf>` as Pastime-owned and re-routes it on every boot. A user who has set a deliberate non-Pastime override (say `directory_menu_content = /sdcard/MyRoms`) keeps that override — but if they ever adopt a Pastime-tree SD card and later remove it, the cfg gets re-routed to internal `Pastime/Roms/`, not back to their original `/sdcard/MyRoms`. v1 accepts this; revisit if anyone hits it.
+- **Hot-plugging an SD card while Pastime is running doesn't pick it up.** The `REMOVABLE_STORAGE` intent extra is only set on cold-launch; the `REORDER_TO_FRONT` resume path skips it, and `RetroActivityFuture` doesn't read intent extras on `onNewIntent`. Cold-relaunch is the supported workflow.
 
 ```
 Pastime/
@@ -56,18 +63,18 @@ Roms/
 - **Folders whose core ident isn't in the libretro buildbot's available list are also hidden.** No "broken folder" UX.
 - Multiple folders may resolve to the same core; that's a feature (e.g., separate "official" and "hacks" libraries).
 
-**External Android emulators (`(ext:<package>)` marker):**
+**External Android emulators (`(ext-<package>)` marker):**
 
-Folders whose marker starts with `ext:` instead of a libretro core ident launch an external Android app via `Intent` rather than loading a libretro core. The marker payload is the full Android package name.
+Folders whose marker starts with `ext-` instead of a libretro core ident launch an external Android app via `Intent` rather than loading a libretro core. The marker payload is the full Android package name. The dash separator is filesystem-universal — colons are illegal on exFAT/FAT32 (the universal SD card formats), and Android package names can't contain dashes themselves so the prefix is unambiguous.
 
 ```
 Roms/
-   Dreamcast (ext:com.flycast.emulator)/
-   Nintendo GameCube (ext:org.dolphinemu.dolphinemu)/
-   Sony PlayStation (ext:com.github.stenzek.duckstation)/
+   Dreamcast (ext-com.flycast.emulator)/
+   Nintendo GameCube (ext-org.dolphinemu.dolphinemu)/
+   Sony PlayStation (ext-com.github.stenzek.duckstation)/
 ```
 
-- Pattern: `^(.+) \(ext:([a-zA-Z0-9._]+)\)$` with at least one `.` in the package.
+- Pattern: `^(.+) \(ext-([a-zA-Z0-9._]+)\)$` with at least one `.` in the package. The `[a-zA-Z0-9._]+` set deliberately excludes `-` so "ext-" can't be confused with a package starting with "-".
 - The package is looked up in `pastime/pastime_external_presets.h`, a generated table of `(component, action, category, extra-key, MIME, kill-first)` tuples synced from Daijishou (`TapiocaFox/Daijishou`, MIT). Resync via `python3 pastime/tools/sync_external_presets.py` and commit the regenerated header.
 - **Folders whose package isn't in the preset table are hidden** (same strict-convention behavior as unknown core idents). The sync script's stderr summary is the right place to see what's covered.
 - ROM payload is handed to the receiving emulator as a `content://` URI through `PastimeRomProvider` with `FLAG_GRANT_READ_URI_PERMISSION`, so it works under modern Android scoped storage.
@@ -112,7 +119,9 @@ This means: standard MinUI navigation (up / down / select / back / page) fits cl
 | `pkg/apple/rebuild-assets.sh` | Overlay `pastime/assets/*` (e.g. `assets/pastime/InterTight-Bold.ttf`) into the macOS `.app`'s `assets.zip` before zipping, so the bundled-assets pipeline ships our font. | ~6 lines |
 | `frontend/drivers/platform_unix.c` (after `jni_thread_getenv`) | Add `pastime_jni_get_activity_clazz()` accessor returning `g_android->activity->clazz`. Lets `pastime/pastime_external_android.c` (separate TU, can't include `platform_unix.h` because of duplicate-storage decls) reach the activity jobject without seeing struct layout. | ~6 lines |
 | `pkg/android/phoenix-common/src/com/retroarch/browser/retroactivity/RetroActivityCommon.java` (end of class) | Add `boolean pastimeLaunchExternal(...)` Java helper that builds and fires the Intent for external-emulator launches. Called from `pastime_external_android.c` via JNI. | ~120 lines (one new method) |
-| `pkg/android/phoenix/AndroidManifest.xml` (inside `<application>`) | Declare `PastimeRomProvider` with authority `${applicationId}.romprovider`, `exported=false`, `grantUriPermissions=true`. | ~6 lines |
+| `pkg/android/phoenix/AndroidManifest.xml` (inside `<application>`) | Declare `PastimeRomProvider` with authority `${applicationId}.romprovider`, `exported=false`, `grantUriPermissions=true`. Plus the `MANAGE_EXTERNAL_STORAGE` permission for the SD-card / All-Files-Access UX. | ~10 lines |
+| `pkg/android/phoenix/src/com/retroarch/browser/mainmenu/MainMenuActivity.java` | Hard-gate startup until the user grants All Files Access (system Settings deeplink with `ActivityNotFoundException` fallback chain, re-check on `onResume`). Also enumerate removable volumes via `StorageManager.getStorageVolumes()` and pass them to native as the `REMOVABLE_STORAGE` intent extra so `pastime_paths_get_root` can adopt an SD card with an existing `Pastime/` tree. | ~180 lines |
+| `frontend/drivers/platform_unix.c` (intent-extra reading block + helpers near `pastime_jni_get_activity_clazz`) | Read `REMOVABLE_STORAGE`; expose `pastime_removable_storage_count_get` / `_path_get` accessors so `pastime/pastime_defaults.c` can scan SD-card mounts without re-parsing. | ~50 lines |
 
 **Contingent (only if proven necessary):**
 
