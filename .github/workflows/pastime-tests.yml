@@ -1,0 +1,19 @@
+name: Pastime Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Pastime unit tests
+        run: bash pastime/tests/run_tests.sh

@@ -1097,6 +1097,9 @@ ifeq ($(HAVE_MENU), 1)
       OBJ += pastime/pastime_thumbs_index.o
       OBJ += pastime/pastime_thumbhash.o
       OBJ += pastime/pastime_webp.o
+      # PASTIME: external-app launcher (cross-platform; the JNI bridge
+      # in pastime_external_android.c is wired separately on Android).
+      OBJ += pastime/pastime_external.o
       DEFINES += -DHAVE_PASTIME
 
       # Vendored libwebp decoder.  Decoder-only subset; arch-specific

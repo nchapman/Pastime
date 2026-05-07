@@ -270,6 +270,7 @@ static void pastime_setup_bucket_http_cb(retro_task_t *task,
    file_transfer_t               *transf   = (file_transfer_t*)user_data;
    http_transfer_data_t          *data     = (http_transfer_data_t*)task_data;
    const char                    *dir_path;
+   char                           dir_buf[PATH_MAX_LENGTH];
    char                           output_path[PATH_MAX_LENGTH];
    char                           subdir_buf[PATH_MAX_LENGTH];
    const char                    *subdir   = NULL;
@@ -298,20 +299,17 @@ static void pastime_setup_bucket_http_cb(retro_task_t *task,
       goto fail;
    }
 
+   /* dir_buf is declared at function scope so dir_path remains valid
+    * for the rest of this callback.  The RA task system is single-
+    * threaded (callbacks fire on the main thread via task_queue_check),
+    * so a static isn't load-bearing. */
+   if (!pastime_setup_resolve_dir(b, settings, dir_buf, sizeof(dir_buf)))
    {
-      /* Stack-local; the RA task system is single-threaded (callbacks
-       * fire on the main thread via task_queue_check), so a static
-       * isn't load-bearing — and `dir_path` is consumed before this
-       * function returns, so the buffer doesn't need to outlive it. */
-      char dir_buf[PATH_MAX_LENGTH];
-      if (!pastime_setup_resolve_dir(b, settings, dir_buf, sizeof(dir_buf)))
-      {
-         RARCH_WARN("[Pastime-setup] no install dir for %s\n",
-               b->zip_filename);
-         goto fail;
-      }
-      dir_path = dir_buf;
+      RARCH_WARN("[Pastime-setup] no install dir for %s\n",
+            b->zip_filename);
+      goto fail;
    }
+   dir_path = dir_buf;
    /* Ensure the leaf install dir exists when a subpath is in play —
     * decompress will fail to extract into a missing dir.  For non-
     * subpath buckets the path_basedir/path_mkdir below covers it. */

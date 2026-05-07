@@ -24,6 +24,15 @@ INC="-I${PROJECT_ROOT}/libretro-common/include"
 DEFS="-DPASTIME_NAV_TEST_BUILD"
 CFLAGS="${CFLAGS:--std=c99 -Wall -Wextra -Wpedantic -Wno-unused-function -O0 -g}"
 
+# On glibc/Linux under strict -std=c99, strdup needs a feature macro
+# to be declared.  macOS is BSD-derived and exposes both strdup and
+# strlcpy unconditionally — adding _POSIX_C_SOURCE there *removes*
+# strlcpy (which compat/strl.h then expects to be in libc), breaking
+# the build.  Apply the define only on non-Darwin hosts.
+if [[ "$(uname -s)" != "Darwin" ]]; then
+   CFLAGS="$CFLAGS -D_DEFAULT_SOURCE"
+fi
+
 # Track binaries we build this run; only those get executed below.
 # Globbing test_* would otherwise re-run stale binaries left behind
 # by a previous failed build.
@@ -77,9 +86,17 @@ BUILT+=(test_external)
 # (no PASTIME_THUMBS_TEST_BUILD stub dance — the manager file isn't
 # linked in).
 echo "== building test_thumbs"
+# compat_strl.c provides strlcpy_retro__/strlcat_retro__ on platforms
+# where strlcpy isn't in libc (Linux/glibc).  macOS auto-defines
+# HAVE_STRL in compat/strl.h, so linking the shim there would conflict.
+COMPAT_STRL=()
+if [[ "$(uname -s)" != "Darwin" ]]; then
+   COMPAT_STRL=("${PROJECT_ROOT}/libretro-common/compat/compat_strl.c")
+fi
 $CC $CFLAGS $INC \
     test_thumbs.c ../pastime_thumbs_index.c \
     "${PROJECT_ROOT}/libretro-common/formats/json/rjson.c" \
+    ${COMPAT_STRL[@]+"${COMPAT_STRL[@]}"} \
     -o test_thumbs
 BUILT+=(test_thumbs)
 

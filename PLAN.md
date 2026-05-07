@@ -133,22 +133,39 @@ This means: standard MinUI navigation (up / down / select / back / page) fits cl
 
 If a feature seems to require patching outside this list, that is a signal to redesign — either push the logic into the menu driver, expose what we need via an upstream PR, or accept a feature gap. New patch points get added to this table with rationale.
 
-### `pastime/` module layout (target)
+### `pastime/` module layout (current)
 
 ```
 pastime/
-   pastime.h                 — shared types, public API surface
-   pastime_paths.c           — locate Pastime/ root across Android storage tiers; cache subpaths
-   pastime_bootstrap.c       — first-run: ensure Pastime/{Roms,Bios,Saves,States} exist
-   pastime_defaults.c        — defaults overlay (menu_driver, system_dir, savefile_dir, etc.)
-   pastime_systems.c         — parse Roms/ subfolders: "Display Name (core_ident)" → struct
-   pastime_cores.c           — buildbot list cache, installed check, lazy download orchestration
-   pastime_recents.c         — thin adapter over content_history playlist
+   pastime_bootstrap.{c,h}        — first-run: ensure Pastime/{Roms,Bios,Saves,States} exist; seed Roms/README.txt
+   pastime_defaults.{c,h}         — defaults overlay applied after config_load(); also owns pastime_paths_get_root()
+                                    (Android storage-tier walker → Pastime/ root). Subsumes the original pastime_paths.c.
+   pastime_cores.{c,h}            — buildbot list cache + sequential install queue (boot splash + lazy fallback)
+   pastime_cores_extras.{c,h}     — extras-core installer (PICO-8 / fake-08) driven by external preset table
+   pastime_setup.{c,h}            — first-run sequential bucket downloader (core info, assets, autoconfigs,
+                                    databases, overlays, slang shaders) over RA's online-updater task plumbing
+   pastime_nav.{c,h}              — pure helpers for navigation (view stacks, focus persistence, list cursor math)
+   pastime_display_name.{c,h}     — folder-name → display-name normalization (tag stripping, sort keys)
+   pastime_metadata.h
+   pastime_metadata_disambig.c    — folder → canonical thumbnails/db system-name resolver (table + fallback)
+   pastime_disambig.{c,h}         — ROM-row label disambiguation when cleaned names collide
+   pastime_thumbs.{c,h}           — custom thumbnail manager: per-system index.json.gz fetch, two-phase match
+                                    cascade, bounded image fetch queue, atomic on-disk caching
+   pastime_thumbs_internal.h
+   pastime_thumbs_index.c         — binary `.idx` parse + lookup (exact canonical, heavy-normalized fallback)
+   pastime_thumbhash.{c,h}        — placeholder thumbhash decode for low-bandwidth list rendering
+   pastime_webp.{c,h}             — vendored libwebp wrapper for synchronous WebP decode into gfx_thumbnail_t
+   pastime_external.{c,h}         — external-app launch (preset table + Android Intent dispatch)
+   pastime_external_android.c     — Android-specific external launch JNI glue
+   pastime_external_presets.h     — generated external-launcher preset table
+   tools/                         — index-builder + asset tooling (host-side, not built into the app)
+   tests/                         — unit tests (run via run_tests.sh)
 menu/drivers/
-   pastime.c                 — the menu driver itself
+   pastime.c                      — the menu driver itself; system-folder parsing and the recents adapter live
+                                    inline here (no separate pastime_systems.c / pastime_recents.c module)
 ```
 
-`pastime_systems.c` and `pastime_cores.c` together implement the storage convention. The menu driver consults them; it doesn't parse folder names or talk to the updater directly.
+The menu driver consults these modules; it doesn't parse folder names directly outside its own inline helpers, and it never talks to the updater task system except through `pastime_cores`/`pastime_setup`.
 
 ## Roadmap
 
@@ -409,6 +426,7 @@ System-folder visibility filtering (carryover from M3), cheats, upstream-rebase 
 - **One concept per patch.** When a new feature requires a new upstream patch point, that's its own commit, not bundled with implementation.
 - **Marker comments.** Every line of upstream code we modify gets a `/* PASTIME: ... */` marker. Greppable: `git grep PASTIME` should enumerate the entire fork delta in upstream files.
 - **Track upstream churn.** Before each rebase, skim `git log upstream/master -- menu/menu_driver.c menu/menu_driver.h frontend/frontend.c retroarch.c configuration.c Makefile.common` for changes near our patch points.
+- **CI is Pastime-owned.** All workflows in `.github/workflows/` are named `pastime-*.yml`; we do not run upstream's per-platform CI. After each rebase, check `.github/workflows/` for any newly-introduced upstream files and `git rm` them — the same goes for `.travis.yml` and `.gitlab-ci.yml` if they reappear. Delete-vs-modify rebase conflicts on those files are expected; resolve with `git rm`.
 
 ## Open questions
 

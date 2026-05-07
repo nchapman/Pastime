@@ -17,6 +17,7 @@ Maintainability of the fork depends on keeping our delta against upstream small 
 - **Every line of patched upstream code gets a marker comment**: `/* PASTIME: <one-line rationale> */`. `git grep PASTIME` should enumerate the fork delta in upstream files. The marker survives rebases and tells the next reader why the line is different.
 - **Defaults**: do not edit `config.def.h` to change Pastime defaults. Add to `pastime_defaults_apply()` instead, called once after `config_load()` inside `retroarch_main_init()` — i.e., after upstream defaults *and* on-disk config have been applied, but before CLI args override.
 - **Rebase, don't merge.** This fork tracks upstream master via rebase. Avoid commits that would be painful to rebase (sweeping reformatting, accidental upstream-file edits).
+- **CI is Pastime-owned.** All `.github/workflows/` files are named `pastime-*.yml`; we deleted upstream's per-platform CI matrix and do not run it. After each rebase, check `.github/workflows/` (and `.travis.yml` / `.gitlab-ci.yml`) for any upstream-reintroduced files and `git rm` them.
 
 ## Build
 
@@ -77,7 +78,7 @@ The single source of truth for what is and isn't a sanctioned modification is **
 
 The full rules are in `CODING-GUIDELINES`; the ones that bite most often:
 
-- **C89-compatible C.** Declare variables at the top of a function or block — no mid-block declarations, no `for (int i = ...)`, no VLAs. The XBox 360 / MSVC build enforces this. Code must also compile as ISO C++ (some platforms compile `.c` as C++).
+- **C99 with portability margin.** No VLAs (`char buf[n]` where `n` is non-constant). Be conscious of code that compiles `.c` as C++ on some platforms — avoid C++ keyword conflicts in headers. Pastime-owned files (`pastime/`, `menu/drivers/pastime.c`) may use C99 freely; edits to upstream files (patch points) should remain C89-compatible to avoid breaking upstream's own console builds.
 - **Allman braces.** Single-statement blocks should not use braces (unless a multi-line macro requires them). Prefer `for (;;)` over `while (true)`.
 - **No `-Wall` warnings.** Treat warnings as bugs.
 - **Avoid trivial getters/setters.** A function should justify its call overhead; one-liners over POD structs are discouraged. Inline access is preferred.
