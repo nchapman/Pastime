@@ -55,6 +55,7 @@
 
 #include "../../pastime/pastime_cores.h"
 #include "../../pastime/pastime_display_name.h"
+#include "../../pastime/pastime_disambig.h"
 #include "../../pastime/pastime_external.h"
 #include "../../pastime/pastime_metadata.h"
 #include "../../pastime/pastime_nav.h"
@@ -134,11 +135,17 @@ typedef struct
    uint16_t         image_w;
    uint16_t         image_h;
    /* Index into pastime_system_t.sources for this ROM's launch backend.
-    * When a system has multiple sources (merge case), this remembers
+    * When a system has multiple sources (overlay case), this remembers
     * which folder the ROM was scanned from so the launch site dispatches
-    * to the right core/external app.  Single-source systems (the common
-    * case) always have source_idx == 0. */
+    * to the right core/external app.  Single-source systems always have
+    * source_idx == 0. */
    uint8_t          source_idx;
+   /* The original parenthetical tag stripped during cleaning, e.g.
+    * "(USA)" or "(USA) (Demo 1)".  Owned, may be NULL when the source
+    * filename had no trailing tag.  Kept around so the disambig pass
+    * (pastime_disambig_run) can re-attach it when the
+    * cleaned display collides with a sibling row. */
+   char            *tag;
 } pastime_rom_t;
 
 /* One row in the recents view.  pl_idx is the entry's index in
@@ -887,6 +894,7 @@ static void pastime_roms_free(pastime_rom_t *roms, size_t count)
       free(roms[i].display_name);
       free(roms[i].sort_key);
       free(roms[i].full_path);
+      free(roms[i].tag);
    }
    free(roms);
 }
@@ -927,12 +935,26 @@ static bool pastime_folder_has_content(const char *full_path)
    return found;
 }
 
-/* Append a source to the named system.  Returns false on OOM. */
+/* Append a source to the named system.  Returns false on OOM or when
+ * the source cap is reached.  Cap = 255 because pastime_rom_t.source_idx
+ * is uint8_t — beyond 255, source_idx would silently wrap and ROMs from
+ * the late sources would launch under source 0's backend.  The cap is
+ * absurd in practice (handheld libraries don't have hundreds of folders
+ * sharing one display name) but guarding here keeps the launch-site
+ * invariant honest. */
 static bool pastime_system_append_source(pastime_system_t *sys,
       char *full_path, char *core_ident,
       const pastime_external_spec_t *external)
 {
-   pastime_source_t *grown = (pastime_source_t*)realloc(sys->sources,
+   pastime_source_t *grown;
+   if (sys->source_count >= 255)
+   {
+      RARCH_WARN("[Pastime] system '%s' has 255 sources; ignoring "
+            "additional folder (source_idx is uint8_t)\n",
+            sys->display_name ? sys->display_name : "(unknown)");
+      return false;
+   }
+   grown = (pastime_source_t*)realloc(sys->sources,
          (sys->source_count + 1) * sizeof(*sys->sources));
    if (!grown)
       return false;
@@ -1068,7 +1090,10 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
          cap     = new_cap;
       }
       memset(&systems[count], 0, sizeof(systems[count]));
-      systems[count].display_name = display;
+      /* Don't transfer ownership of `display` into the struct until
+       * append_source has succeeded — on OOM we'd otherwise leave a
+       * dangling pointer in the not-yet-counted row, and the cleanup
+       * `free(display)` below would mismatch. */
       if (!pastime_system_append_source(&systems[count], full, ident, external))
       {
          free(display);
@@ -1076,6 +1101,7 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
          free(full);
          break;
       }
+      systems[count].display_name = display;
       count++;
    }
    string_list_free(raw);
@@ -1103,20 +1129,55 @@ static int pastime_rom_cmp(const void *a, const void *b)
    return strcmp(ka, kb);
 }
 
-/* Scan all sources of a merged system for ROMs.  Top-level files only;
- * .zip and other archives included since libretro cores read them
- * directly via the VFS layer.  Multi-source dedup: if the same ROM
- * basename appears in more than one source, the *first* source (in
- * the system's source order) wins; later sources log + skip the
- * duplicate.  Source order is alphabetical by folder path (set during
- * scan_systems), so dedup is deterministic across boots. */
+/* The user-facing identifier of a source — the same word the user
+ * typed inside the folder marker.  Libretro source returns its
+ * core_ident ("snes9x", "pcsx_rearmed").  External source returns the
+ * preset's shortname when available, falling back to the package
+ * (rare; the override map covers the popular emulators).  Used by the
+ * disambig pass to label cross-source duplicates as
+ * "Crash Bandicoot (pcsx_rearmed)" / "Crash Bandicoot (duckstation)". */
+static const char *pastime_source_short_label(const pastime_source_t *src)
+{
+   if (!src)
+      return NULL;
+   if (src->core_ident && *src->core_ident)
+      return src->core_ident;
+   if (src->external && src->external->shortname
+         && *src->external->shortname)
+      return src->external->shortname;
+   if (src->external && src->external->package)
+      return src->external->package;
+   return NULL;
+}
+
+/* pastime_disambig_source_label_fn — bound by pastime_scan_roms when
+ * it calls pastime_disambig_run.  `user` is the system whose sources
+ * the row indices key into. */
+static const char *pastime_disambig_resolve_source_label(
+      uint8_t source_idx, void *user)
+{
+   const pastime_system_t *sys = (const pastime_system_t*)user;
+   if (!sys || source_idx >= sys->source_count)
+      return NULL;
+   return pastime_source_short_label(&sys->sources[source_idx]);
+}
+
+
+/* Scan all sources of an overlaid system for ROMs.  Top-level files
+ * only; .zip and other archives included since libretro cores read
+ * them directly via the VFS layer.  Multi-source duplicates are NOT
+ * dropped at scan time — they're collected here and disambiguated by
+ * pastime_disambig_run (in pastime/pastime_disambig.c) in a second
+ * pass, so the user sees both copies labelled with their differing
+ * attribute (source name for cross-source collisions, tag-tail
+ * differential for intra-source). */
 static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
       size_t *out_count)
 {
    pastime_rom_t *roms  = NULL;
    size_t         cap   = 0;
    size_t         count = 0;
-   size_t         src_i, i, j;
+   size_t         src_i, i;
 
    *out_count = 0;
    if (!sys || !sys->sources || sys->source_count == 0)
@@ -1139,7 +1200,6 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
          const char *full = raw->elems[i].data;
          char        base[NAME_MAX_LENGTH];
          char       *display;
-         bool        is_dup = false;
 
          if (!full || !*full)
             continue;
@@ -1149,33 +1209,6 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
          pastime_display_name_strip_rom_extension(base);
          if (!*base)
             continue;
-
-         /* First-source-wins dedup.  Compare against already-collected
-          * ROMs from earlier sources by basename (extension included
-          * via the un-stripped raw filename — but our stripped `base`
-          * is what we render, so dedupe on that for user-visible
-          * uniqueness).  O(N*M) in the worst case; rom counts per
-          * system are small enough that a hash isn't worth it. */
-         for (j = 0; j < count; j++)
-         {
-            char other_base[NAME_MAX_LENGTH];
-            fill_pathname_base(other_base, roms[j].full_path,
-                  sizeof(other_base));
-            pastime_display_name_strip_rom_extension(other_base);
-            if (string_is_equal(other_base, base))
-            {
-               is_dup = true;
-               break;
-            }
-         }
-         if (is_dup)
-         {
-            RARCH_LOG("[Pastime] '%s' shadowed by source[%u] in merged "
-                  "system '%s' (this source[%u] entry skipped)\n",
-                  base, (unsigned)roms[j].source_idx,
-                  sys->display_name, (unsigned)src_i);
-            continue;
-         }
 
          if (count == cap)
          {
@@ -1190,13 +1223,16 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
          {
             char       *path_dup;
             char       *sort_dup;
+            char       *tag_dup = NULL;
             char        clean[NAME_MAX_LENGTH];
+            char        tag[NAME_MAX_LENGTH];
             char        sort_buf[NAME_MAX_LENGTH];
             /* Strip No-Intro / Redump trailing tags here so the user
-             * sees "Super Mario Bros. 3" not "...(USA) (Rev A)".
-             * sort_key folds case + drops a leading article so
-             * "The Legend of Zelda" sorts under L. */
-            pastime_display_name_clean(base, clean, sizeof(clean));
+             * sees "Super Mario Bros. 3" not "...(USA) (Rev A)".  The
+             * tag itself is preserved on the side so the disambig
+             * pass can re-attach it on collision. */
+            pastime_display_name_clean_keep_tag(base, clean, sizeof(clean),
+                  tag, sizeof(tag));
             if (!*clean)
                continue;
             pastime_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
@@ -1213,10 +1249,18 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
                free(sort_dup);
                break;
             }
+            if (*tag && !(tag_dup = strdup(tag)))
+            {
+               free(display);
+               free(sort_dup);
+               free(path_dup);
+               break;
+            }
             memset(&roms[count], 0, sizeof(roms[count]));
             roms[count].display_name = display;
             roms[count].sort_key     = sort_dup;
             roms[count].full_path    = path_dup;
+            roms[count].tag          = tag_dup;
             roms[count].source_idx   = (uint8_t)src_i;
             gfx_thumbnail_init_blank(&roms[count].thumbnail);
             /* image_w/image_h left zero by memset — populated by the
@@ -1231,6 +1275,28 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
 
    if (count > 1)
       qsort(roms, count, sizeof(*roms), pastime_rom_cmp);
+   /* Hand off to the disambig module to rewrite duplicate labels
+    * with minimum qualifiers.  We build a small array of refs over
+    * our roms[]; the source-label resolver pulls from sys->sources
+    * via pastime_source_short_label(). */
+   if (count >= 2)
+   {
+      pastime_disambig_row_t *drows = (pastime_disambig_row_t*)malloc(
+            count * sizeof(*drows));
+      if (drows)
+      {
+         size_t k;
+         for (k = 0; k < count; k++)
+         {
+            drows[k].display_name = &roms[k].display_name;
+            drows[k].tag          = roms[k].tag;
+            drows[k].source_idx   = roms[k].source_idx;
+         }
+         pastime_disambig_run(drows, count,
+               pastime_disambig_resolve_source_label, (void*)sys);
+         free(drows);
+      }
+   }
 
    *out_count = count;
    return roms;

@@ -170,12 +170,89 @@ void pastime_display_name_strip_rom_extension(char *name)
 void pastime_display_name_clean(const char *raw,
       char *out, size_t out_size)
 {
+   pastime_display_name_clean_keep_tag(raw, out, out_size, NULL, 0);
+}
+
+/* Find the start of the trailing run of "(...)" / "[...]" blocks in s.
+ * Returns strlen(s) when there's no trailing tag.  The substring from
+ * the returned offset to strlen(s) is the tag verbatim (including any
+ * inter-block whitespace).  Defensive against unbalanced brackets:
+ * stops walking left if we can't find a matching opener. */
+static size_t dp_find_trailing_tag_start(const char *s)
+{
+   size_t end;
+   size_t cur;
+
+   if (!s)
+      return 0;
+   end = strlen(s);
+   /* Trim trailing whitespace from the search position so a name like
+    * "Foo (USA) " still finds the trailing block. */
+   while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+      end--;
+   cur = end;
+   while (cur > 0)
+   {
+      char   close = s[cur - 1];
+      char   open;
+      size_t k;
+      if (close == ')')      open = '(';
+      else if (close == ']') open = '[';
+      else                   break;
+      /* Walk left for the matching opener.  Won't traverse past the
+       * start of the string. */
+      k = cur - 1;
+      while (k > 0 && s[k - 1] != open)
+         k--;
+      if (k == 0 || s[k - 1] != open)
+         break;        /* unmatched closer → not a tag we trust */
+      cur = k - 1;
+      /* Allow multiple "(USA) (Rev 1)" blocks separated by spaces. */
+      while (cur > 0 && (s[cur - 1] == ' ' || s[cur - 1] == '\t'))
+         cur--;
+   }
+   return cur;
+}
+
+void pastime_display_name_clean_keep_tag(const char *raw,
+      char *out, size_t out_size,
+      char *tag_out, size_t tag_size)
+{
    size_t len;
 
-   if (!out || out_size == 0)
-      return;
-   out[0] = '\0';
+   if (out && out_size > 0)
+      out[0] = '\0';
+   if (tag_out && tag_size > 0)
+      tag_out[0] = '\0';
    if (!raw || !*raw)
+      return;
+
+   /* Capture the trailing tag (verbatim, with brackets) before any
+    * cleanup runs.  Skip the leading whitespace separator so the tag
+    * starts at its first '(' / '['. */
+   if (tag_out && tag_size > 0)
+   {
+      size_t tag_start = dp_find_trailing_tag_start(raw);
+      size_t raw_len   = strlen(raw);
+      while (tag_start < raw_len
+            && (raw[tag_start] == ' ' || raw[tag_start] == '\t'))
+         tag_start++;
+      if (tag_start < raw_len)
+      {
+         size_t tag_len = raw_len - tag_start;
+         /* Trim trailing whitespace so we don't carry a dangling space. */
+         while (tag_len > 0
+               && (raw[tag_start + tag_len - 1] == ' '
+                   || raw[tag_start + tag_len - 1] == '\t'))
+            tag_len--;
+         if (tag_len >= tag_size)
+            tag_len = tag_size - 1;
+         memcpy(tag_out, raw + tag_start, tag_len);
+         tag_out[tag_len] = '\0';
+      }
+   }
+
+   if (!out || out_size == 0)
       return;
 
    len = strlen(raw);

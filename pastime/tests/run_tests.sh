@@ -50,6 +50,13 @@ $CC $CFLAGS $INC \
     -o test_display_name
 BUILT+=(test_display_name)
 
+# --- ROM-row label disambiguation ---
+echo "== building test_disambig"
+$CC $CFLAGS $INC \
+    test_disambig.c ../pastime_disambig.c \
+    -o test_disambig
+BUILT+=(test_disambig)
+
 # --- cores extras table ---
 echo "== building test_cores_extras"
 $CC $CFLAGS $INC \

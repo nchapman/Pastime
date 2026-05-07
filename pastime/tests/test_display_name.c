@@ -28,6 +28,17 @@ static void clean_eq(const char *raw, const char *want)
    ASSERT_STR_EQ(buf, want);
 }
 
+static void clean_keep_tag_eq(const char *raw,
+      const char *want_clean, const char *want_tag)
+{
+   char clean[128];
+   char tag[128];
+   pastime_display_name_clean_keep_tag(raw, clean, sizeof(clean),
+         tag, sizeof(tag));
+   ASSERT_STR_EQ(clean, want_clean);
+   ASSERT_STR_EQ(tag,   want_tag);
+}
+
 static void sort_eq(const char *display, const char *want)
 {
    char buf[128];
@@ -159,6 +170,47 @@ static void test_clean_truncates_oversize_input(void)
    ASSERT_STR_EQ(tight, "Super M");
 }
 
+static void test_clean_keep_tag_basic(void)
+{
+   /* Single trailing parens block. */
+   clean_keep_tag_eq("Super Mario Bros. 3 (USA)",
+         "Super Mario Bros. 3", "(USA)");
+   /* Multiple bracketed tags collapse into one tag string. */
+   clean_keep_tag_eq("Super Mario Bros. 3 (USA) (Rev A)",
+         "Super Mario Bros. 3", "(USA) (Rev A)");
+   /* Mixed parens + brackets. */
+   clean_keep_tag_eq("Sonic the Hedgehog (USA) [!]",
+         "Sonic the Hedgehog", "(USA) [!]");
+   /* No tag → empty tag_out, clean unchanged. */
+   clean_keep_tag_eq("Super Mario Bros.", "Super Mario Bros.", "");
+   /* The disambig case the system-overlay pass needs. */
+   clean_keep_tag_eq("Ape Escape (USA)",
+         "Ape Escape", "(USA)");
+   clean_keep_tag_eq("Ape Escape (USA) (Demo 1)",
+         "Ape Escape", "(USA) (Demo 1)");
+}
+
+static void test_clean_keep_tag_null_tag_out(void)
+{
+   /* tag_out NULL must not crash; clean side still works. */
+   char buf[64];
+   pastime_display_name_clean_keep_tag("Foo (USA)", buf, sizeof(buf),
+         NULL, 0);
+   ASSERT_STR_EQ(buf, "Foo");
+}
+
+static void test_clean_keep_tag_unmatched(void)
+{
+   /* Unmatched closer at end → not treated as a tag.  Bracket-strip
+    * leaves the unmatched fragment alone (per existing semantics) so
+    * the cleaned form keeps it; tag_out stays empty. */
+   char clean[64];
+   char tag[64];
+   pastime_display_name_clean_keep_tag("Mystery Game )broken",
+         clean, sizeof(clean), tag, sizeof(tag));
+   ASSERT_STR_EQ(tag, "");
+}
+
 static void test_clean_folder_name_convention(void)
 {
    /* The launcher feeds folder names like "GBA (mgba)" through
@@ -287,6 +339,9 @@ int main(void)
    test_clean_rotation_at_buffer_boundary();
    test_clean_truncates_oversize_input();
    test_clean_folder_name_convention();
+   test_clean_keep_tag_basic();
+   test_clean_keep_tag_null_tag_out();
+   test_clean_keep_tag_unmatched();
    test_sort_lowercase();
    test_sort_strips_articles();
    test_sort_empty();

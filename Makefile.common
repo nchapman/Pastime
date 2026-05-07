@@ -1092,6 +1092,7 @@ ifeq ($(HAVE_MENU), 1)
       OBJ += pastime/pastime_nav.o
       OBJ += pastime/pastime_metadata_disambig.o
       OBJ += pastime/pastime_display_name.o
+      OBJ += pastime/pastime_disambig.o
       OBJ += pastime/pastime_thumbs.o
       OBJ += pastime/pastime_thumbs_index.o
       OBJ += pastime/pastime_thumbhash.o

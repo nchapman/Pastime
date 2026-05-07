@@ -32,6 +32,21 @@ extern "C" {
 void pastime_display_name_clean(const char *raw,
       char *out, size_t out_size);
 
+/* Like pastime_display_name_clean, but also returns the original tag
+ * suffix — the contiguous trailing run of "(...)" / "[...]" blocks that
+ * was stripped, preserved verbatim with their delimiters and joined
+ * with single spaces ("(USA) (Rev 1)").  `tag_out` may be empty when
+ * `raw` had no trailing brackets.  Used by the system-overlay disambig
+ * pass: when two ROMs in a merged system collapse to the same cleaned
+ * display, appending the tag distinguishes them ("Ape Escape" vs
+ * "Ape Escape (Demo 1)").
+ *
+ * Safe with NULL/empty `raw` or `tag_out`; either output buffer can be
+ * NULL if the caller doesn't need that side. */
+void pastime_display_name_clean_keep_tag(const char *raw,
+      char *out, size_t out_size,
+      char *tag_out, size_t tag_size);
+
 /* Strip the file extension from a ROM basename in place.  Removes the
  * trailing ".<ext>", and additionally peels a residual ".p8" so that
  * PICO-8 PNG-encoded carts ("Celeste.p8.png") collapse to "Celeste"
