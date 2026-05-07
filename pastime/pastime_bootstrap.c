@@ -30,19 +30,65 @@
 static const char PASTIME_README[] =
    "Pastime - Roms folder\n"
    "\n"
-   "Drop one folder per system here.  The folder name must end with the\n"
-   "libretro core ident in parentheses, e.g.:\n"
+   "Drop one folder per system here.  The folder name must end with a\n"
+   "backend marker in parentheses, e.g.:\n"
    "\n"
-   "  Super Nintendo (snes9x)/\n"
+   "  Super Nintendo Entertainment System (snes9x)/\n"
    "  Game Boy Advance (mgba)/\n"
-   "  Sega Genesis (genesis_plus_gx)/\n"
+   "  PlayStation 2 (ext-aethersx2)/\n"
    "\n"
-   "Folders without the (corename) suffix are hidden.  The core is\n"
-   "downloaded from the libretro buildbot the first time you launch a\n"
-   "game in that folder; you do not install cores manually.\n"
+   "  (corename)        - libretro core; downloaded from the libretro\n"
+   "                      buildbot the first time you launch a game.\n"
+   "  (ext-shortname)   - external Android app (e.g. ext-aethersx2,\n"
+   "                      ext-dolphin, ext-azahar).  Folder is hidden\n"
+   "                      if the app is not installed.\n"
    "\n"
-   "Multiple folders can target the same core (e.g. an \"official\"\n"
-   "library and a \"hacks\" library both using mgba).\n";
+   "Folders without a marker are hidden.  Multiple folders can target\n"
+   "the same backend (e.g. an \"official\" library and a \"hacks\"\n"
+   "library both using mgba); folders that share a display name are\n"
+   "merged into one row in the launcher.\n";
+
+/* First-run system folders.  Seeded once when the README is created;
+ * deleting a folder later does not bring it back.  Names match the
+ * English Wikipedia article title for each system. */
+static const char *PASTIME_DEFAULT_SYSTEM_FOLDERS[] = {
+   /* Nintendo */
+   "Game Boy (gambatte)",
+   "Game Boy Color (gambatte)",
+   "Game Boy Advance (mgba)",
+   "Nintendo Entertainment System (mesen)",
+   "Super Nintendo Entertainment System (snes9x)",
+   "Nintendo 64 (mupen64plus_next)",
+   "Nintendo DS (melondsds)",
+   "Nintendo 3DS (ext-azahar)",
+   "GameCube (ext-dolphin)",
+   "Wii (ext-dolphin)",
+   "Virtual Boy (mednafen_vb)",
+   /* Sega */
+   "Master System (genesis_plus_gx)",
+   "Game Gear (genesis_plus_gx)",
+   "Sega Genesis (genesis_plus_gx)",
+   "Sega CD (genesis_plus_gx)",
+   "32X (picodrive)",
+   "Sega Saturn (mednafen_saturn)",
+   "Dreamcast (flycast)",
+   /* Sony */
+   "PlayStation (swanstation)",
+   "PlayStation Portable (ppsspp)",
+   "PlayStation 2 (ext-aethersx2)",
+   /* Other */
+   "Arcade (fbneo)",
+   "Neo Geo (fbneo)",
+   "TurboGrafx-16 (mednafen_pce)",
+   "TurboGrafx-CD (mednafen_pce)",
+   "Neo Geo Pocket (mednafen_ngp)",
+   "Neo Geo Pocket Color (mednafen_ngp)",
+   "WonderSwan (mednafen_wswan)",
+   "WonderSwan Color (mednafen_wswan)",
+   "Atari 2600 (stella)",
+   "Atari 7800 (prosystem)",
+   "Atari Lynx (mednafen_lynx)",
+};
 
 static void pastime_ensure_dir(const char *parent, const char *leaf)
 {
@@ -80,12 +126,18 @@ void pastime_bootstrap(void)
    pastime_ensure_dir(root, "Saves");
    pastime_ensure_dir(root, "States");
 
-   /* Drop the convention README into Roms/ on first launch.  Don't
-    * overwrite — the user might have edited it. */
+   /* Drop the convention README into Roms/ on first launch, and seed
+    * the default system folders the same time.  README presence is the
+    * first-run sentinel — once it exists, we never re-seed, so users
+    * can delete folders without them coming back. */
    fill_pathname_join_special(roms,   root, "Roms",       sizeof(roms));
    fill_pathname_join_special(readme, roms, "README.txt", sizeof(readme));
    if (!path_is_valid(readme))
    {
+      size_t i;
+      for (i = 0; i < ARRAY_SIZE(PASTIME_DEFAULT_SYSTEM_FOLDERS); i++)
+         pastime_ensure_dir(roms, PASTIME_DEFAULT_SYSTEM_FOLDERS[i]);
+
       if (!filestream_write_file(readme,
                PASTIME_README, (int64_t)(sizeof(PASTIME_README) - 1)))
          RARCH_WARN("[Pastime] bootstrap: failed to write %s\n", readme);
