@@ -15,6 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Install the NDK *before* pinning JDK 11.  Recent sdkmanager
+      # versions are compiled for Java 17+ and crash with
+      # UnsupportedClassVersionError under JDK 11.  ubuntu-24.04's
+      # default JDK is fine for sdkmanager; gradle's JDK 11 pin is set
+      # in the next step.
+      - name: Install NDK r26.1
+        run: |
+          set -e
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125"
+
       # Pinned to match pkg/android/phoenix/.mise.toml — AGP 4.2 + Gradle
       # 6.7.1 require JDK 8 or 11; JDK 17+ breaks processManifest.
       - name: Set up JDK 11
@@ -22,15 +33,6 @@ jobs:
         with:
           java-version: '11'
           distribution: 'temurin'
-
-      # ndkVersion in build.gradle is r26.1.10909125 (PASTIME-marked bump
-      # from upstream's r22, which lacks an arm64 macOS host).  AGP picks
-      # this up automatically when it's installed under $ANDROID_SDK_ROOT.
-      - name: Install NDK r26.1
-        run: |
-          set -e
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125"
 
       - name: Build aarch64 debug APK
         working-directory: pkg/android/phoenix
