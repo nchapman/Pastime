@@ -60,9 +60,9 @@ static const char *PASTIME_DEFAULT_SYSTEM_FOLDERS[] = {
    "Super Nintendo Entertainment System (snes9x)",
    "Nintendo 64 (mupen64plus_next)",
    "Nintendo DS (melondsds)",
-   "Nintendo 3DS (ext-azahar)",
-   "GameCube (ext-dolphin)",
-   "Wii (ext-dolphin)",
+   "Nintendo 3DS (citra)",
+   "GameCube (dolphin)",
+   "Wii (dolphin)",
    "Virtual Boy (mednafen_vb)",
    /* Sega */
    "Master System (genesis_plus_gx)",
@@ -75,7 +75,7 @@ static const char *PASTIME_DEFAULT_SYSTEM_FOLDERS[] = {
    /* Sony */
    "PlayStation (swanstation)",
    "PlayStation Portable (ppsspp)",
-   "PlayStation 2 (ext-aethersx2)",
+   "PlayStation 2 (pcsx2)",
    /* Other */
    "Arcade (fbneo)",
    "Neo Geo (fbneo)",
