@@ -44,7 +44,12 @@ android {
     }
     targetSdkVersion 28
     versionCode System.currentTimeSeconds().toInteger()
-    versionName "${getManifestAttribute("versionName")}_GIT"
+    /* PASTIME: tagged releases pass -PRELEASE_VERSION_NAME=<tag> so the
+     * APK's versionName reflects the Pastime tag rather than the upstream
+     * RetroArch manifest version. */
+    versionName project.hasProperty("RELEASE_VERSION_NAME") \
+      ? RELEASE_VERSION_NAME \
+      : "${getManifestAttribute("versionName")}_GIT"
   }
 
   productFlavors {
