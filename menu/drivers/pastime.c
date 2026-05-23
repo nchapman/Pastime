@@ -2804,32 +2804,16 @@ static void pastime_draw_title_pill(gfx_display_t *p_disp, void *userdata,
          clean, sizeof(clean));
 }
 
-/* Build the status-pill text from RA's built-in helpers: "HH:MM"
- * (or "HH:MM AM/PM") + battery, where battery is "NN%" / "NN% AC"
- * (charging) / "AC" (no battery, e.g. desktop builds).  Two-space
- * gap so the two halves read as separate elements.  Time format
- * tracks settings->uints.menu_timedate_style — set by the global
- * Settings menu's Clock Format row.  Date+time styles fall back to
- * 24-hour time-only since the pill has no room for a date. */
+/* Build the status-pill text from RA's built-in helpers: battery
+ * percentage, "NN%" / "NN% AC" (charging) / "AC" (no battery, e.g.
+ * desktop builds). */
 static void pastime_build_status_text(char *out, size_t len)
 {
-   settings_t *settings = config_get_ptr();
    gfx_display_ctx_powerstate_t ps;
-   gfx_display_ctx_datetime_t dt;
-   char time_buf[16];
    /* menu_display_powerstate writes a "NN%" string we don't use (we
     * read the struct fields instead) but it requires a non-NULL
     * buffer.  One byte is enough — snprintf truncates to fit. */
    char discard[1];
-
-   time_buf[0] = '\0';
-
-   dt.time_mode      = (settings && settings->uints.menu_timedate_style
-                          == MENU_TIMEDATE_STYLE_HM_AMPM)
-                       ? MENU_TIMEDATE_STYLE_HM_AMPM
-                       : MENU_TIMEDATE_STYLE_HM;
-   dt.date_separator = MENU_TIMEDATE_DATE_SEPARATOR_HYPHEN;
-   menu_display_timedate(&dt, time_buf, sizeof(time_buf));
 
    ps.battery_enabled = false;
    ps.percent         = 0;
@@ -2839,12 +2823,12 @@ static void pastime_build_status_text(char *out, size_t len)
    if (ps.battery_enabled)
    {
       if (ps.charging)
-         snprintf(out, len, "%s  %u%% AC", time_buf, ps.percent);
+         snprintf(out, len, "%u%% AC", ps.percent);
       else
-         snprintf(out, len, "%s  %u%%", time_buf, ps.percent);
+         snprintf(out, len, "%u%%", ps.percent);
    }
    else
-      snprintf(out, len, "%s  AC", time_buf);
+      snprintf(out, len, "AC");
 }
 
 /* Width of the rendered status pill — useful to callers (e.g. the
@@ -4536,23 +4520,6 @@ static void dp_global_swap_ab_on_change(int delta, void *userdata)
    dp_global_persist();
 }
 
-/* Two-state mapping: 0 → 24-hour (HM), 1 → 12-hour (HM_AMPM).
- * Overwrites any pre-existing date+time style — Pastime's status
- * pill is time-only, and we don't expose the full upstream
- * timedate menu, so this is the only sanctioned way to set it. */
-static void dp_global_clock_on_change(int delta, void *userdata)
-{
-   pastime_handle_t *dp = (pastime_handle_t*)userdata;
-   settings_t        *s  = config_get_ptr();
-   (void)delta;
-   if (!dp || !s)
-      return;
-   s->uints.menu_timedate_style = (dp_global_active_idx(dp) == 1)
-         ? MENU_TIMEDATE_STYLE_HM_AMPM
-         : MENU_TIMEDATE_STYLE_HM;
-   dp_global_persist();
-}
-
 static void dp_global_scale_on_change(int delta, void *userdata)
 {
    pastime_handle_t *dp = (pastime_handle_t*)userdata;
@@ -4597,7 +4564,6 @@ static pastime_settings_list_t *pastime_build_global_settings_list(
       pastime_handle_t *dp)
 {
    static const char * const off_on[]    = { "Off", "On" };
-   static const char * const clock_lab[] = { "24-hour", "12-hour" };
 
    pastime_settings_list_t *L;
    pastime_settings_row_t  *r;
@@ -4605,7 +4571,7 @@ static pastime_settings_list_t *pastime_build_global_settings_list(
    if (!s)
       return NULL;
    dp_global_scale_labels_build();
-   L = pastime_settings_list_new("Settings", 3, 0, 60);
+   L = pastime_settings_list_new("Settings", 2, 0, 60);
    if (!L)
       return NULL;
 
@@ -4619,16 +4585,6 @@ static pastime_settings_list_t *pastime_build_global_settings_list(
    r->userdata     = dp;
 
    r               = &L->rows[1];
-   r->title        = "Clock Format";
-   r->desc         = "How the status clock is displayed.";
-   r->values       = clock_lab;
-   r->values_count = 2;
-   r->idx_value    = (s->uints.menu_timedate_style
-                        == MENU_TIMEDATE_STYLE_HM_AMPM) ? 1 : 0;
-   r->on_change    = dp_global_clock_on_change;
-   r->userdata     = dp;
-
-   r               = &L->rows[2];
    r->title        = "Menu Scale";
    r->desc         = "Size of menu text and controls.";
    r->values       = dp_global_scale_labels;
