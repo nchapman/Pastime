@@ -4717,16 +4717,28 @@ static bool config_load_file(global_t *global,
     * live settings.  config_save_on_exit is forced off so retroarch.cfg
     * never reflects our defaults; without this hook, any path that
     * reloads the cfg mid-session (config_unload_override on game exit,
-    * CMD_EVENT_RELOAD_CONFIG, the override-stack reloads in
-    * config_load_override) would revert OSD suppression, video
+    * CMD_EVENT_RELOAD_CONFIG) would revert OSD suppression, video
     * aspect/integer scaling, paths, save-state booleans etc.  Most
     * visible symptom: modern widget toasts re-appear after game exit.
     *
     * Skipped on first_load — the boot path is already wired to call
     * pastime_defaults_apply explicitly in retroarch_main_init,
     * paired with pastime_bootstrap.  Skipped when loading into a
-    * scratch settings_t (e.g. config_save_overrides's diff source). */
-   if (!first_load && settings == config_st)
+    * scratch settings_t (e.g. config_save_overrides's diff source).
+    * Skipped when CONFIG_OVERRIDE is non-empty — an override stack
+    * was just applied on top of the base config (per the loop at
+    * line 4010), and re-applying defaults here would stomp the
+    * user's saved per-core / per-game settings.  No !without_overrides
+    * guard needed alongside (matching the line 4010 condition): that
+    * branch loads into a scratch settings_t (config_save_overrides's
+    * diff source), so the settings == config_st gate above already
+    * excludes it.  The override-unload path clears CONFIG_OVERRIDE
+    * before reloading the base config (see config_unload_override),
+    * so this gate doesn't suppress the "restore Pastime defaults on
+    * game exit" behavior the hook exists for. */
+   if (     !first_load
+         && settings == config_st
+         && path_is_empty(RARCH_PATH_CONFIG_OVERRIDE))
       pastime_defaults_apply();
    first_load = false;
    return true;
