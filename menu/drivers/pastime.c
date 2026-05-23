@@ -6642,8 +6642,12 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          {
             if (dp->recents && dp->nav.selection < dp->recent_row_count)
             {
+               /* Launching from recents bumps the played ROM to row 0
+                * of the recents list, so return the cursor to row 0
+                * (the now-topmost entry) rather than the row the user
+                * launched from — that row now holds a different ROM. */
                dp->launch_return_view      = PASTIME_VIEW_RECENTS;
-               dp->launch_return_selection = dp->nav.selection;
+               dp->launch_return_selection = 0;
                dp->launch_return_armed     = true;
                pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
             }
@@ -6836,16 +6840,17 @@ static void pastime_menu_context_destroy(void *data)
     * hold lists whose row data may include pointers into the core
     * options manager (RA-owned, possibly torn down before us); a
     * CONFIRM frame on top would leak its heap-allocated side payload
-    * if pop_all stopped at it.  pop_to(TOP) catches everything. */
+    * if pop_all stopped at it.  pop_to(TOP) catches everything.
+    *
+    * Deliberately does NOT clear launch_return_armed.  Context
+    * teardown firing on game launch (Android Vulkan handoff to the
+    * core) is the very mechanism that flattens the stack mid-game
+    * and breaks "return to launch context" without the stash; if we
+    * cleared the stash here too, the restore in pastime_sync_ingame
+    * could never fire.  The stash is bound to "the next !running
+    * frame with view==TOP", which is always the exit of whatever
+    * core was running — no risk of firing on an unrelated exit. */
    dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
-   /* Drop any pending launch-return stash too: context teardown is
-    * the "reset all transient driver state" site, and an armed
-    * stash surviving into a fresh driver session could fire on a
-    * later unrelated exit.  pop_to(TOP) above clears it indirectly
-    * for SYSTEM/RECENTS-on-stack (via the close_* disarms), but
-    * not when INGAME is on top — which is the common context-loss
-    * case mid-game. */
-   dp->launch_return_armed = false;
    gfx_display_deinit_white_texture();
 }
 
