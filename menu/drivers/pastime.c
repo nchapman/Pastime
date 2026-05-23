@@ -3626,11 +3626,12 @@ static pastime_settings_list_t *pastime_build_stub_list(const char *title)
  * "shader not found" errors. */
 
 /* The Screen Scaling row is a 2-axis cycler over (PAR × scaling
- * discipline), plus two outliers.  Six logical modes:
+ * discipline), plus two outliers.  Seven logical modes:
  *
  *   DP_SCALING_ASPECT          CORE   PAR + fractional
  *   DP_SCALING_NATIVE          CORE   PAR + integer underscale
  *   DP_SCALING_FULLSCREEN      FULL stretch (no PAR)
+ *   DP_SCALING_CROPPED         CORE   PAR + integer overscale (clip)
  *   DP_SCALING_ASPECT_SQUARE   SQUARE PAR + fractional
  *   DP_SCALING_NATIVE_SQUARE   SQUARE PAR + integer underscale
  *   DP_SCALING_CROPPED_SQUARE  SQUARE PAR + integer overscale (clip)
@@ -3639,7 +3640,7 @@ static pastime_settings_list_t *pastime_build_stub_list(const char *title)
  * DAR differs from the source's natural DAR (i.e. core PAR ≠ 1:1).
  * On square-PAR cores (GB, GBA, NDS) those three rows would all
  * produce identical pictures to their CORE-PAR siblings, so we
- * suppress them for a 3-row list.  On non-square cores the SQUARE
+ * suppress them for a 4-row list.  On non-square cores the SQUARE
  * variants are labeled with the source DAR (e.g. "Aspect (8:7)") so
  * the user can see exactly which ratio they're picking. */
 enum dp_scaling_mode
@@ -3647,12 +3648,13 @@ enum dp_scaling_mode
    DP_SCALING_ASPECT          = 0,
    DP_SCALING_NATIVE          = 1,
    DP_SCALING_FULLSCREEN      = 2,
-   DP_SCALING_ASPECT_SQUARE   = 3,
-   DP_SCALING_NATIVE_SQUARE   = 4,
-   DP_SCALING_CROPPED_SQUARE  = 5
+   DP_SCALING_CROPPED         = 3,
+   DP_SCALING_ASPECT_SQUARE   = 4,
+   DP_SCALING_NATIVE_SQUARE   = 5,
+   DP_SCALING_CROPPED_SQUARE  = 6
 };
 
-#define DP_SCALING_MODE_MAX 6
+#define DP_SCALING_MODE_MAX 7
 /* "Aspect (NN:NN)" — 8 base + up to 11 ratio = ~20 chars; +slack. */
 #define DP_SCALING_LABEL_MAX 28
 
@@ -3725,6 +3727,8 @@ static enum dp_scaling_mode dp_frontend_scaling_current_mode(void)
             == VIDEO_SCALE_INTEGER_SCALING_OVERSCALE);
       if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_CORE && !over)
          return DP_SCALING_NATIVE;
+      if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_CORE && over)
+         return DP_SCALING_CROPPED;
       if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE && !over)
          return DP_SCALING_NATIVE_SQUARE;
       if (s->uints.video_aspect_ratio_idx == ASPECT_RATIO_SQUARE && over)
@@ -3753,6 +3757,12 @@ static void dp_frontend_scaling_apply(enum dp_scaling_mode mode)
       case DP_SCALING_FULLSCREEN:
          s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_FULL;
          s->bools.video_scale_integer        = false;
+         break;
+      case DP_SCALING_CROPPED:
+         s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_CORE;
+         s->bools.video_scale_integer        = true;
+         s->uints.video_scale_integer_scaling
+                                             = VIDEO_SCALE_INTEGER_SCALING_OVERSCALE;
          break;
       case DP_SCALING_ASPECT_SQUARE:
          s->uints.video_aspect_ratio_idx     = ASPECT_RATIO_SQUARE;
@@ -4158,44 +4168,48 @@ static pastime_settings_list_t *pastime_build_frontend_list(
    scaling_ud->mode[1]   = DP_SCALING_NATIVE;
    scaling_ud->labels[2] = "Fullscreen";
    scaling_ud->mode[2]   = DP_SCALING_FULLSCREEN;
-   scaling_ud->count     = 3;
+   scaling_ud->labels[3] = "Cropped";
+   scaling_ud->mode[3]   = DP_SCALING_CROPPED;
+   scaling_ud->count     = 4;
 
    /* Square-PAR variants — only when the core's pixels actually differ
     * from square (otherwise these would be visual duplicates of the
     * common rows above). */
    if (show_sq)
    {
-      snprintf(scaling_ud->storage[3], DP_SCALING_LABEL_MAX,
-            "Aspect (%u:%u)", square_w, square_h);
-      scaling_ud->labels[3] = scaling_ud->storage[3];
-      scaling_ud->mode[3]   = DP_SCALING_ASPECT_SQUARE;
       snprintf(scaling_ud->storage[4], DP_SCALING_LABEL_MAX,
-            "Native (%u:%u)", square_w, square_h);
+            "Aspect (%u:%u)", square_w, square_h);
       scaling_ud->labels[4] = scaling_ud->storage[4];
-      scaling_ud->mode[4]   = DP_SCALING_NATIVE_SQUARE;
+      scaling_ud->mode[4]   = DP_SCALING_ASPECT_SQUARE;
       snprintf(scaling_ud->storage[5], DP_SCALING_LABEL_MAX,
-            "Cropped (%u:%u)", square_w, square_h);
+            "Native (%u:%u)", square_w, square_h);
       scaling_ud->labels[5] = scaling_ud->storage[5];
-      scaling_ud->mode[5]   = DP_SCALING_CROPPED_SQUARE;
-      scaling_ud->count     = 6;
+      scaling_ud->mode[5]   = DP_SCALING_NATIVE_SQUARE;
+      snprintf(scaling_ud->storage[6], DP_SCALING_LABEL_MAX,
+            "Cropped (%u:%u)", square_w, square_h);
+      scaling_ud->labels[6] = scaling_ud->storage[6];
+      scaling_ud->mode[6]   = DP_SCALING_CROPPED_SQUARE;
+      scaling_ud->count     = 7;
    }
 
    /* Map the current settings_t state back to a row idx.  When the
     * SQUARE block is suppressed (square-PAR core, or migrating from an
     * older Pastime where Native wrote SQUARE+integer+UNDERSCALE), any
     * SQUARE-flavor mode in settings_t has no row to display.  Remap
-    * each to its CORE-PAR sibling for the search — visually identical
-    * on a square-PAR core, and the rendered picture matches the
-    * displayed label.  The first user-driven cycle re-applies the
-    * canonical settings_t state for that row. */
+    * each to its CORE-PAR sibling (ASPECT_SQUARE→ASPECT,
+    * NATIVE_SQUARE→NATIVE, CROPPED_SQUARE→CROPPED) — visually
+    * identical on a square-PAR core, and the rendered picture
+    * matches the displayed label.  The first user-driven cycle
+    * re-applies the canonical settings_t state for that row. */
    cur_mode = dp_frontend_scaling_current_mode();
    if (!show_sq)
    {
       if (cur_mode == DP_SCALING_ASPECT_SQUARE)
          cur_mode = DP_SCALING_ASPECT;
-      else if (cur_mode == DP_SCALING_NATIVE_SQUARE
-            || cur_mode == DP_SCALING_CROPPED_SQUARE)
+      else if (cur_mode == DP_SCALING_NATIVE_SQUARE)
          cur_mode = DP_SCALING_NATIVE;
+      else if (cur_mode == DP_SCALING_CROPPED_SQUARE)
+         cur_mode = DP_SCALING_CROPPED;
    }
    {
       size_t cur_idx = 0;
@@ -4211,7 +4225,8 @@ static pastime_settings_list_t *pastime_build_frontend_list(
       r              = &L->rows[out_row++];
       r->title       = "Screen Scaling";
       r->desc        = "Aspect fits the screen; Native is integer-"
-                       "scaled; Fullscreen stretches.  Parenthesized "
+                       "scaled; Fullscreen stretches; Cropped fills "
+                       "the screen, clipping edges.  Parenthesized "
                        "variants use 1:1 pixels.";
       r->values      = scaling_ud->labels;
       r->values_count = scaling_ud->count;
