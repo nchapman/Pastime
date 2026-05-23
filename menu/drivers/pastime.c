@@ -431,6 +431,22 @@ struct pastime_handle_s
    char                pending_launch_core[PATH_MAX_LENGTH];
    char                pending_launch_rom[PATH_MAX_LENGTH];
 
+   /* Where the user was when they kicked off the current launch.
+    * Captured at OK time on a ROM row; consumed by pastime_sync_ingame
+    * after the core exits, to restore the launcher to the same view
+    * plus cursor.  Static analysis says the nav stack would already
+    * carry that frame across the INGAME push/pop, but in practice
+    * something flattens it mid-game (likely Android GPU context loss
+    * triggering pastime_menu_context_destroy's pop_to(TOP)).  The
+    * stash works regardless of which mechanism is the culprit.
+    * Armed by launch, cleared by restore or by user navigation in
+    * the launcher (so a stale stash can't fire on a later unrelated
+    * exit). */
+   enum pastime_view  launch_return_view;        /* SYSTEM or RECENTS */
+   size_t              launch_return_system_idx;  /* valid iff view==SYSTEM */
+   size_t              launch_return_selection;   /* cursor row to restore */
+   bool                launch_return_armed;
+
    /* INGAME view row composition.  Built on the running→ingame
     * transition (and refreshed after a Save action), so row_label and
     * OK dispatch read the same array.  ingame_action_count is in
@@ -1914,6 +1930,11 @@ static void pastime_open_recents(pastime_handle_t *dp)
 
 static void pastime_close_recents(pastime_handle_t *dp)
 {
+   /* User backed out of RECENTS manually — drop any pending launch-
+    * return stash so a later unrelated game exit doesn't snap them
+    * back here.  Safe to clear unconditionally; the restore path
+    * re-arms via its OK handler. */
+   dp->launch_return_armed = false;
    dp_nav_pop(&dp->nav);
 }
 
@@ -2072,6 +2093,10 @@ static void pastime_open_system(pastime_handle_t *dp, size_t sys_idx)
 
 static void pastime_close_system(pastime_handle_t *dp)
 {
+   /* User backed out of SYSTEM manually — drop any pending launch-
+    * return stash so a later unrelated game exit doesn't snap them
+    * back here. */
+   dp->launch_return_armed = false;
    dp_nav_pop(&dp->nav);
 }
 
@@ -2211,10 +2236,15 @@ static void pastime_rebuild_lists(pastime_handle_t *dp)
    /* If a future caller triggers rebuild while drilled in, snap back
     * to TOP — active_system / cached recents would otherwise index
     * into stale arrays.  Each frame's dispose hook handles its own
-    * cleanup (roms/recents free). */
+    * cleanup (roms/recents free).  Also drop the launch-return stash:
+    * after a rebuild the cached system_idx may point at a different
+    * folder (or none).  Today this only fires from init where the
+    * stash is always clear; the disarm here is for a mid-session
+    * rebuild trigger added later. */
    if (dp->nav.view == PASTIME_VIEW_SYSTEM
          || dp->nav.view == PASTIME_VIEW_RECENTS)
       dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
+   dp->launch_return_armed = false;
 
    /* directory_menu_content is stored verbatim — RA doesn't expand "~" or
     * ":/" prefixes for this setting (see configuration.c).  Expand here so
@@ -5752,6 +5782,58 @@ static void pastime_sync_ingame(pastime_handle_t *dp)
        * not affected. */
       dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
    }
+
+   /* Restore launcher position after the core exits.  Armed at OK
+    * time on a ROM row; consumed here once the runloop has settled
+    * back into "no core" (dummy is the post-unload steady state)
+    * and the nav stack has been flattened to TOP.  If the stack
+    * still carries the launcher frame (the static-analysis-says-
+    * preferred case where nothing wiped it), this branch's view!=TOP
+    * gate is false and we leave the existing frame alone — no
+    * double-push.  The unconditional disarm at the bottom of the
+    * block fires regardless of which switch arm ran (or none, on
+    * out-of-range system_idx), so a single firing of the restore
+    * always consumes the stash. */
+   if (dp->launch_return_armed
+         && !running
+         && dp->nav.view == PASTIME_VIEW_TOP)
+   {
+      switch (dp->launch_return_view)
+      {
+         case PASTIME_VIEW_SYSTEM:
+            /* Out-of-range system_idx (folder deleted, list rebuilt
+             * mid-game): silently fall through and clear the stash
+             * below.  TOP is the right fallback — there's nowhere
+             * else meaningful to land. */
+            if (dp->launch_return_system_idx < dp->system_count)
+            {
+               size_t sel;
+               pastime_open_system(dp, dp->launch_return_system_idx);
+               sel = dp->launch_return_selection;
+               if (dp->rom_count == 0)
+                  sel = 0;
+               else if (sel >= dp->rom_count)
+                  sel = dp->rom_count - 1;
+               dp_nav_set_selection(&dp->nav, sel);
+            }
+            break;
+         case PASTIME_VIEW_RECENTS:
+         {
+            size_t sel;
+            pastime_open_recents(dp);
+            sel = dp->launch_return_selection;
+            if (dp->recent_row_count == 0)
+               sel = 0;
+            else if (sel >= dp->recent_row_count)
+               sel = dp->recent_row_count - 1;
+            dp_nav_set_selection(&dp->nav, sel);
+            break;
+         }
+         default:
+            break;
+      }
+      dp->launch_return_armed = false;
+   }
 }
 
 /* What the frame should render.  Setup activity (cores + content
@@ -6246,8 +6328,11 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          {
             /* Drop any pending lazy launch so a cancelled lazy install
              * returns to the menu instead of auto-launching when the
-             * in-flight task completes. */
+             * in-flight task completes.  Also disarm the launch-return
+             * stash so a later unrelated exit doesn't snap them back
+             * to the ROM they decided not to launch. */
             pastime_clear_pending_launch(dp);
+            dp->launch_return_armed = false;
             pastime_setup_cancel();
          }
          return 0;
@@ -6522,6 +6607,13 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
              * system.  source_idx is bounded by source_count at scan
              * time; no runtime check needed. */
             src = &sys->sources[rom->source_idx];
+            /* Capture launcher position so post-exit sync can restore
+             * us to this same SYSTEM list with the cursor on the ROM
+             * we just played.  See launch_return_* on pastime_handle_t. */
+            dp->launch_return_view       = PASTIME_VIEW_SYSTEM;
+            dp->launch_return_system_idx = dp->active_system;
+            dp->launch_return_selection  = dp->nav.selection;
+            dp->launch_return_armed      = true;
             /* core_ident vs external is mutually exclusive per source —
              * parser invariant.  External launches are fire-and-forget;
              * the Java helper surfaces toast on failure. */
@@ -6534,7 +6626,12 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          if (dp->nav.view == PASTIME_VIEW_RECENTS)
          {
             if (dp->recents && dp->nav.selection < dp->recent_row_count)
+            {
+               dp->launch_return_view      = PASTIME_VIEW_RECENTS;
+               dp->launch_return_selection = dp->nav.selection;
+               dp->launch_return_armed     = true;
                pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
+            }
             return 0;
          }
          /* TOP view: Resume → recents-launch the head; Recents → open;
@@ -6546,6 +6643,12 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
             {
                if (sel == 0)
                {
+                  /* Resume plays head of recents; on exit, return the
+                   * user to the Recents list with cursor on the just-
+                   * played ROM (always at row 0 after the launch). */
+                  dp->launch_return_view      = PASTIME_VIEW_RECENTS;
+                  dp->launch_return_selection = 0;
+                  dp->launch_return_armed     = true;
                   pastime_launch_recent(dp->resume_pl_idx);
                   return 0;
                }
@@ -6720,6 +6823,14 @@ static void pastime_menu_context_destroy(void *data)
     * CONFIRM frame on top would leak its heap-allocated side payload
     * if pop_all stopped at it.  pop_to(TOP) catches everything. */
    dp_nav_pop_to(&dp->nav, PASTIME_VIEW_TOP);
+   /* Drop any pending launch-return stash too: context teardown is
+    * the "reset all transient driver state" site, and an armed
+    * stash surviving into a fresh driver session could fire on a
+    * later unrelated exit.  pop_to(TOP) above clears it indirectly
+    * for SYSTEM/RECENTS-on-stack (via the close_* disarms), but
+    * not when INGAME is on top — which is the common context-loss
+    * case mid-game. */
+   dp->launch_return_armed = false;
    gfx_display_deinit_white_texture();
 }
 
