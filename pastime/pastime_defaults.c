@@ -303,6 +303,15 @@ void pastime_defaults_apply(void)
    settings->bools.menu_enable_widgets              = false;
    settings->bools.video_font_enable                = false;
 
+   /* Long-list nav: with menu_scroll_fast off (RA default) the cursor
+    * advances at most one row per repeat tick, which feels constant-
+    * speed on a 200-ROM list even though the framework is already
+    * auto-accelerating the repeat rate.  Flipping this on raises the
+    * acceleration cap (menu_driver.c:5382) so the per-tick step
+    * scales to multiple rows under a sustained hold, giving the
+    * LessUI "chew through a long list quickly" feel. */
+   settings->bools.menu_scroll_fast = true;
+
    if (!pastime_paths_get_root(root, sizeof(root)))
    {
       RARCH_WARN("[Pastime] could not resolve Pastime/ root; "
