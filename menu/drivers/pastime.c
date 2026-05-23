@@ -414,6 +414,13 @@ struct pastime_handle_s
    /* Cached: rows in the current view (TOP: recents header + systems;
     * SYSTEM: rom_count). */
    size_t              total_rows;
+   /* Cached visible-row capacity of the launcher list, written each
+    * frame by pastime_draw_list().  Read by the entry-action handler
+    * for L/R page jumps so the page size matches what the user
+    * actually sees.  Zero-initialized; the `page <= 1 ? 1` guard in
+    * the handler makes page-jumps before the first draw behave as
+    * single-row steps rather than no-ops. */
+   size_t              list_visible_rows;
    /* Lazy-install handoff (PLAN.md M3 Flow B): set when the user picks a
     * ROM whose core isn't installed.  The cores module takes over the
     * frame (splash), and pastime_drive_pending_launch finishes the
@@ -5222,6 +5229,9 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
          scroll = dp->total_rows - visible;
    }
 
+   /* Cache for the entry-action handler's L/R page-jump math. */
+   dp->list_visible_rows = visible;
+
    /* Right-pane preview FIRST so it sits *under* the row pills/text.
     * The selected row's full-width pill deliberately overlaps the
     * image area (LessUI parity); for that overlap to read as the pill
@@ -6201,6 +6211,13 @@ restore_viewport:
  * generic_menu_entry_action() (which assumes file_list_t-driven entries)
  * isn't useful — we mutate dp->nav.selection directly and consume the action.
  * OK/CANCEL just log for now; real navigation targets land in M3+. */
+/* Adapter from pastime_row_label() into the dp_nav_label_fn
+ * signature used by dp_nav_letter_jump.  The void* is the handle. */
+static const char *pastime_nav_label_adapter(void *user, size_t row)
+{
+   return pastime_row_label((const pastime_handle_t*)user, row);
+}
+
 static int pastime_entry_action(void *userdata, menu_entry_t *entry,
       size_t i, enum menu_action action)
 {
@@ -6275,6 +6292,30 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
             S->sel = (S->sel + 1) % S->row_count;
             pastime_settings_snap_scroll(dp, S);
             return 0;
+         case MENU_ACTION_SCROLL_UP:
+         case MENU_ACTION_SCROLL_DOWN:
+         {
+            /* Settings rows don't have a stable alphabetic ordering
+             * (they're grouped semantically), so letter jumps would
+             * be confusing — treat SCROLL_UP/DOWN as page jumps
+             * regardless of the framework scroll-mode flag.  Page
+             * size mirrors the launcher: visible window minus one
+             * row of overlap. */
+            int    dir  = (action == MENU_ACTION_SCROLL_DOWN) ? +1 : -1;
+            size_t vis  = pastime_settings_visible_rows(dp, S);
+            size_t page = (vis > 1) ? vis - 1 : 1;
+            S->sel = dp_nav_page_jump(S->sel, S->row_count, page, dir);
+            pastime_settings_snap_scroll(dp, S);
+            return 0;
+         }
+         case MENU_ACTION_SCROLL_HOME:
+            S->sel = 0;
+            pastime_settings_snap_scroll(dp, S);
+            return 0;
+         case MENU_ACTION_SCROLL_END:
+            S->sel = S->row_count - 1;
+            pastime_settings_snap_scroll(dp, S);
+            return 0;
          case MENU_ACTION_LEFT:
          case MENU_ACTION_RIGHT:
          {
@@ -6330,6 +6371,56 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
       case MENU_ACTION_DOWN:
          dp_nav_set_selection(&dp->nav,
                (dp->nav.selection + 1) % dp->total_rows);
+         return 0;
+      case MENU_ACTION_LEFT:
+      case MENU_ACTION_RIGHT:
+      {
+         /* D-pad LEFT/RIGHT as page jump on launcher lists — LessUI
+          * muscle memory.  SETTINGS view already consumed LEFT/RIGHT
+          * above (option cycling), so this only fires on TOP / SYSTEM /
+          * RECENTS / SAVE_PICKER / INGAME.  Same page-size math as the
+          * shoulder-button page jump below. */
+         int    dir  = (action == MENU_ACTION_RIGHT) ? +1 : -1;
+         size_t page = dp->list_visible_rows;
+         if (page <= 1) page = 1;
+         else           page -= 1;
+         dp_nav_set_selection(&dp->nav,
+               dp_nav_page_jump(dp->nav.selection, dp->total_rows,
+                     page, dir));
+         return 0;
+      }
+      case MENU_ACTION_SCROLL_UP:
+      case MENU_ACTION_SCROLL_DOWN:
+      {
+         /* Framework convention (see menu_driver.c): L/R defaults to
+          * PAGE, L2/R2 to LETTER (swapped by the input_menu_swap_scroll
+          * setting).  The action delivered is the same SCROLL_UP /
+          * SCROLL_DOWN regardless; the mode flag tells us which.  Both
+          * jumps are clamped — no wrap — so fast-scrolling stops at
+          * either edge instead of skipping back across the list. */
+         struct menu_state *menu_st = menu_state_get_ptr();
+         int                dir     = (action == MENU_ACTION_SCROLL_DOWN)
+                                      ? +1 : -1;
+         size_t             target;
+         if (menu_st->scroll.mode == MENU_SCROLL_START_LETTER)
+            target = dp_nav_letter_jump(dp->nav.selection, dp->total_rows,
+                  dir, pastime_nav_label_adapter, dp);
+         else
+         {
+            size_t page = dp->list_visible_rows;
+            if (page <= 1) page = 1;
+            else           page -= 1;   /* leave one row of overlap */
+            target = dp_nav_page_jump(dp->nav.selection, dp->total_rows,
+                  page, dir);
+         }
+         dp_nav_set_selection(&dp->nav, target);
+         return 0;
+      }
+      case MENU_ACTION_SCROLL_HOME:
+         dp_nav_set_selection(&dp->nav, 0);
+         return 0;
+      case MENU_ACTION_SCROLL_END:
+         dp_nav_set_selection(&dp->nav, dp->total_rows - 1);
          return 0;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:

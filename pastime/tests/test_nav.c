@@ -111,6 +111,23 @@ static void recording_dispose(void *user, void *side)
          g_fail - g_test_fail_at_start); \
 } while (0)
 
+/* ---------- letter-jump label provider ---------- */
+
+/* Static row table used by the letter-jump tests.  Stored as a
+ * pointer the tests can swap with `letter_rows = <ptr>; letter_count
+ * = N;` before calling dp_nav_letter_jump.  Adapter matches
+ * dp_nav_label_fn. */
+static const char *const *letter_rows;
+static size_t            letter_count;
+
+static const char *letter_label(void *user, size_t row)
+{
+   (void)user;
+   if (row >= letter_count)
+      return NULL;
+   return letter_rows[row];
+}
+
 /* ============================================================
  * Tests — every test takes (state, user).
  * ============================================================ */
@@ -452,6 +469,231 @@ static void test_top_returns_correct_frame(
    ASSERT_PTR_EQ(t, &s->nav[1]);
 }
 
+/* ---- page jump ---- */
+
+static void test_page_jump_empty_list(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_page_jump(0, 0, 10, +1), 0);
+   ASSERT_EQ(dp_nav_page_jump(0, 0, 10, -1), 0);
+}
+
+static void test_page_jump_down_basic(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_page_jump(0,  100, 10, +1), 10);
+   ASSERT_EQ(dp_nav_page_jump(10, 100, 10, +1), 20);
+   ASSERT_EQ(dp_nav_page_jump(50, 100,  5, +1), 55);
+}
+
+static void test_page_jump_down_clamps_to_end(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_page_jump(95, 100, 10, +1), 99);
+   ASSERT_EQ(dp_nav_page_jump(99, 100, 10, +1), 99);
+   ASSERT_EQ(dp_nav_page_jump( 0,   1, 10, +1),  0);
+}
+
+static void test_page_jump_up_basic(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_page_jump(50, 100, 10, -1), 40);
+   ASSERT_EQ(dp_nav_page_jump(99, 100,  5, -1), 94);
+}
+
+static void test_page_jump_up_clamps_to_zero(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_page_jump(5,  100, 10, -1), 0);
+   ASSERT_EQ(dp_nav_page_jump(10, 100, 10, -1), 0);
+   ASSERT_EQ(dp_nav_page_jump(0,  100, 10, -1), 0);
+}
+
+static void test_page_jump_zero_page_treated_as_one(dp_nav_state_t *s,
+      test_user_t *u)
+{
+   (void)s; (void)u;
+   /* Defensive against a stale list_visible_rows of 0 (e.g. input
+    * arriving before first draw) — must still advance by one rather
+    * than no-op. */
+   ASSERT_EQ(dp_nav_page_jump(5, 100, 0, +1), 6);
+   ASSERT_EQ(dp_nav_page_jump(5, 100, 0, -1), 4);
+}
+
+/* ---- letter bucket ---- */
+
+static void test_letter_bucket_basics(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_first_letter_bucket("Adventure"), 'A');
+   ASSERT_EQ(dp_nav_first_letter_bucket("Zelda"),     'Z');
+   ASSERT_EQ(dp_nav_first_letter_bucket("Mario"),     'M');
+}
+
+static void test_letter_bucket_articles_stripped(dp_nav_state_t *s,
+      test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_first_letter_bucket("The Legend of Zelda"), 'L');
+   ASSERT_EQ(dp_nav_first_letter_bucket("the legend of zelda"), 'L');
+   ASSERT_EQ(dp_nav_first_letter_bucket("A Boy and His Blob"),  'B');
+   ASSERT_EQ(dp_nav_first_letter_bucket("An Untitled Story"),   'U');
+   /* "Apple" — leading 'A' is NOT an article (no trailing space),
+    * so the bucket is just 'A'.  Guards against an over-eager skip
+    * that would mistake any leading 'A' for the article. */
+   ASSERT_EQ(dp_nav_first_letter_bucket("Apple"), 'A');
+   /* Degenerate "A " (article + nothing): no real ROM name looks
+    * like this, but the function must not read past the buffer.
+    * After the skip we're on '\0', which returns '\0'. */
+   ASSERT_EQ(dp_nav_first_letter_bucket("A "), '\0');
+}
+
+static void test_letter_bucket_digit_bucket(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_first_letter_bucket("3D World"), '#');
+   ASSERT_EQ(dp_nav_first_letter_bucket("007"),      '#');
+}
+
+static void test_letter_bucket_null_and_empty(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_first_letter_bucket(NULL), '\0');
+   ASSERT_EQ(dp_nav_first_letter_bucket(""),   '\0');
+   ASSERT_EQ(dp_nav_first_letter_bucket("   "), '\0');
+   ASSERT_EQ(dp_nav_first_letter_bucket("---"), '\0');
+}
+
+static void test_letter_bucket_lowercase_folds(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_first_letter_bucket("mario"), 'M');
+   ASSERT_EQ(dp_nav_first_letter_bucket("zelda"), 'Z');
+}
+
+static void test_letter_bucket_skips_punctuation(dp_nav_state_t *s,
+      test_user_t *u)
+{
+   (void)s; (void)u;
+   ASSERT_EQ(dp_nav_first_letter_bucket("  Mario"),  'M');
+   ASSERT_EQ(dp_nav_first_letter_bucket("[BIOS] X"), 'B');
+}
+
+/* ---- letter jump ---- */
+
+static void test_letter_jump_empty_list(dp_nav_state_t *s, test_user_t *u)
+{
+   (void)s; (void)u;
+   letter_rows  = NULL;
+   letter_count = 0;
+   ASSERT_EQ(dp_nav_letter_jump(0, 0, +1, letter_label, NULL), 0);
+   ASSERT_EQ(dp_nav_letter_jump(0, 0, -1, letter_label, NULL), 0);
+}
+
+static void test_letter_jump_forward_advances_bucket(dp_nav_state_t *s,
+      test_user_t *u)
+{
+   static const char *const rows[] = {
+      "Adventure", "Asteroids", "Boom Blox", "Castlevania", "Castlevania II"
+   };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 5;
+   /* Sitting on A0 → next bucket starts at row 2 (B). */
+   ASSERT_EQ(dp_nav_letter_jump(0, 5, +1, letter_label, NULL), 2);
+   /* On A1 → still jumps to row 2. */
+   ASSERT_EQ(dp_nav_letter_jump(1, 5, +1, letter_label, NULL), 2);
+   /* On B → jumps to first C. */
+   ASSERT_EQ(dp_nav_letter_jump(2, 5, +1, letter_label, NULL), 3);
+}
+
+static void test_letter_jump_forward_no_next_clamps_to_end(
+      dp_nav_state_t *s, test_user_t *u)
+{
+   static const char *const rows[] = { "Alpha", "Beta", "Beta II" };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 3;
+   /* From last bucket — no further bucket exists, snap to end. */
+   ASSERT_EQ(dp_nav_letter_jump(1, 3, +1, letter_label, NULL), 2);
+   ASSERT_EQ(dp_nav_letter_jump(2, 3, +1, letter_label, NULL), 2);
+}
+
+static void test_letter_jump_single_bucket(dp_nav_state_t *s, test_user_t *u)
+{
+   static const char *const rows[] = { "Mario", "Mega Man", "Metal Slug" };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 3;
+   /* All 'M' — forward from any non-last row snaps to end (the
+    * "gesture isn't dead" fallback documented on dp_nav_letter_jump);
+    * from the last row it's a no-op. */
+   ASSERT_EQ(dp_nav_letter_jump(0, 3, +1, letter_label, NULL), 2);
+   ASSERT_EQ(dp_nav_letter_jump(2, 3, +1, letter_label, NULL), 2);
+   /* Backward from mid snaps to section top (row 0); from row 0 is
+    * a no-op since there's no earlier bucket. */
+   ASSERT_EQ(dp_nav_letter_jump(2, 3, -1, letter_label, NULL), 0);
+   ASSERT_EQ(dp_nav_letter_jump(0, 3, -1, letter_label, NULL), 0);
+}
+
+static void test_letter_jump_back_snaps_to_section_top(dp_nav_state_t *s,
+      test_user_t *u)
+{
+   static const char *const rows[] = {
+      "Alpha", "Apex", "Beta", "Bowser", "Bravo"
+   };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 5;
+   /* On row 4 (third B) → snap to top of B section (row 2). */
+   ASSERT_EQ(dp_nav_letter_jump(4, 5, -1, letter_label, NULL), 2);
+   ASSERT_EQ(dp_nav_letter_jump(3, 5, -1, letter_label, NULL), 2);
+   ASSERT_EQ(dp_nav_letter_jump(1, 5, -1, letter_label, NULL), 0);
+}
+
+static void test_letter_jump_back_from_section_top_jumps_to_prev_section(
+      dp_nav_state_t *s, test_user_t *u)
+{
+   static const char *const rows[] = {
+      "Alpha", "Apex", "Beta", "Bowser", "Charlie"
+   };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 5;
+   /* Already at B top (row 2) → walk back to A top (row 0). */
+   ASSERT_EQ(dp_nav_letter_jump(2, 5, -1, letter_label, NULL), 0);
+   /* Already at C top (row 4) → walk back to B top (row 2). */
+   ASSERT_EQ(dp_nav_letter_jump(4, 5, -1, letter_label, NULL), 2);
+}
+
+static void test_letter_jump_back_at_start_returns_zero(dp_nav_state_t *s,
+      test_user_t *u)
+{
+   static const char *const rows[] = { "Alpha", "Beta" };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 2;
+   ASSERT_EQ(dp_nav_letter_jump(0, 2, -1, letter_label, NULL), 0);
+}
+
+static void test_letter_jump_with_articles(dp_nav_state_t *s, test_user_t *u)
+{
+   /* "The Legend of Zelda" buckets as L, not T — letter jumps
+    * should respect the article strip so the alphabet feel matches
+    * sorted display order. */
+   static const char *const rows[] = {
+      "Kirby's Adventure",       /* K */
+      "The Legend of Zelda",     /* L (article stripped) */
+      "Mario Bros"               /* M */
+   };
+   (void)s; (void)u;
+   letter_rows  = rows;
+   letter_count = 3;
+   ASSERT_EQ(dp_nav_letter_jump(0, 3, +1, letter_label, NULL), 1);
+   ASSERT_EQ(dp_nav_letter_jump(1, 3, +1, letter_label, NULL), 2);
+   ASSERT_EQ(dp_nav_letter_jump(2, 3, -1, letter_label, NULL), 1);
+}
+
 /* ---- NULL after_change ---- */
 
 /* These bypass the RUN_TEST macro because it always wires a real
@@ -528,6 +770,29 @@ int main(void)
    RUN_TEST(test_nested_push_pop_preserves_each_parent);
 
    RUN_TEST(test_top_returns_correct_frame);
+
+   RUN_TEST(test_page_jump_empty_list);
+   RUN_TEST(test_page_jump_down_basic);
+   RUN_TEST(test_page_jump_down_clamps_to_end);
+   RUN_TEST(test_page_jump_up_basic);
+   RUN_TEST(test_page_jump_up_clamps_to_zero);
+   RUN_TEST(test_page_jump_zero_page_treated_as_one);
+
+   RUN_TEST(test_letter_bucket_basics);
+   RUN_TEST(test_letter_bucket_articles_stripped);
+   RUN_TEST(test_letter_bucket_digit_bucket);
+   RUN_TEST(test_letter_bucket_null_and_empty);
+   RUN_TEST(test_letter_bucket_lowercase_folds);
+   RUN_TEST(test_letter_bucket_skips_punctuation);
+
+   RUN_TEST(test_letter_jump_empty_list);
+   RUN_TEST(test_letter_jump_forward_advances_bucket);
+   RUN_TEST(test_letter_jump_forward_no_next_clamps_to_end);
+   RUN_TEST(test_letter_jump_single_bucket);
+   RUN_TEST(test_letter_jump_back_snaps_to_section_top);
+   RUN_TEST(test_letter_jump_back_from_section_top_jumps_to_prev_section);
+   RUN_TEST(test_letter_jump_back_at_start_returns_zero);
+   RUN_TEST(test_letter_jump_with_articles);
 
    test_null_after_change_is_safe();
 

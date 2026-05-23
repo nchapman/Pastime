@@ -126,6 +126,50 @@ enum pastime_view dp_nav_root_view(const dp_nav_state_t *s);
  * intended cursor. */
 void dp_nav_set_selection(dp_nav_state_t *s, size_t sel);
 
+/* ---------- list navigation helpers (pure) ----------
+ *
+ * These are stateless math used by the entry-action handler to
+ * implement long-list conveniences (page jumps, alphabet jumps,
+ * top/bottom).  Kept here (rather than inline in the menu driver)
+ * so they can be unit-tested without dragging in any RA state. */
+
+/* Page jump: shift `cur` by `page` rows in direction `dir`
+ * (+1 = down, -1 = up), clamped to [0, total-1].  Does NOT wrap —
+ * fast-scrolling past either edge should stop, not jump to the
+ * opposite end (matches LessUI; wrap on single-row UP/DOWN remains
+ * the caller's choice). `page` of 0 is treated as 1. `total` of 0
+ * returns 0. */
+size_t dp_nav_page_jump(size_t cur, size_t total, size_t page, int dir);
+
+/* Letter-bucket key for `label`.  Skips leading non-alphanumerics
+ * and articles ("The ", "A ", "An "), then returns an uppercase
+ * ASCII letter ('A'..'Z') if the next char is alpha, '#' if it's a
+ * digit, or '\0' for an empty/all-skipped label.  NULL → '\0'.
+ * Pure ASCII fold — non-ASCII bytes are passed through as-is so
+ * the comparison still partitions consistently within a language. */
+char dp_nav_first_letter_bucket(const char *label);
+
+/* Label accessor for letter-jump: row index → display label.
+ * Returning NULL is fine and treated as an empty label. */
+typedef const char *(*dp_nav_label_fn)(void *user, size_t row);
+
+/* Letter jump: scan rows for the next/prev bucket boundary.
+ *
+ *   dir > 0 → first row whose bucket differs from cur's bucket
+ *             when walking forward; if there is none, returns
+ *             total-1 (snap to end so the gesture isn't dead).
+ *   dir < 0 → the FIRST row of the previous bucket (i.e. walk back
+ *             to a different bucket, then walk back further to its
+ *             first row).  If cur is not already at the first row
+ *             of its own bucket, the first back-press snaps to that
+ *             instead (matches the common "back to top of section,
+ *             then to previous section" feel).  If no earlier
+ *             bucket exists, returns 0.
+ *
+ * total of 0 returns 0.  label may be NULL (treated as empty). */
+size_t dp_nav_letter_jump(size_t cur, size_t total, int dir,
+      dp_nav_label_fn label, void *user);
+
 RETRO_END_DECLS
 
 #endif
