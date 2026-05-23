@@ -222,3 +222,110 @@ bool pastime_external_android_is_installed(const char *package)
    (*env)->DeleteLocalRef(env, j_pkg);
    return result == JNI_TRUE;
 }
+
+/* Toggle the Android status bar between visible (launcher) and hidden
+ * (core running).  Fire-and-forget — Java side posts the immersive
+ * reapply onto the UI thread.  Caller (menu/drivers/pastime.c) gates
+ * on transition so this is called only when the desired state actually
+ * changes, but the Java side is also cheap if called redundantly. */
+#define PASTIME_IMMERSIVE_METHOD_NAME "pastimeSetLauncherImmersive"
+#define PASTIME_IMMERSIVE_METHOD_SIG  "(Z)V"
+
+static jmethodID g_immersive_id;
+static bool      g_immersive_missing;
+
+void pastime_android_set_launcher_immersive(bool launcher_mode)
+{
+   JNIEnv *env;
+   jobject activity;
+   jclass  activity_class;
+
+   if (g_immersive_missing)
+      return;
+   if (!(activity = pastime_jni_get_activity_clazz()))
+      return;
+   if (!(env = jni_thread_getenv()))
+      return;
+
+   if (!g_immersive_id)
+   {
+      activity_class = (*env)->GetObjectClass(env, activity);
+      if (!activity_class)
+         return;
+      g_immersive_id = (*env)->GetMethodID(env, activity_class,
+            PASTIME_IMMERSIVE_METHOD_NAME, PASTIME_IMMERSIVE_METHOD_SIG);
+      (*env)->DeleteLocalRef(env, activity_class);
+      if (!g_immersive_id)
+      {
+         if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+         g_immersive_missing = true;
+         RARCH_WARN("[Pastime] Java helper "
+               PASTIME_IMMERSIVE_METHOD_NAME " not found "
+               "(stale APK?); status bar toggling disabled.\n");
+         return;
+      }
+   }
+
+   (*env)->CallVoidMethod(env, activity, g_immersive_id,
+         (jboolean)(launcher_mode ? JNI_TRUE : JNI_FALSE));
+   if ((*env)->ExceptionCheck(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+   }
+}
+
+/* Resources.getDimensionPixelSize on android:dimen/status_bar_height —
+ * the canonical "how many pixels does the status bar occupy" answer.
+ * Returns 0 on any failure path (caller can then skip its inset). */
+#define PASTIME_STATUSBAR_METHOD_NAME "pastimeGetStatusBarHeight"
+#define PASTIME_STATUSBAR_METHOD_SIG  "()I"
+
+static jmethodID g_statusbar_id;
+static bool      g_statusbar_missing;
+
+int pastime_android_get_status_bar_height(void)
+{
+   JNIEnv *env;
+   jobject activity;
+   jclass  activity_class;
+   jint    result = 0;
+
+   if (g_statusbar_missing)
+      return 0;
+   if (!(activity = pastime_jni_get_activity_clazz()))
+      return 0;
+   if (!(env = jni_thread_getenv()))
+      return 0;
+
+   if (!g_statusbar_id)
+   {
+      activity_class = (*env)->GetObjectClass(env, activity);
+      if (!activity_class)
+         return 0;
+      g_statusbar_id = (*env)->GetMethodID(env, activity_class,
+            PASTIME_STATUSBAR_METHOD_NAME, PASTIME_STATUSBAR_METHOD_SIG);
+      (*env)->DeleteLocalRef(env, activity_class);
+      if (!g_statusbar_id)
+      {
+         if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+         g_statusbar_missing = true;
+         RARCH_WARN("[Pastime] Java helper "
+               PASTIME_STATUSBAR_METHOD_NAME " not found "
+               "(stale APK?); top inset will be zero.\n");
+         return 0;
+      }
+   }
+
+   result = (*env)->CallIntMethod(env, activity, g_statusbar_id);
+   if ((*env)->ExceptionCheck(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+      return 0;
+   }
+   return (int)result;
+}
+

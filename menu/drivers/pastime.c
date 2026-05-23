@@ -336,8 +336,8 @@ typedef struct
     * Future enhancement (deferred): an auto-fit row-count algorithm
     * that picks `row_h` so an integer number of rows fills the
     * available vertical space — eliminates the trailing gap on small
-    * screens.  Sketch: target_h = 56*scale, available = vid_h - 2*
-    * margin_y - 2*row_h (title strip + footer); n = round(available /
+    * screens.  Sketch: target_h = 56*scale, available = vid_h -
+    * margin_top - margin_y - 2*row_h (title strip + footer); n = round(available /
     * target_h); row_h = available / n, clamped to [40,72]*scale.  Not
     * shipped yet because target devices have plenty of vertical room. */
    float scale;
@@ -358,7 +358,11 @@ typedef struct
    int pane_left;
 
    int margin_x;            /* outer horizontal padding */
-   int margin_y;            /* outer vertical padding (top + bottom) */
+   int margin_y;            /* outer vertical padding (bottom edge) */
+   int margin_top;          /* top padding — equals margin_y plus the
+                             * platform's system status-bar height so
+                             * launcher chrome doesn't tuck under it.
+                             * Zero on platforms without a system bar.  */
    int row_h;               /* unified row height — see invariant above */
    int row_text_indent;     /* x-inset of text inside a row */
    int chrome_pad_x;        /* horizontal padding inside chrome pills */
@@ -446,6 +450,13 @@ struct pastime_handle_s
    size_t              launch_return_system_idx;  /* valid iff view==SYSTEM */
    size_t              launch_return_selection;   /* cursor row to restore */
    bool                launch_return_armed;
+
+   /* Android status-bar toggle latch.  Tracks the launcher↔game state
+    * last pushed to the Java side so pastime_sync_ingame only calls
+    * the JNI bridge on transitions (the per-frame check itself is
+    * cheap, but redundant JNI hops aren't free).  -1 means "no value
+    * pushed yet" so the first sync always sends. */
+   int8_t              launcher_immersive_applied;
 
    /* INGAME view row composition.  Built on the running→ingame
     * transition (and refreshed after a Save action), so row_label and
@@ -557,14 +568,6 @@ struct pastime_handle_s
    /* Pre-formatted "Resume Foo" label, mutated only on rebuild. */
    char                resume_label[NAME_MAX_LENGTH];
 
-   /* Top-right status pill text — rebuilt once per frame in
-    * pastime_menu_frame from RA's powerstate + timedate helpers (both
-    * internally throttled).  Cached because the value is consumed in
-    * three places (the pill draw, the title-pill right limit, and the
-    * top-row max-width budget) and we want them all in sync within a
-    * single frame. */
-   char                status_text[32];
-
    /* First-run setup progress animation.  displayed lerps toward a
     * per-segment target each frame; the asymptotic curve (target - cur)
     * gives the bar a "moving but never quite full" feel within each
@@ -617,7 +620,6 @@ static float DP_COLOR_PILL_BG_GRAY[16] = {
    0.18f, 0.18f, 0.18f, 1.0f,   0.18f, 0.18f, 0.18f, 1.0f,
    0.18f, 0.18f, 0.18f, 1.0f,   0.18f, 0.18f, 0.18f, 1.0f
 };
-
 /* Cap texture is generated 1:1 (no scaling) at this size, then sampled
  * by the GPU when drawn into the actual pill cap area.  Larger source
  * = smoother arc + smaller relative AA fringe = cleaner join with the
@@ -2277,6 +2279,22 @@ static void pastime_rebuild_lists(pastime_handle_t *dp)
 
 /* ---------- layout ---------- */
 
+/* Pixel height of the platform's system status bar.  Android queries
+ * Resources.getIdentifier("status_bar_height"); other platforms return
+ * 0.  Cached after the first JNI call. */
+static int pastime_get_status_bar_height(void)
+{
+#ifdef ANDROID
+   extern int pastime_android_get_status_bar_height(void);
+   static int cached = -1;
+   if (cached < 0)
+      cached = pastime_android_get_status_bar_height();
+   return cached;
+#else
+   return 0;
+#endif
+}
+
 static void pastime_layout_recompute(pastime_layout_t *L,
       unsigned video_width, unsigned video_height,
       float user_scale_factor)
@@ -2316,8 +2334,9 @@ static void pastime_layout_recompute(pastime_layout_t *L,
       L->pane_left = (int)video_width - pane_w;
    }
 
-   L->margin_x         = (int)(24.0f  * scale);
-   L->margin_y         = (int)(24.0f  * scale);
+   L->margin_x         = (int)(12.0f  * scale);
+   L->margin_y         = (int)(12.0f  * scale);
+   L->margin_top       = L->margin_y + pastime_get_status_bar_height();
    L->row_h            = (int)(48.0f  * scale);
    L->row_text_indent  = (int)(16.0f  * scale);
    L->chrome_pad_x     = (int)(12.0f  * scale);
@@ -2800,73 +2819,10 @@ static void pastime_draw_title_pill(gfx_display_t *p_disp, void *userdata,
       max_w = height;
 
    pastime_draw_text_pill(p_disp, userdata, font, centre_offset, height,
-         L, cap_tex, L->margin_x, L->margin_y, max_w, L->row_text_indent,
+         L, cap_tex, L->margin_x, L->margin_top, max_w, L->row_text_indent,
          clean, sizeof(clean));
 }
 
-/* Build the status-pill text from RA's built-in helpers: battery
- * percentage, "NN%" / "NN% AC" (charging) / "AC" (no battery, e.g.
- * desktop builds). */
-static void pastime_build_status_text(char *out, size_t len)
-{
-   gfx_display_ctx_powerstate_t ps;
-   /* menu_display_powerstate writes a "NN%" string we don't use (we
-    * read the struct fields instead) but it requires a non-NULL
-    * buffer.  One byte is enough — snprintf truncates to fit. */
-   char discard[1];
-
-   ps.battery_enabled = false;
-   ps.percent         = 0;
-   ps.charging        = false;
-   menu_display_powerstate(&ps, discard, sizeof(discard));
-
-   if (ps.battery_enabled)
-   {
-      if (ps.charging)
-         snprintf(out, len, "%u%% AC", ps.percent);
-      else
-         snprintf(out, len, "%u%%", ps.percent);
-   }
-   else
-      snprintf(out, len, "AC");
-}
-
-/* Width of the rendered status pill — useful to callers (e.g. the
- * title pill) that need to reserve space for it without coupling to
- * its draw site.  Text is dp->status_text, recomputed once per
- * frame in pastime_menu_frame. */
-static int pastime_status_pill_width(font_data_t *font,
-      const pastime_layout_t *L, const char *text)
-{
-   int text_w = font_driver_get_message_width(font, text,
-         (unsigned)strlen(text), 1.0f);
-   int pill_w;
-   if (text_w < 0)
-      text_w = 0;
-   pill_w = text_w + 2 * L->chrome_pad_x;
-   if (pill_w < L->row_h)
-      pill_w = L->row_h;
-   return pill_w;
-}
-
-static void pastime_draw_status_pill(gfx_display_t *p_disp, void *userdata,
-      font_data_t *font, int centre_offset,
-      const pastime_layout_t *L, uintptr_t cap_tex, float *bg_color,
-      const char *text)
-{
-   /* Right-anchored: pill sized to text + padding (with a row-h floor
-    * so single-glyph values still look pill-shaped), positioned so its
-    * right edge sits on the right margin. */
-   int pill_w = pastime_status_pill_width(font, L, text);
-   int x      = (int)L->vid_w - L->margin_x - pill_w;
-   int text_y = pastime_baseline_y(L->margin_y, L->row_h, centre_offset);
-
-   pastime_draw_pill(p_disp, userdata, L, cap_tex,
-         x, L->margin_y, pill_w, L->row_h, bg_color);
-   pastime_draw_text(font, text,
-         (float)(x + pill_w / 2), (float)text_y,
-         L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
-}
 
 /* ---------- settings list (M8) ---------- */
 
@@ -3051,7 +3007,7 @@ static size_t pastime_settings_visible_rows(const pastime_handle_t *dp,
 {
    const pastime_layout_t *Ly = &dp->layout;
    int chev_z   = PASTIME_SETTINGS_CHEVRON_ZONE_PX(Ly);
-   int top_y    = Ly->margin_y + Ly->row_h + (int)(16.0f * Ly->scale)
+   int top_y    = Ly->margin_top + Ly->row_h + (int)(16.0f * Ly->scale)
                 + chev_z;
    int desc_h   = (int)(Ly->chrome_font_size * 2.4f);
    int bottom_y = (int)Ly->vid_h - Ly->margin_y - desc_h - chev_z;
@@ -3223,7 +3179,7 @@ static void pastime_draw_settings_view(gfx_display_t *p_disp, void *userdata,
     * with the status row or description band. */
    {
       int chev_z = PASTIME_SETTINGS_CHEVRON_ZONE_PX(L);
-      avail_top    = L->margin_y + L->row_h + (int)(16.0f * L->scale)
+      avail_top    = L->margin_top + L->row_h + (int)(16.0f * L->scale)
                    + chev_z;
       avail_bottom = (int)L->vid_h - L->margin_y - desc_band_h - chev_z;
       avail_h      = avail_bottom - avail_top;
@@ -5034,7 +4990,7 @@ static void pastime_draw_right_preview(gfx_display_t *p_disp, void *userdata,
     * the footer-hint band so the art reads as floating in the middle of
     * the chrome rather than crowding either edge. */
    int pane_gap    = (int)(16.0f * L->scale);
-   int pane_top    = L->margin_y + L->row_h + pane_gap;
+   int pane_top    = L->margin_top + L->row_h + pane_gap;
    int pane_bottom = (int)L->vid_h - L->margin_y - L->row_h - pane_gap;
    int pane_w      = pane_right  - pane_left;
    int pane_h      = pane_bottom - pane_top;
@@ -5158,7 +5114,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
     * to the (right-anchored, short) status pill, which sits beside
     * the left-anchored row 0. */
    bool     has_title  = (dp->nav.view == PASTIME_VIEW_INGAME);
-   int      list_top   = L->margin_y
+   int      list_top   = L->margin_top
                        + (has_title ? L->row_h : 0);
    int      list_x     = L->margin_x;
    int      row_max_w  = (int)L->vid_w - (2 * L->margin_x);
@@ -5193,11 +5149,14 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
                             || dp->nav.view == PASTIME_VIEW_SAVE_PICKER);
    int      pane_right      = (int)L->vid_w - L->margin_x;
    int      pane_full_w     = pane_right - L->pane_left;
-   /* Pane height matches the right-preview drawer (margin_y +/- a row
-    * + a 16*scale gap top/bottom).  Kept in sync there; this mirror
-    * is what determines the per-row reservation for SYSTEM. */
+   /* Pane height = vid_h - margin_top - margin_y - 2*row_h - 2*pane_gap
+    * (chrome row + one pane_gap at each edge).  Mirrors the calc in
+    * draw_right_preview — kept in sync there; this mirror is what
+    * determines the per-row reservation for SYSTEM. */
    int      pane_gap        = (int)(16.0f * L->scale);
-   int      pane_h          = (int)L->vid_h - 2 * (L->margin_y + L->row_h)
+   int      pane_h          = (int)L->vid_h
+                              - L->margin_top - L->margin_y
+                              - 2 * L->row_h
                             - 2 * pane_gap;
    /* SAVE_PICKER fallback width: image fills the full pane (square-ish
     * thumbnails — INTEGER-scale path in draw_right_preview).  One
@@ -5207,15 +5166,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
     * where the truncated text ends; we want a visible gap there. */
    int      row_max_w_full_pane = L->pane_left - L->margin_x
                                 - L->row_text_indent;
-   /* Top row shares its line with the status pill — shorten its max
-    * width by the pill width plus a margin's gap so a long title
-    * truncates instead of overlapping.  Skipped in INGAME because
-    * has_title pushes the list past that row entirely. */
-   int      top_row_max_w = has_title ? row_max_w
-         : (row_max_w
-            - pastime_status_pill_width(dp->chrome_font, L,
-                  dp->status_text)
-            - L->margin_x);
+   int      top_row_max_w = row_max_w;
    if (top_row_max_w < 0)
       top_row_max_w = 0;
    if (row_max_w_full_pane < 0)
@@ -5684,6 +5635,26 @@ static void pastime_drive_recents_thumbnails(pastime_handle_t *dp)
          upscale_thresh);
 }
 
+/* Push the desired Android status-bar state to the Java side when it
+ * changes.  Launcher (no core) → status bar visible; gameplay or
+ * in-game menu (core loaded) → fully immersive.  Latched on dp so
+ * repeated calls with the same state collapse to a no-op.  No-op on
+ * non-Android builds (helper isn't compiled in). */
+static void pastime_apply_immersive(pastime_handle_t *dp, bool running)
+{
+#ifdef ANDROID
+   extern void pastime_android_set_launcher_immersive(bool launcher_mode);
+   int8_t want = running ? 0 : 1;
+   if (dp->launcher_immersive_applied != want)
+   {
+      pastime_android_set_launcher_immersive(want == 1);
+      dp->launcher_immersive_applied = want;
+   }
+#else
+   (void)dp; (void)running;
+#endif
+}
+
 /* Drive the INGAME view from the actual core-running state.  Upstream
  * menu drivers don't detect this themselves — task_content sets
  * MENU_ST_FLAG_PENDING_QUICK_MENU on content load and runloop pushes
@@ -5704,6 +5675,8 @@ static void pastime_sync_ingame(pastime_handle_t *dp)
    bool               running     =
          (runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING) != 0
          && runloop_st->current_core_type != CORE_TYPE_DUMMY;
+
+   pastime_apply_immersive(dp, running);
 
    /* Unconditional: upstream may set this flag at content load even
     * before our frame fires, so we eat it every tick rather than only
@@ -6098,13 +6071,6 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
       pastime_reload_fonts(dp, video_driver_is_threaded());
    }
 
-   /* Refresh status-pill text once per frame, before anything reads it
-    * (draw_list's top-row width budget, the INGAME title pill's right
-    * limit, and the pill draw call below).  RA throttles the underlying
-    * powerstate + timedate work internally, so calling every frame is
-    * cheap. */
-   pastime_build_status_text(dp->status_text, sizeof(dp->status_text));
-
    /* Background — opaque normally, dim-overlay over the running game so
     * INGAME reads as a HUD instead of hiding the frame underneath. */
    pastime_draw_rect(p_disp, userdata, &dp->layout,
@@ -6116,22 +6082,9 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
    chrome_bg = (dp->nav.view == PASTIME_VIEW_INGAME)
              ? DP_COLOR_PILL_DARK : DP_COLOR_PILL_CHROME_GRAY;
 
-   /* Top-right status pill */
-   pastime_draw_status_pill(p_disp, userdata, dp->chrome_font,
-         dp->chrome_font_centre_offset, &dp->layout, dp->pill_cap_tex,
-         chrome_bg, dp->status_text);
-
    if (dp->nav.view == PASTIME_VIEW_INGAME)
    {
-      /* Title may grow up to the left edge of the status pill, with
-       * one margin's worth of gap between them so they read as
-       * separate elements.  status_pill_width must be called with
-       * the same font that draw_status_pill above renders with —
-       * mismatch would silently misalign the gap. */
-      int status_w = pastime_status_pill_width(dp->chrome_font,
-            &dp->layout, dp->status_text);
-      int title_right_limit = (int)dp->layout.vid_w - dp->layout.margin_x
-            - status_w - dp->layout.margin_x;
+      int title_right_limit = (int)dp->layout.vid_w - dp->layout.margin_x;
       pastime_draw_title_pill(p_disp, userdata, dp->font,
             dp->font_centre_offset, dp->layout.row_h,
             &dp->layout, dp->pill_cap_tex, title_right_limit);
@@ -6585,6 +6538,11 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
             dp->launch_return_system_idx = dp->active_system;
             dp->launch_return_selection  = dp->nav.selection;
             dp->launch_return_armed      = true;
+            /* Hide the Android status bar now — the menu_toggle hook
+             * will fire when the menu hides, but `running` is still
+             * false at that point (core hasn't loaded yet) so the
+             * launcher state would stick. */
+            pastime_apply_immersive(dp, true);
             /* core_ident vs external is mutually exclusive per source —
              * parser invariant.  External launches are fire-and-forget;
              * the Java helper surfaces toast on failure. */
@@ -6605,6 +6563,7 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
                dp->launch_return_view      = PASTIME_VIEW_RECENTS;
                dp->launch_return_selection = 0;
                dp->launch_return_armed     = true;
+               pastime_apply_immersive(dp, true);
                pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
             }
             return 0;
@@ -6624,6 +6583,7 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
                   dp->launch_return_view      = PASTIME_VIEW_RECENTS;
                   dp->launch_return_selection = 0;
                   dp->launch_return_armed     = true;
+                  pastime_apply_immersive(dp, true);
                   pastime_launch_recent(dp->resume_pl_idx);
                   return 0;
                }
@@ -6707,6 +6667,7 @@ static void *pastime_menu_init(void **userdata, bool video_is_threaded)
    dp->thumb_prev_selection_sys = SIZE_MAX;
    dp->thumb_prev_selection_rec = SIZE_MAX;
    dp->roms_dims_warmed         = false;
+   dp->launcher_immersive_applied = -1;
    /* Upstream only fires HISTORY_INIT lazily on first content load
     * (tasks/task_content.c), so on a fresh boot g_defaults.content_history
     * is NULL and our "Recently Played" row never appears.  Guard so menu

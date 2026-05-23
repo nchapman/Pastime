@@ -1,8 +1,12 @@
 package com.retroarch.browser.retroactivity;
 
+import android.annotation.TargetApi;
 import android.util.Log;
 import android.view.PointerIcon;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.content.Intent;
 import android.content.Context;
@@ -27,6 +31,12 @@ public final class RetroActivityFuture extends RetroActivityCamera {
 
   // Top-level window decor view
   private View mDecorView;
+
+  /* PASTIME: when true, attemptToggleImmersiveMode keeps the Android
+   * status bar visible (drops SYSTEM_UI_FLAG_FULLSCREEN / LOW_PROFILE).
+   * Flipped from native via pastimeSetLauncherImmersive() based on
+   * whether a libretro core is currently loaded. */
+  private volatile boolean pastimeLauncherMode = false;
 
   // Constants used for Handler messages
   private static final int HANDLER_WHAT_TOGGLE_IMMERSIVE = 1;
@@ -61,6 +71,22 @@ public final class RetroActivityFuture extends RetroActivityCamera {
     
     isRunning = true;
     mDecorView = getWindow().getDecorView();
+
+    /* PASTIME: re-assert game-mode immersive whenever the system reveals
+     * any bar (surface re-creation, transient system events).  In
+     * launcher mode we *want* the status bar visible, so do nothing. */
+    mDecorView.setOnSystemUiVisibilityChangeListener(
+        new View.OnSystemUiVisibilityChangeListener() {
+          @Override
+          public void onSystemUiVisibilityChange(int visibility) {
+            if (pastimeLauncherMode)
+              return;
+            if ((visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) == 0
+             || (visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0) {
+              pastimeApplyImmersive();
+            }
+          }
+        });
 
     // If QUITFOCUS parameter is provided then enable that Retroarch quits when focus is lost
     quitfocus = getIntent().hasExtra("QUITFOCUS");
@@ -170,26 +196,98 @@ public final class RetroActivityFuture extends RetroActivityCamera {
   }
 
   private void attemptToggleImmersiveMode(boolean state) {
-    // Attempt to toggle "Immersive Mode" for Android 4.4 (19) and up
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-      try {
-        if (state) {
-          mDecorView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_FULLSCREEN
-            | View.SYSTEM_UI_FLAG_LOW_PROFILE
-            | View.SYSTEM_UI_FLAG_IMMERSIVE);
-        } else {
-          mDecorView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
-        }
-      } catch (Exception e) {
-        Log.w("RetroActivityFuture", "[attemptToggleImmersiveMode] exception thrown: " + e.getMessage());
+    /* PASTIME: routes through pastimeApplyImmersive so the focus-driven
+     * re-apply and the launcher↔game JNI setter share one code path.
+     * `state` from onWindowFocusChanged: only act when we have focus —
+     * a focus-loss re-apply would just fight whatever's stealing focus. */
+    if (state)
+      pastimeApplyImmersive();
+  }
+
+  /* PASTIME: single source of truth for status-bar / nav-bar visibility.
+   * Launcher mode: status bar visible, nav hidden.  Game mode: both
+   * hidden, sticky so transient system events don't bring them back.
+   * The C menu driver queries pastimeGetStatusBarHeight() to inset its
+   * launcher chrome below the bar — the surface itself stays edge-to-
+   * edge in both modes (NativeActivity doesn't reliably shrink the
+   * native window when WindowInsets are applied). */
+  private void pastimeApplyImmersive() {
+    try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        pastimeApplyImmersiveR(getWindow());
+        return;
       }
+      /* Legacy path (pre-API-30) */
+      Window window = getWindow();
+      int base = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+               | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+               | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+               | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+               | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+      if (pastimeLauncherMode) {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        mDecorView.setSystemUiVisibility(base);
+      } else {
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        mDecorView.setSystemUiVisibility(base
+              | View.SYSTEM_UI_FLAG_FULLSCREEN
+              | View.SYSTEM_UI_FLAG_LOW_PROFILE);
+      }
+    } catch (Exception e) {
+      Log.w("RetroActivityFuture", "[pastimeApplyImmersive] exception: " + e.getMessage());
     }
+  }
+
+  /* PASTIME: API 30+ path is split into its own method so the Dalvik /
+   * ART class verifier doesn't try to resolve WindowInsetsController /
+   * WindowInsets.Type at class-load time on older devices.  The SDK_INT
+   * guard at the call site keeps this method off the verifier's radar
+   * unless we're actually on R+. */
+  @TargetApi(Build.VERSION_CODES.R)
+  private void pastimeApplyImmersiveR(Window window) {
+    WindowInsetsController ic = window.getInsetsController();
+    if (ic == null)
+      return;
+    window.setDecorFitsSystemWindows(false);
+    ic.setSystemBarsBehavior(
+        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+    if (pastimeLauncherMode) {
+      ic.hide(WindowInsets.Type.navigationBars());
+      ic.show(WindowInsets.Type.statusBars());
+    } else {
+      ic.hide(WindowInsets.Type.statusBars()
+            | WindowInsets.Type.navigationBars());
+    }
+  }
+
+  /* PASTIME: returns the system status-bar height in pixels.  Called
+   * from native (pastime_external_android.c) to inset launcher chrome
+   * below the bar.  Resources.getIdentifier hack is the canonical way
+   * to read this on Android — works on all API levels. */
+  public int pastimeGetStatusBarHeight() {
+    try {
+      int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+      if (id > 0)
+        return getResources().getDimensionPixelSize(id);
+    } catch (Exception e) {
+      Log.w("RetroActivityFuture", "[pastimeGetStatusBarHeight] exception: " + e.getMessage());
+    }
+    return 0;
+  }
+
+  /* PASTIME: called from native (pastime_external_android.c) when the
+   * launcher↔game transition fires.  Stores the flag and re-applies on
+   * the UI thread — Window.setFlags / setSystemUiVisibility must run
+   * there or they coalesce with the next relayout and effectively
+   * no-op. */
+  public void pastimeSetLauncherImmersive(boolean launcherMode) {
+    pastimeLauncherMode = launcherMode;
+    runOnUiThread(new Runnable() {
+      @Override
+      public void run() {
+        pastimeApplyImmersive();
+      }
+    });
   }
 
   private void attemptTogglePointerCapture(boolean state) {

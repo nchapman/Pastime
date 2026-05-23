@@ -50,7 +50,8 @@
             </intent-filter>
         </activity>
         <!-- PASTIME: launchMode singleTask (was singleInstance) so RetroActivityFuture joins MainMenuActivity's task — avoids two entries in the Android app switcher. -->
-        <activity android:name="com.retroarch.browser.retroactivity.RetroActivityFuture" android:exported="true" android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|fontScale" android:theme="@android:style/Theme.NoTitleBar.Fullscreen" android:launchMode="singleTask">
+        <!-- PASTIME: theme Theme.Black.NoTitleBar (was NoTitleBar.Fullscreen) so the Android status bar can be toggled per-mode via setSystemUiVisibility — Fullscreen sets the window-level FLAG_FULLSCREEN unconditionally, which the launcher needs to be able to drop. Black variant avoids a light-background flash at launch before the GL surface attaches on older Android. -->
+        <activity android:name="com.retroarch.browser.retroactivity.RetroActivityFuture" android:exported="true" android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|fontScale" android:theme="@android:style/Theme.Black.NoTitleBar" android:launchMode="singleTask">
             <meta-data android:name="android.app.lib_name" android:value="retroarch-activity" />
             <meta-data android:name="android.app.func_name" android:value="ANativeActivity_onCreate" />
         </activity>
