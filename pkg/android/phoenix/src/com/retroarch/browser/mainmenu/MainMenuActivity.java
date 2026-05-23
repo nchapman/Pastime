@@ -153,7 +153,9 @@ public final class MainMenuActivity extends PreferenceActivity
 			retro.setFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
 		} else {
 			// RetroActivity not running - full setup with parameters
-			retro.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+			/* PASTIME: dropped FLAG_ACTIVITY_CLEAR_TOP. Once both activities share a task,
+			 * CLEAR_TOP would destroy a live RetroActivityFuture if isRunning ever went
+			 * stale (e.g. after process death). Nothing legitimately needs clearing here. */
 			final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
 
 			startRetroActivity(
