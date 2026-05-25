@@ -1089,6 +1089,7 @@ ifeq ($(HAVE_MENU), 1)
       OBJ += pastime/pastime_setup.o
       OBJ += pastime/pastime_defaults.o
       OBJ += pastime/pastime_bootstrap.o
+      OBJ += pastime/pastime_storage.o
       OBJ += pastime/pastime_nav.o
       OBJ += pastime/pastime_metadata_disambig.o
       OBJ += pastime/pastime_display_name.o
@@ -2743,6 +2744,9 @@ ifeq ($(HAVE_COCOA_COMMON),1)
    OBJ += input/drivers/cocoa_input.o \
           ui/drivers/ui_cocoa.o \
           ui/drivers/cocoa/cocoa_common.o
+   ifeq ($(HAVE_PASTIME), 1)
+      OBJ += pastime/pastime_storage_cocoa.o
+   endif
    # RetroArchPlaylistManager uses Obj-C lightweight generics and
    # nullability macros (Xcode 7+, 2015).  It's fine on iOS/tvOS and
    # modern macOS (10.11+), but GCC 4.0 / old clang on pre-10.11

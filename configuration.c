@@ -1686,6 +1686,7 @@ static struct config_path_setting *populate_settings_path(
    SETTING_PATH("playlist_directory",            settings->paths.directory_playlist, true, NULL, true);
    SETTING_PATH("cheat_database_path",           settings->paths.path_cheat_database, false, NULL, true);
    SETTING_PATH("system_directory",              settings->paths.directory_system, true, NULL, true);
+   SETTING_PATH("pastime_storage_root",          settings->paths.pastime_storage_root, false, NULL, true); /* PASTIME: user-selected storage root */
    SETTING_PATH("cache_directory",               settings->paths.directory_cache, false, NULL, true);
    SETTING_PATH("audio_dsp_plugin",              settings->paths.path_audio_dsp_plugin, false, NULL, true);
    SETTING_PATH("audio_filter_dir",              settings->paths.directory_audio_filter, true, NULL, true);

@@ -60,6 +60,7 @@
 #include "../../pastime/pastime_metadata.h"
 #include "../../pastime/pastime_nav.h"
 #include "../../pastime/pastime_setup.h"
+#include "../../pastime/pastime_storage.h"
 #include "../../pastime/pastime_thumbs.h"
 #include "../../pastime/pastime_thumbhash.h"
 #ifdef HAVE_PASTIME_WEBP
@@ -4516,6 +4517,13 @@ static size_t dp_global_scale_current_idx(float current)
    return best;
 }
 
+static void pastime_action_change_storage(void *userdata)
+{
+   (void)userdata;
+   pastime_storage_reset_state();
+   pastime_storage_show_picker();
+}
+
 static pastime_settings_list_t *pastime_build_global_settings_list(
       pastime_handle_t *dp)
 {
@@ -4527,7 +4535,7 @@ static pastime_settings_list_t *pastime_build_global_settings_list(
    if (!s)
       return NULL;
    dp_global_scale_labels_build();
-   L = pastime_settings_list_new("Settings", 2, 0, 60);
+   L = pastime_settings_list_new("Settings", 3, 0, 60);
    if (!L)
       return NULL;
 
@@ -4548,6 +4556,12 @@ static pastime_settings_list_t *pastime_build_global_settings_list(
    r->idx_value    = dp_global_scale_current_idx(
          s->floats.menu_scale_factor);
    r->on_change    = dp_global_scale_on_change;
+   r->userdata     = dp;
+
+   r               = &L->rows[2];
+   r->title        = "Storage Location";
+   r->desc         = "Choose where Pastime stores games, saves, and states.";
+   r->on_confirm   = pastime_action_change_storage;
    r->userdata     = dp;
 
    return L;
@@ -5787,12 +5801,15 @@ static void pastime_sync_ingame(pastime_handle_t *dp)
 enum pastime_render_mode
 {
    PASTIME_RENDER_LIST = 0,   /* normal menu */
+   PASTIME_RENDER_STORAGE_PICKER, /* first-run: choose storage location */
    PASTIME_RENDER_WELCOME,    /* PLANNED — waiting for A to start */
    PASTIME_RENDER_SPLASH      /* setup pass in flight */
 };
 
 static enum pastime_render_mode pastime_get_render_mode(void)
 {
+   if (!pastime_storage_is_configured())
+      return PASTIME_RENDER_STORAGE_PICKER;
    switch (pastime_setup_get_phase())
    {
       case PASTIME_SETUP_PLANNED: return PASTIME_RENDER_WELCOME;
@@ -5873,6 +5890,38 @@ static void pastime_setup_anim_step(pastime_handle_t *dp,
             * PASTIME_SETUP_BAR_K;
    if (dp->setup_anim.displayed > 1.0f)
       dp->setup_anim.displayed = 1.0f;
+}
+
+/* Only called in PASTIME_RENDER_STORAGE_PICKER.  Shows explanation text
+ * and waits for the user to press A before opening the platform folder
+ * picker.  While the picker is open (Android async), shows a brief
+ * "waiting" indicator. */
+static void pastime_draw_storage_picker_view(const pastime_handle_t *dp)
+{
+   const pastime_layout_t *L  = &dp->layout;
+   float                   cy = (float)L->vid_h * 0.5f;
+   enum pastime_storage_state ss = pastime_storage_get_state();
+
+   if (ss == PASTIME_STORAGE_AWAITING_PICK)
+   {
+      pastime_draw_text(dp->font, "Waiting for folder selection...",
+            (float)L->vid_w * 0.5f,
+            cy,
+            L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
+   }
+   else
+   {
+      pastime_draw_text(dp->font, "Choose where to store your games",
+            (float)L->vid_w * 0.5f,
+            cy - (L->font_size * 0.3f),
+            L, DP_TEXT_LIGHT, TEXT_ALIGN_CENTER);
+      pastime_draw_text(dp->chrome_font,
+            "We'll create folders for ROMs, saves, and states.",
+            (float)L->vid_w * 0.5f,
+            cy + L->font_size * 0.5f
+                  + (L->chrome_font_size * 0.85f) + (12.0f * L->scale),
+            L, DP_TEXT_MUTED, TEXT_ALIGN_CENTER);
+   }
 }
 
 /* Only called in PASTIME_RENDER_WELCOME.  A static "Let's get you set
@@ -6053,6 +6102,21 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
       dp->settings_rebuild_pending = false;
    }
    mode = pastime_get_render_mode();
+
+   /* Settings-triggered storage picker: poll for async result.  When the
+    * picker was opened from the settings menu (not first-run gate), we
+    * commit the result here per-frame rather than blocking in the input
+    * handler. */
+   if (mode == PASTIME_RENDER_LIST
+         && pastime_storage_get_state() == PASTIME_STORAGE_PICKED)
+   {
+      pastime_storage_commit(pastime_storage_get_picked_path());
+      pastime_rebuild_lists(dp);
+   }
+   else if (mode == PASTIME_RENDER_LIST
+         && pastime_storage_get_state() == PASTIME_STORAGE_CANCELLED)
+      pastime_storage_reset_state();
+
    /* When we leave splash, drop the anim flag so the next setup pass
     * (lazy install) starts fresh at displayed=0 instead of carrying
     * the previous run's full bar. */
@@ -6092,6 +6156,9 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
 
    switch (mode)
    {
+      case PASTIME_RENDER_STORAGE_PICKER:
+         pastime_draw_storage_picker_view(dp);
+         break;
       case PASTIME_RENDER_SPLASH:
          pastime_draw_setup_splash(p_disp, userdata, dp);
          break;
@@ -6165,7 +6232,10 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
 
    /* Right-aligned hint depends on mode.  When the current view
     * supports going back, a B BACK pair shares the outer pill with
-    * the primary hint. */
+    * the primary hint.  Hidden when the storage picker is open (no
+    * actionable buttons while waiting for the platform dialog). */
+   if (mode != PASTIME_RENDER_STORAGE_PICKER
+         || pastime_storage_get_state() != PASTIME_STORAGE_AWAITING_PICK)
    {
       pastime_hint_t right[2];
       size_t          n          = 0;
@@ -6186,6 +6256,8 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
          right[n].glyph = "B";
          right[n].label = "CANCEL";
       }
+      else if (mode == PASTIME_RENDER_STORAGE_PICKER)
+         right[n].label = "CHOOSE";
       else if (mode == PASTIME_RENDER_WELCOME)
          right[n].label = "START";
       else
@@ -6230,6 +6302,28 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
    pastime_handle_t *dp = (pastime_handle_t*)userdata;
    if (!dp)
       return -1;
+
+   /* Storage picker: user must choose a location before anything else. */
+   {
+      enum pastime_render_mode m = pastime_get_render_mode();
+      if (m == PASTIME_RENDER_STORAGE_PICKER)
+      {
+         enum pastime_storage_state ss = pastime_storage_get_state();
+         if (ss == PASTIME_STORAGE_IDLE || ss == PASTIME_STORAGE_CANCELLED)
+         {
+            if (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT)
+            {
+               pastime_storage_reset_state();
+               pastime_storage_show_picker();
+            }
+         }
+         else if (ss == PASTIME_STORAGE_PICKED)
+         {
+            pastime_storage_commit(pastime_storage_get_picked_path());
+         }
+         return 0;
+      }
+   }
 
    /* Boot pass in progress (awaiting list or downloading): swallow nav.
     * CANCEL aborts the pass — during AWAITING_LIST that drops straight

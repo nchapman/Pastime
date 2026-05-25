@@ -797,6 +797,51 @@ JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_RetroActivityCom
 #endif
 }
 
+/* PASTIME: JNI callbacks and picker trigger for user-selected storage root. */
+#ifdef HAVE_PASTIME
+#include "../pastime/pastime_storage.h"
+
+void pastime_android_show_storage_picker(void)
+{
+   JNIEnv *env;
+   if (!g_android)
+      return;
+   env = jni_thread_getenv();
+   if (!env)
+      return;
+   CALL_VOID_METHOD(env, g_android->activity->clazz,
+         g_android->requestPastimeStorageRoot);
+}
+
+JNIEXPORT void JNICALL
+Java_com_retroarch_browser_retroactivity_RetroActivityCommon_pastimeStorageRootPicked(
+      JNIEnv *env, jobject obj, jstring path_obj)
+{
+   const char *path = (*env)->GetStringUTFChars(env, path_obj, NULL);
+   if ((*env)->ExceptionOccurred(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+      pastime_storage_on_cancelled();
+      return;
+   }
+   if (!path)
+   {
+      pastime_storage_on_cancelled();
+      return;
+   }
+   pastime_storage_on_picked(path);
+   (*env)->ReleaseStringUTFChars(env, path_obj, path);
+}
+
+JNIEXPORT void JNICALL
+Java_com_retroarch_browser_retroactivity_RetroActivityCommon_pastimeStorageRootCancelled(
+      JNIEnv *env, jobject obj)
+{
+   pastime_storage_on_cancelled();
+}
+#endif /* HAVE_PASTIME */
+
 #elif !defined(DINGUX)
 static bool make_proc_acpi_key_val(char **_ptr, char **_key, char **_val)
 {
@@ -2451,6 +2496,11 @@ static void frontend_unix_init(void *data)
          "getPersistedSafTrees", "()[Ljava/lang/String;");
 
    android_app->have_saf = retro_vfs_init_saf(jni_thread_getenv, android_app->activity->clazz);
+#endif
+
+#ifdef HAVE_PASTIME
+   GET_METHOD_ID(env, android_app->requestPastimeStorageRoot, class,
+         "requestPastimeStorageRoot", "()V"); /* PASTIME: folder picker for storage root */
 #endif
 
    GET_OBJECT_CLASS(env, class, obj);

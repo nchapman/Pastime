@@ -51,6 +51,15 @@ extern const char *pastime_removable_storage_path_get(unsigned i);
 
 bool pastime_paths_get_root(char *out, size_t out_len)
 {
+   /* User-selected root takes priority over all heuristics. */
+   settings_t *settings = config_get_ptr();
+   if (settings && settings->paths.pastime_storage_root[0])
+   {
+      strlcpy(out, settings->paths.pastime_storage_root, out_len);
+      return true;
+   }
+
+   /* Legacy fallback: tier cascade for users who haven't picked yet. */
 #ifdef ANDROID
    /* Removable storage first.  We *only* adopt a card when it already
     * has a Pastime/ directory on it — never auto-bootstrap onto removable

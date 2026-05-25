@@ -625,6 +625,7 @@ typedef struct settings
       char directory_bottom_assets[DIR_MAX_LENGTH];
 #endif
       char log_dir[DIR_MAX_LENGTH];
+      char pastime_storage_root[PATH_MAX_LENGTH]; /* PASTIME: user-selected root */
 
 #ifdef HAVE_TEST_DRIVERS
       char test_input_file_joypad[PATH_MAX_LENGTH];

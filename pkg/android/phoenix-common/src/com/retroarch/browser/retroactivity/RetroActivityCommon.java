@@ -35,6 +35,8 @@ import android.hardware.usb.UsbManager;
 import android.media.AudioAttributes;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.DocumentsContract;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.system.Os;
@@ -85,6 +87,7 @@ public class RetroActivityCommon extends NativeActivity
   public static final int RETRO_RUMBLE_STRONG = 0;
   public static final int RETRO_RUMBLE_WEAK = 1;
   public static final int REQUEST_CODE_OPEN_DOCUMENT_TREE = 0;
+  public static final int REQUEST_CODE_PASTIME_STORAGE = 1;
   public boolean sustainedPerformanceMode = true;
   public int screenOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
 
@@ -159,19 +162,45 @@ public class RetroActivityCommon extends NativeActivity
   @Override
   public void onActivityResult(int requestCode, int resultCode, Intent intent)
   {
-    if (intent == null)
-      return;
-
     switch (requestCode)
     {
       case REQUEST_CODE_OPEN_DOCUMENT_TREE:
         {
+          if (intent == null)
+            return;
           Uri uri = intent.getData();
           if (uri == null)
             break;
           if (Build.VERSION.SDK_INT >= 19)
             getContentResolver().takePersistableUriPermission(uri, intent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION));
           safTreeAdded(uri.toString());
+        }
+        break;
+
+      case REQUEST_CODE_PASTIME_STORAGE:
+        {
+          if (intent == null || resultCode != RESULT_OK)
+          {
+            pastimeStorageRootCancelled();
+            break;
+          }
+          Uri uri = intent.getData();
+          if (uri == null)
+          {
+            pastimeStorageRootCancelled();
+            break;
+          }
+          if (Build.VERSION.SDK_INT >= 19)
+            getContentResolver().takePersistableUriPermission(uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+          String fsPath = extractFilesystemPath(uri);
+          if (fsPath != null)
+            pastimeStorageRootPicked(fsPath);
+          else
+          {
+            Log.w("Pastime", "Could not map SAF URI to filesystem path: " + uri);
+            pastimeStorageRootCancelled();
+          }
         }
         break;
 
@@ -184,6 +213,36 @@ public class RetroActivityCommon extends NativeActivity
   {
     startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_CODE_OPEN_DOCUMENT_TREE);
   }
+
+  /* PASTIME: storage root picker */
+  public void requestPastimeStorageRoot()
+  {
+    if (Build.VERSION.SDK_INT < 21)
+    {
+      Log.w("Pastime", "requestPastimeStorageRoot: API < 21, picker not available");
+      pastimeStorageRootCancelled();
+      return;
+    }
+    startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_CODE_PASTIME_STORAGE);
+  }
+
+  private String extractFilesystemPath(Uri treeUri)
+  {
+    String docId = DocumentsContract.getTreeDocumentId(treeUri);
+    if (docId == null)
+      return null;
+    String[] parts = docId.split(":");
+    String volume = parts[0];
+    String subPath = parts.length > 1 ? parts[1] : "";
+    if ("primary".equals(volume))
+      return Environment.getExternalStorageDirectory().getAbsolutePath()
+          + (subPath.isEmpty() ? "" : "/" + subPath);
+    else
+      return "/storage/" + volume + (subPath.isEmpty() ? "" : "/" + subPath);
+  }
+
+  public native void pastimeStorageRootPicked(String path);
+  public native void pastimeStorageRootCancelled();
 
   public void doVibrate(int id, int effect, int strength, int oneShot)
   {

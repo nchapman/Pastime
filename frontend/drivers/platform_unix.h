@@ -207,6 +207,10 @@ struct android_app
    jmethodID getPersistedSafTrees;
    bool have_saf;
 #endif
+
+#ifdef HAVE_PASTIME
+   jmethodID requestPastimeStorageRoot; /* PASTIME: folder picker for storage root */
+#endif
 };
 
 enum

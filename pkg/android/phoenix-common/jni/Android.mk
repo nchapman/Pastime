@@ -68,6 +68,7 @@ LOCAL_SRC_FILES  +=	$(RARCH_DIR)/menu/drivers/pastime.c \
 							$(RARCH_DIR)/pastime/pastime_cores_extras.c \
 							$(RARCH_DIR)/pastime/pastime_defaults.c \
 							$(RARCH_DIR)/pastime/pastime_bootstrap.c \
+							$(RARCH_DIR)/pastime/pastime_storage.c \
 							$(RARCH_DIR)/pastime/pastime_setup.c \
 							$(RARCH_DIR)/pastime/pastime_nav.c \
 							$(RARCH_DIR)/pastime/pastime_metadata_disambig.c \

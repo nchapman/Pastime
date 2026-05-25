@@ -20,37 +20,15 @@
 
 #include <retro_miscellaneous.h>
 #include <file/file_path.h>
-#include <streams/file_stream.h>
 
 #include "pastime_bootstrap.h"
 #include "pastime_defaults.h"
 
 #include "../verbosity.h"
 
-static const char PASTIME_README[] =
-   "Pastime - Roms folder\n"
-   "\n"
-   "Drop one folder per system here.  The folder name must end with a\n"
-   "backend marker in parentheses, e.g.:\n"
-   "\n"
-   "  Super Nintendo Entertainment System (snes9x)/\n"
-   "  Game Boy Advance (mgba)/\n"
-   "  PlayStation 2 (ext-aethersx2)/\n"
-   "\n"
-   "  (corename)        - libretro core; downloaded from the libretro\n"
-   "                      buildbot the first time you launch a game.\n"
-   "  (ext-shortname)   - external Android app (e.g. ext-aethersx2,\n"
-   "                      ext-dolphin, ext-azahar).  Folder is hidden\n"
-   "                      if the app is not installed.\n"
-   "\n"
-   "Folders without a marker are hidden.  Multiple folders can target\n"
-   "the same backend (e.g. an \"official\" library and a \"hacks\"\n"
-   "library both using mgba); folders that share a display name are\n"
-   "merged into one row in the launcher.\n";
-
-/* First-run system folders.  Seeded once when the README is created;
- * deleting a folder later does not bring it back.  Names match the
- * English Wikipedia article title for each system. */
+/* Default system folders seeded when we first create the Roms/ directory.
+ * Once Roms/ exists we never re-seed, so users can delete folders without
+ * them coming back.  Names match the English Wikipedia article title. */
 static const char *PASTIME_DEFAULT_SYSTEM_FOLDERS[] = {
    /* Nintendo */
    "Game Boy (gambatte)",
@@ -104,7 +82,7 @@ void pastime_bootstrap(void)
 {
    char root[PATH_MAX_LENGTH];
    char roms[PATH_MAX_LENGTH];
-   char readme[PATH_MAX_LENGTH];
+   bool roms_existed;
 
    if (!pastime_paths_get_root(root, sizeof(root)))
    {
@@ -112,34 +90,25 @@ void pastime_bootstrap(void)
       return;
    }
 
-   /* path_mkdir is recursive — it'll create root if missing as a side
-    * effect of creating the children, but we mkdir it explicitly so the
-    * intent is legible in logs. */
    if (!path_is_directory(root) && !path_mkdir(root))
    {
       RARCH_WARN("[Pastime] bootstrap: cannot create %s\n", root);
       return;
    }
 
+   fill_pathname_join_special(roms, root, "Roms", sizeof(roms));
+   roms_existed = path_is_directory(roms);
+
    pastime_ensure_dir(root, "Roms");
    pastime_ensure_dir(root, "Bios");
    pastime_ensure_dir(root, "Saves");
    pastime_ensure_dir(root, "States");
 
-   /* Drop the convention README into Roms/ on first launch, and seed
-    * the default system folders the same time.  README presence is the
-    * first-run sentinel — once it exists, we never re-seed, so users
-    * can delete folders without them coming back. */
-   fill_pathname_join_special(roms,   root, "Roms",       sizeof(roms));
-   fill_pathname_join_special(readme, roms, "README.txt", sizeof(readme));
-   if (!path_is_valid(readme))
+   /* Seed system subfolders only when Roms/ was freshly created. */
+   if (!roms_existed)
    {
       size_t i;
       for (i = 0; i < ARRAY_SIZE(PASTIME_DEFAULT_SYSTEM_FOLDERS); i++)
          pastime_ensure_dir(roms, PASTIME_DEFAULT_SYSTEM_FOLDERS[i]);
-
-      if (!filestream_write_file(readme,
-               PASTIME_README, (int64_t)(sizeof(PASTIME_README) - 1)))
-         RARCH_WARN("[Pastime] bootstrap: failed to write %s\n", readme);
    }
 }
