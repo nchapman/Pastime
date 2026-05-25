@@ -42,6 +42,15 @@ bool pastime_paths_get_root(char *out, size_t out_len);
  * in retroarch.cfg is preserved). */
 void pastime_defaults_apply(void);
 
+/* One-shot flag: when set, the runloop auto-state gate (runloop.c)
+ * loads the auto-save state for this content load, bypassing
+ * settings->bools.savestate_auto_load (which defaults_apply keeps
+ * false so A-button launches always start fresh).
+ * Consumed immediately after the gate fires. */
+void pastime_defaults_request_auto_load(void);
+void pastime_defaults_cancel_auto_load(void);
+bool pastime_defaults_should_auto_load(void);
+
 RETRO_END_DECLS
 
 #endif

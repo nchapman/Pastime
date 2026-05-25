@@ -188,6 +188,23 @@ static bool pastime_should_route_path(const char *cur, const char *ra_default,
           || pastime_owns_path(cur, leaf);
 }
 
+static bool pastime_force_auto_load = false;
+
+void pastime_defaults_request_auto_load(void)
+{
+   pastime_force_auto_load = true;
+}
+
+void pastime_defaults_cancel_auto_load(void)
+{
+   pastime_force_auto_load = false;
+}
+
+bool pastime_defaults_should_auto_load(void)
+{
+   return pastime_force_auto_load;
+}
+
 void pastime_defaults_apply(void)
 {
    char        root[PATH_MAX_LENGTH];
@@ -226,14 +243,13 @@ void pastime_defaults_apply(void)
    if (settings->uints.input_menu_toggle_gamepad_combo == INPUT_COMBO_NONE)
       settings->uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_START_SELECT;
 
-   /* Save-state UX (M7): autosave on quit, autoload on launch, and
-    * always capture a screenshot.  These power Resume in the launcher
-    * and the thumbnails in the in-game load picker.  Applied
-    * unconditionally — the boolean upstream defaults are all false, so
-    * we can't distinguish "user turned it off" from "never set", and
-    * the Pastime UX depends on these being on. */
+   /* Save-state UX: autosave on quit, always capture a screenshot.
+    * Auto-load is unconditionally off — the launcher's X/RESUME button
+    * is the only path to load a state, via pastime_force_auto_load
+    * (checked in runloop.c).  Never gate this on pastime_should_overlay;
+    * a user-set cfg value would bypass the resume-vs-fresh-start UX. */
    settings->bools.savestate_auto_save        = true;
-   settings->bools.savestate_auto_load        = true;
+   settings->bools.savestate_auto_load        = false;
    settings->bools.savestate_thumbnail_enable = true;
 
    /* Box-art on demand.  RA defaults this to false ("download manually

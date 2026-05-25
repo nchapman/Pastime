@@ -244,6 +244,10 @@
 #include "ai/game_ai.h"
 #endif
 
+#ifdef HAVE_PASTIME
+#include "pastime/pastime_defaults.h" /* PASTIME: X-button resume */
+#endif
+
 #define SHADER_FILE_WATCH_DELAY_MSEC 500
 
 #define QUIT_DELAY_USEC 3 * 1000000 /* 3 seconds */
@@ -4358,10 +4362,17 @@ static bool event_init_content(
 #endif
       {
          if (     runloop_st->entry_state_slot < 0
-               && settings->bools.savestate_auto_load)
+               && (settings->bools.savestate_auto_load
+#ifdef HAVE_PASTIME
+                  || pastime_defaults_should_auto_load() /* PASTIME: X-button resume */
+#endif
+                  ))
             command_event_load_auto_state();
       }
    }
+#ifdef HAVE_PASTIME
+   pastime_defaults_cancel_auto_load(); /* PASTIME: consume even if cheevos/bsv blocked */
+#endif
 
 #ifdef HAVE_BSV_MOVIE
    movie_stop(input_st);

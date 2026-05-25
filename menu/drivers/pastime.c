@@ -54,6 +54,7 @@
 #include "../../verbosity.h"
 
 #include "../../pastime/pastime_cores.h"
+#include "../../pastime/pastime_defaults.h"
 #include "../../pastime/pastime_display_name.h"
 #include "../../pastime/pastime_disambig.h"
 #include "../../pastime/pastime_external.h"
@@ -559,15 +560,11 @@ struct pastime_handle_s
    unsigned            preview_thumbhash_h;
    uint32_t            preview_thumbhash_key;
 
-   /* Cached "Resume <Game>" availability for the launcher's TOP view.
-    * Refreshed on rebuild_lists; if true, a Resume row is prepended
-    * above Recents.  Stores the most-recent recents playlist index so
-    * selection dispatches to pastime_launch_recent without re-
-    * searching. */
-   bool                resume_available;
-   size_t              resume_pl_idx;
-   /* Pre-formatted "Resume Foo" label, mutated only on rebuild. */
-   char                resume_label[NAME_MAX_LENGTH];
+   /* True when the currently selected ROM (SYSTEM or RECENTS view) has
+    * a .state.auto file on disk.  Updated in the nav-change callback
+    * so we don't hit the filesystem every frame.  Gates the X/RESUME
+    * footer hint and the MENU_ACTION_SEARCH (X button) resume path. */
+   bool                can_resume;
 
    /* First-run setup progress animation.  displayed lerps toward a
     * per-segment target each frame; the asymptotic curve (target - cur)
@@ -637,17 +634,10 @@ static float DP_COLOR_PILL_BG_GRAY[16] = {
 
 /* ---------- list (systems + recents) ---------- */
 
-/* TOP-view only: row 0 is "Recently Played" iff there are recent entries.
- * If a Resume row is present (M7), it sits *above* the Recents row, so
- * the Recents-row index in TOP becomes (resume_available ? 1 : 0). */
+/* TOP-view only: row 0 is "Recently Played" iff there are recent entries. */
 static bool pastime_has_recents_row(const pastime_handle_t *dp)
 {
    return dp->nav.view == PASTIME_VIEW_TOP && dp->recent_count > 0;
-}
-
-static bool pastime_has_resume_row(const pastime_handle_t *dp)
-{
-   return dp->nav.view == PASTIME_VIEW_TOP && dp->resume_available;
 }
 
 static const char *pastime_ingame_label(enum pastime_ingame_action a)
@@ -695,16 +685,7 @@ static const char *pastime_row_label(const pastime_handle_t *dp, size_t row)
       return "";
    }
 
-   /* TOP view: Resume row (if present) sits above Recents (if present)
-    * sits above Systems.  Order matters here — both flags are
-    * independent, so we walk them in sequence rather than using a
-    * single conditional offset. */
-   if (pastime_has_resume_row(dp))
-   {
-      if (row == 0)
-         return dp->resume_label;
-      row--;
-   }
+   /* TOP view: Recents row (if present) sits above Systems. */
    if (pastime_has_recents_row(dp))
    {
       if (row == 0)
@@ -1349,8 +1330,7 @@ static void pastime_recompute_total_rows(pastime_handle_t *dp)
       return;
    }
    else
-      dp->total_rows = (pastime_has_resume_row(dp)  ? 1 : 0)
-                     + (pastime_has_recents_row(dp) ? 1 : 0)
+      dp->total_rows = (pastime_has_recents_row(dp) ? 1 : 0)
                      + dp->system_count;
 
    /* Selection clamp: keep dp->nav.selection in [0, total_rows).
@@ -1364,13 +1344,112 @@ static void pastime_recompute_total_rows(pastime_handle_t *dp)
       dp_nav_set_selection(&dp->nav, dp->total_rows - 1);
 }
 
+/* Check whether a ROM has a .state.auto file on disk.  When
+ * sort_savestates_enable is true (the default), RA writes auto-saves
+ * into a per-core subdirectory: <States>/<core_name>/<basename>.state.auto.
+ * core_name is the core's library_name (e.g. "Snes9x", "mGBA"). */
+static bool pastime_rom_has_auto_state(const char *rom_path,
+      const char *core_name)
+{
+   const char *savestate_dir;
+   settings_t *settings;
+   char        state_dir[PATH_MAX_LENGTH];
+   char        basename[NAME_MAX_LENGTH];
+   char        auto_path[PATH_MAX_LENGTH];
+
+   if (!rom_path || !*rom_path)
+      return false;
+   savestate_dir = dir_get_ptr(RARCH_DIR_SAVESTATE);
+   if (!savestate_dir || !*savestate_dir)
+      return false;
+
+   settings = config_get_ptr();
+   if (settings && settings->bools.sort_savestates_enable
+         && core_name && *core_name)
+      fill_pathname_join_special(state_dir, savestate_dir, core_name,
+            sizeof(state_dir));
+   else
+      strlcpy(state_dir, savestate_dir, sizeof(state_dir));
+
+   fill_pathname_base(basename, rom_path, sizeof(basename));
+   path_remove_extension(basename);
+   if (!*basename)
+      return false;
+
+   fill_pathname_join_special(auto_path, state_dir, basename,
+         sizeof(auto_path));
+   strlcat(auto_path, ".state.auto", sizeof(auto_path));
+   return path_is_valid(auto_path);
+}
+
+/* Resolve a core_ident (e.g. "snes9x") to the core's library_name
+ * (e.g. "Snes9x") via core_info.  Returns NULL if not found. */
+static const char *pastime_core_library_name(const char *core_ident)
+{
+   char         lookup[NAME_MAX_LENGTH];
+   core_info_t *info = NULL;
+   if (!core_ident || !*core_ident)
+      return NULL;
+   snprintf(lookup, sizeof(lookup), "%s_libretro", core_ident);
+   if (!core_info_find(lookup, &info) || !info)
+      return NULL;
+   return info->core_name;
+}
+
+/* Refresh dp->can_resume for the current selection.  Called from the
+ * nav-change callback so we only hit the filesystem on cursor moves. */
+static void pastime_refresh_can_resume(pastime_handle_t *dp)
+{
+   dp->can_resume = false;
+
+   if (dp->nav.view == PASTIME_VIEW_SYSTEM)
+   {
+      if (dp->roms && dp->nav.selection < dp->rom_count)
+      {
+         const pastime_system_t *sys = &dp->systems[dp->active_system];
+         const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
+         const pastime_source_t *src = &sys->sources[rom->source_idx];
+         const char         *libname = src->core_ident
+               ? pastime_core_library_name(src->core_ident) : NULL;
+         dp->can_resume = pastime_rom_has_auto_state(
+               rom->full_path, libname);
+      }
+   }
+   else if (dp->nav.view == PASTIME_VIEW_RECENTS)
+   {
+      if (dp->recents && dp->nav.selection < dp->recent_row_count)
+      {
+         playlist_t                  *pl    = g_defaults.content_history;
+         const struct playlist_entry *entry = NULL;
+         if (pl)
+         {
+            playlist_get_index(pl,
+                  dp->recents[dp->nav.selection].pl_idx, &entry);
+            if (entry && entry->path)
+            {
+               const char *libname = NULL;
+               core_info_t *info   = NULL;
+               if (entry->core_path && *entry->core_path
+                     && core_info_find(entry->core_path, &info)
+                     && info)
+                  libname = info->core_name;
+               dp->can_resume = pastime_rom_has_auto_state(
+                     entry->path, libname);
+            }
+         }
+      }
+   }
+}
+
 /* nav stack helpers (push/pop/pop_to/top/root_view/set_selection)
  * live in pastime/pastime_nav.c — see the header included at the
  * top of this file.  Wrapper that lets the after_change callback
  * (dp_nav_state_t-typed) reach back into the host's recompute. */
 static void pastime_after_nav_change(void *user)
 {
-   pastime_recompute_total_rows((pastime_handle_t*)user);
+   pastime_handle_t *dp = (pastime_handle_t*)user;
+   pastime_recompute_total_rows(dp);
+   pastime_refresh_can_resume(dp);
 }
 
 static void pastime_recents_free(pastime_recent_t *rows, size_t count)
@@ -1802,59 +1881,6 @@ static void pastime_refresh_ingame_actions(pastime_handle_t *dp)
       dp_nav_set_selection(&dp->nav, n - 1);
 }
 
-/* Build "Resume <Game>" availability from the head of recents.  No
- * runtime state is loaded (we're on the launcher home), so we
- * reproduce RA's path-construction for `<savestate_dir>/<content
- * basename minus extension>.state.auto`.  This matches the branch in
- * runloop_path_set_redirect (runloop.c:8408) that fires when
- * directory_savestate is set — Pastime always sets it via the
- * defaults overlay.  Crucially, RA strips the content extension
- * before appending `.state` (see runloop_path_set_basename at
- * runloop.c:8174), so we must too — otherwise `foo.nes` would map
- * to `foo.nes.state.auto` and the Resume row would never appear. */
-static void pastime_refresh_resume(pastime_handle_t *dp)
-{
-   playlist_t                  *pl    = g_defaults.content_history;
-   const struct playlist_entry *entry = NULL;
-   const char                  *savestate_dir;
-   char                         basename[NAME_MAX_LENGTH];
-   char                         auto_path[PATH_MAX_LENGTH];
-   const char                  *label;
-
-   dp->resume_available = false;
-   dp->resume_label[0]  = '\0';
-
-   if (!pl || playlist_size(pl) == 0)
-      return;
-   playlist_get_index(pl, 0, &entry);
-   if (!entry || !entry->path || !*entry->path)
-      return;
-
-   savestate_dir = dir_get_ptr(RARCH_DIR_SAVESTATE);
-   if (!savestate_dir || !*savestate_dir)
-      return;
-
-   fill_pathname_base(basename, entry->path, sizeof(basename));
-   path_remove_extension(basename);
-   if (!*basename)
-      return;
-
-   fill_pathname_join_special(auto_path, savestate_dir, basename,
-         sizeof(auto_path));
-   strlcat(auto_path, ".state.auto", sizeof(auto_path));
-   if (!path_is_valid(auto_path))
-      return;
-
-   if (entry->label && *entry->label)
-      label = entry->label;
-   else
-      label = basename;
-
-   snprintf(dp->resume_label, sizeof(dp->resume_label), "Resume %s", label);
-   dp->resume_available = true;
-   dp->resume_pl_idx    = 0;
-}
-
 /* Dispose hook for the RECENTS frame: free the cached display rows
  * and the read-only thumbnail resolver.  Selection is preserved by
  * the parent TOP frame underneath us, so we don't need to do
@@ -1876,13 +1902,14 @@ static void pastime_recents_dispose(void *user, void *side)
 
 /* Dispose hook for the INGAME frame.  The action array stays on dp
  * (next push will rebuild it via refresh_ingame_actions); we just
- * need to refresh the launcher's Resume row availability so the new
- * autosave RA wrote on unload shows up. */
+ * need to refresh can_resume so the footer hint updates after the
+ * auto-save RA wrote on unload. */
 static void pastime_ingame_dispose(void *user, void *side)
 {
    pastime_handle_t *dp = (pastime_handle_t*)user;
    (void)side;
-   pastime_refresh_resume(dp);
+   pastime_defaults_cancel_auto_load();
+   pastime_refresh_can_resume(dp);
 }
 
 /* Dispose hook for the SAVE_PICKER frame: free thumbnail textures
@@ -2138,6 +2165,7 @@ static void pastime_do_launch_rom(const char *core_ident, const char *rom_path)
    if (!pastime_resolve_core_path(core_ident, core_path, sizeof(core_path)))
    {
       RARCH_WARN("[Pastime] core not installed: %s\n", core_ident);
+      pastime_defaults_cancel_auto_load();
       return;
    }
 
@@ -2152,8 +2180,11 @@ static void pastime_do_launch_rom(const char *core_ident, const char *rom_path)
    if (!task_push_load_content_with_new_core_from_menu(
             core_path, rom_path, &content_info,
             CORE_TYPE_PLAIN, NULL, NULL))
+   {
       RARCH_ERR("[Pastime] task_push_load_content failed for '%s'\n",
             rom_path);
+      pastime_defaults_cancel_auto_load();
+   }
 }
 
 static void pastime_clear_pending_launch(pastime_handle_t *dp)
@@ -2184,6 +2215,7 @@ static void pastime_launch_rom(pastime_handle_t *dp,
    if (*dp->pending_launch_core)
    {
       RARCH_WARN("[Pastime] launch already pending; ignoring second pick\n");
+      pastime_defaults_cancel_auto_load();
       return;
    }
 
@@ -2269,11 +2301,6 @@ static void pastime_rebuild_lists(pastime_handle_t *dp)
     * playlist->size unlocked, so don't call rebuild from a task callback. */
    dp->recent_count = g_defaults.content_history
                       ? playlist_size(g_defaults.content_history) : 0;
-
-   /* M7: launcher's "Resume <Game>" row appears when the most-recent
-    * recents entry has a `.state.auto` on disk.  Refreshed here so a
-    * fresh boot picks up an autosave from a previous process. */
-   pastime_refresh_resume(dp);
 
    pastime_recompute_total_rows(dp);
 }
@@ -5715,12 +5742,10 @@ static void pastime_sync_ingame(pastime_handle_t *dp)
    }
    else if (!running && dp->nav.view == PASTIME_VIEW_INGAME)
    {
-      /* Pop returns us to whichever view was underneath INGAME (TOP
-       * if the game was launched from there, RECENTS if from a
-       * Resume row, etc.) — naturally restored by the parent
-       * frame.  Resume-row availability is refreshed by the
-       * dispose hook so the new TOP frame's row composition is
-       * up to date on the next frame. */
+      /* Pop returns us to whichever view was underneath INGAME
+       * (TOP, SYSTEM, RECENTS) — naturally restored by the parent
+       * frame.  can_resume is refreshed by the dispose hook so
+       * the footer hint reflects the newly written auto-save. */
       dp_nav_pop(&dp->nav);
    }
    else if (!running
@@ -6222,8 +6247,16 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
 
    {
       pastime_hint_t left[1];
-      left[0].glyph = "POWER";
-      left[0].label = "SLEEP";
+      if (mode == PASTIME_RENDER_LIST && dp->can_resume)
+      {
+         left[0].glyph = "X";
+         left[0].label = "RESUME";
+      }
+      else
+      {
+         left[0].glyph = "POWER";
+         left[0].label = "SLEEP";
+      }
       pastime_draw_footer_hints(p_disp, userdata, dp->chrome_font,
             dp->chrome_font_centre_offset, &dp->layout,
             dp->pill_cap_tex, dp->layout.margin_x, bottom_y,
@@ -6296,6 +6329,38 @@ static const char *pastime_nav_label_adapter(void *user, size_t row)
    return pastime_row_label((const pastime_handle_t*)user, row);
 }
 
+/* Caller guarantees SYSTEM view with valid dp->roms and selection. */
+static void pastime_launch_system_selection(pastime_handle_t *dp)
+{
+   const pastime_system_t *sys = &dp->systems[dp->active_system];
+   const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
+   const pastime_source_t *src = &sys->sources[rom->source_idx];
+   dp->launch_return_view       = PASTIME_VIEW_SYSTEM;
+   dp->launch_return_system_idx = dp->active_system;
+   dp->launch_return_selection  = dp->nav.selection;
+   dp->launch_return_armed      = true;
+   pastime_apply_immersive(dp, true);
+   if (src->external)
+   {
+      pastime_defaults_cancel_auto_load();
+      pastime_external_launch(src->external, rom->full_path);
+   }
+   else
+      pastime_launch_rom(dp, src->core_ident, rom->full_path);
+}
+
+static void pastime_launch_recents_selection(pastime_handle_t *dp)
+{
+   if (dp->recents && dp->nav.selection < dp->recent_row_count)
+   {
+      dp->launch_return_view      = PASTIME_VIEW_RECENTS;
+      dp->launch_return_selection = 0;
+      dp->launch_return_armed     = true;
+      pastime_apply_immersive(dp, true);
+      pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
+   }
+}
+
 static int pastime_entry_action(void *userdata, menu_entry_t *entry,
       size_t i, enum menu_action action)
 {
@@ -6351,6 +6416,7 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
              * to the ROM they decided not to launch. */
             pastime_clear_pending_launch(dp);
             dp->launch_return_armed = false;
+            pastime_defaults_cancel_auto_load();
             pastime_setup_cancel();
          }
          return 0;
@@ -6550,42 +6616,11 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
                   break;
                case DP_INGAME_LOAD:
                {
-                  pastime_save_entry_t scratch[PASTIME_MAX_SAVE_ENTRIES];
-                  size_t                scratch_count = 0;
-                  size_t                manual_count  = 0;
-                  size_t                i;
-                  int                   only_slot     = 0;
-
-                  /* Re-enumerate (without thumbs) to count manual
-                   * saves — could have changed since view enter
-                   * (background autosave, manual external delete). */
-                  pastime_savestate_enumerate(scratch, &scratch_count, false);
-                  for (i = 0; i < scratch_count; i++)
-                  {
-                     if (scratch[i].slot < 0)
-                        continue;
-                     if (manual_count == 0)
-                        only_slot = scratch[i].slot;
-                     manual_count++;
-                  }
-                  if (manual_count == 0)
-                     break;       /* race: row hidden next frame */
-                  if (manual_count == 1)
-                  {
-                     pastime_load_from_slot(only_slot);
-                     command_event(CMD_EVENT_MENU_TOGGLE, NULL);
-                     break;
-                  }
-                  /* >1: open the picker.  Loads thumbnails synchronously
-                   * (~10-50 ms one-shot hitch on view enter is fine for
-                   * a deliberate user action). */
-                  /* Pre-populate the picker buffer before push so
-                   * the recompute inside dp_nav_sync_top reads the
-                   * right row count.  save_picker[] stays on dp —
-                   * only one picker exists at a time. */
                   pastime_save_picker_free(dp);
                   pastime_savestate_enumerate(dp->save_picker,
                         &dp->save_picker_count, true);
+                  if (dp->save_picker_count == 0)
+                     break;
                   dp_nav_push(&dp->nav, PASTIME_VIEW_SAVE_PICKER, NULL,
                         pastime_save_picker_dispose);
                   break;
@@ -6617,72 +6652,18 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          }
          if (dp->nav.view == PASTIME_VIEW_SYSTEM)
          {
-            const pastime_system_t *sys = &dp->systems[dp->active_system];
-            const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
-            const pastime_source_t *src;
-            /* Multi-source merge: each ROM remembers which source folder
-             * it came from, so the launch backend is per-ROM, not per-
-             * system.  source_idx is bounded by source_count at scan
-             * time; no runtime check needed. */
-            src = &sys->sources[rom->source_idx];
-            /* Capture launcher position so post-exit sync can restore
-             * us to this same SYSTEM list with the cursor on the ROM
-             * we just played.  See launch_return_* on pastime_handle_t. */
-            dp->launch_return_view       = PASTIME_VIEW_SYSTEM;
-            dp->launch_return_system_idx = dp->active_system;
-            dp->launch_return_selection  = dp->nav.selection;
-            dp->launch_return_armed      = true;
-            /* Hide the Android status bar now — the menu_toggle hook
-             * will fire when the menu hides, but `running` is still
-             * false at that point (core hasn't loaded yet) so the
-             * launcher state would stick. */
-            pastime_apply_immersive(dp, true);
-            /* core_ident vs external is mutually exclusive per source —
-             * parser invariant.  External launches are fire-and-forget;
-             * the Java helper surfaces toast on failure. */
-            if (src->external)
-               pastime_external_launch(src->external, rom->full_path);
-            else
-               pastime_launch_rom(dp, src->core_ident, rom->full_path);
+            pastime_launch_system_selection(dp);
             return 0;
          }
          if (dp->nav.view == PASTIME_VIEW_RECENTS)
          {
-            if (dp->recents && dp->nav.selection < dp->recent_row_count)
-            {
-               /* Launching from recents bumps the played ROM to row 0
-                * of the recents list, so return the cursor to row 0
-                * (the now-topmost entry) rather than the row the user
-                * launched from — that row now holds a different ROM. */
-               dp->launch_return_view      = PASTIME_VIEW_RECENTS;
-               dp->launch_return_selection = 0;
-               dp->launch_return_armed     = true;
-               pastime_apply_immersive(dp, true);
-               pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
-            }
+            pastime_launch_recents_selection(dp);
             return 0;
          }
-         /* TOP view: Resume → recents-launch the head; Recents → open;
-          * else → drill into a system.  Order mirrors row layout in
-          * pastime_row_label. */
+         /* TOP view: Recents → open; else → drill into a system.
+          * Order mirrors row layout in pastime_row_label. */
          {
             size_t sel = dp->nav.selection;
-            if (pastime_has_resume_row(dp))
-            {
-               if (sel == 0)
-               {
-                  /* Resume plays head of recents; on exit, return the
-                   * user to the Recents list with cursor on the just-
-                   * played ROM (always at row 0 after the launch). */
-                  dp->launch_return_view      = PASTIME_VIEW_RECENTS;
-                  dp->launch_return_selection = 0;
-                  dp->launch_return_armed     = true;
-                  pastime_apply_immersive(dp, true);
-                  pastime_launch_recent(dp->resume_pl_idx);
-                  return 0;
-               }
-               sel--;
-            }
             if (pastime_has_recents_row(dp) && sel == 0)
             {
                pastime_open_recents(dp);
@@ -6720,6 +6701,27 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          }
          /* TOP view: nothing to back out to.  Stay put. */
          return 0;
+      case MENU_ACTION_SEARCH:
+      case MENU_ACTION_SCAN:
+      {
+         /* X button: resume from auto-save if available.
+          * RA maps JOYPAD_X → SEARCH, JOYPAD_Y → SCAN.  When swap_ok_cancel
+          * is on (Nintendo layout), the physical X button sends SCAN instead
+          * of SEARCH, so accept whichever action matches the swap state. */
+         bool swapped = config_get_ptr()->bools.input_menu_swap_ok_cancel_buttons;
+         if (action != (swapped ? MENU_ACTION_SCAN : MENU_ACTION_SEARCH))
+            return 0;
+         if (!dp->can_resume)
+            return 0;
+         pastime_defaults_request_auto_load();
+         if (dp->nav.view == PASTIME_VIEW_SYSTEM)
+            pastime_launch_system_selection(dp);
+         else if (dp->nav.view == PASTIME_VIEW_RECENTS)
+            pastime_launch_recents_selection(dp);
+         else
+            pastime_defaults_cancel_auto_load();
+         return 0;
+      }
       case MENU_ACTION_START:
          /* Launcher-only shortcut into the global Settings list.
           * Other views ignore Start (RA's default for it is "reset
