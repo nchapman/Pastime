@@ -103,6 +103,7 @@ void pastime_bootstrap(void)
    pastime_ensure_dir(root, "Bios");
    pastime_ensure_dir(root, "Saves");
    pastime_ensure_dir(root, "States");
+   pastime_ensure_dir(root, "Collections");
 
    /* Seed system subfolders only when Roms/ was freshly created. */
    if (!roms_existed)

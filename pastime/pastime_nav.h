@@ -33,6 +33,8 @@ enum pastime_view
    PASTIME_VIEW_TOP = 0,    /* recents header + system list */
    PASTIME_VIEW_SYSTEM,     /* drilled into one system; showing its ROMs */
    PASTIME_VIEW_RECENTS,    /* drilled into recents history */
+   PASTIME_VIEW_COLLECTIONS,/* list of collection names (drill from TOP) */
+   PASTIME_VIEW_COLLECTION, /* ROM list from one collection .txt */
    PASTIME_VIEW_INGAME,     /* core running; show Continue/Save/Load/Quit overlay */
    PASTIME_VIEW_SAVE_PICKER,/* drilled into save-state list */
    PASTIME_VIEW_SETTINGS,   /* settings-style list (Options → core opts) */
