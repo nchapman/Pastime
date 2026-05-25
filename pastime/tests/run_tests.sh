@@ -100,6 +100,12 @@ $CC $CFLAGS $INC \
     -o test_thumbs
 BUILT+=(test_thumbs)
 
+echo "== building test_rommap"
+$CC $CFLAGS $INC \
+    test_rommap.c \
+    -o test_rommap
+BUILT+=(test_rommap)
+
 # --- run only what we just built ---
 fail=0
 for bin in "${BUILT[@]}"; do

@@ -60,6 +60,7 @@
 #include "../../pastime/pastime_external.h"
 #include "../../pastime/pastime_metadata.h"
 #include "../../pastime/pastime_nav.h"
+#include "../../pastime/pastime_rommap.h"
 #include "../../pastime/pastime_setup.h"
 #include "../../pastime/pastime_storage.h"
 #include "../../pastime/pastime_thumbs.h"
@@ -436,6 +437,11 @@ struct pastime_handle_s
     * future footgun. */
    char                pending_launch_core[PATH_MAX_LENGTH];
    char                pending_launch_rom[PATH_MAX_LENGTH];
+
+   /* Display name of the running game, captured at launch time.
+    * Used by the INGAME title pill instead of re-deriving from
+    * the content path (which is the opaque filename for mapped ROMs). */
+   char                running_game_title[NAME_MAX_LENGTH];
 
    /* Where the user was when they kicked off the current launch.
     * Captured at OK time on a ROM row; consumed by pastime_sync_ingame
@@ -1190,32 +1196,94 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
    if (!sys || !sys->sources || sys->source_count == 0)
       return NULL;
 
+   /* Cache baked map across sources — multi-source systems often share
+    * a core, so we avoid re-parsing the large map file per source. */
+   {
+   char              cached_baked_fn[64] = "";
+   pastime_rommap_t *cached_baked       = NULL;
+
    for (src_i = 0; src_i < sys->source_count; src_i++)
    {
       const char         *system_path = sys->sources[src_i].full_path;
       struct string_list *raw;
+      pastime_rommap_t   *user_map  = NULL;
+      pastime_rommap_t   *baked_map = NULL;
 
       if (!system_path || !*system_path)
          continue;
+
+      /* Load name maps: user override in ROM folder, baked via core routing */
+      {
+         char map_path[PATH_MAX_LENGTH];
+         const char *baked_fn;
+
+         fill_pathname_join_special(map_path, system_path, "map.txt",
+               sizeof(map_path));
+         user_map = pastime_rommap_load(map_path);
+
+         baked_fn = pastime_rommap_route(sys->sources[src_i].core_ident);
+         if (baked_fn)
+         {
+            if (!string_is_equal(baked_fn, cached_baked_fn))
+            {
+               settings_t *settings = config_get_ptr();
+               pastime_rommap_free(cached_baked);
+               cached_baked = NULL;
+               cached_baked_fn[0] = '\0';
+               if (settings && *settings->paths.directory_assets)
+               {
+                  char maps_dir[PATH_MAX_LENGTH];
+                  fill_pathname_join_special(maps_dir,
+                        settings->paths.directory_assets, "pastime/maps",
+                        sizeof(maps_dir));
+                  fill_pathname_join_special(map_path, maps_dir, baked_fn,
+                        sizeof(map_path));
+                  cached_baked = pastime_rommap_load(map_path);
+                  strlcpy(cached_baked_fn, baked_fn,
+                        sizeof(cached_baked_fn));
+               }
+            }
+            baked_map = cached_baked;
+         }
+      }
+
       raw = dir_list_new(system_path, NULL,
             false /* include_dirs */, false, false, false /* recursive */);
       if (!raw)
+      {
+         pastime_rommap_free(user_map);
          continue;
+      }
 
       for (i = 0; i < raw->size; i++)
       {
          const char *full = raw->elems[i].data;
          char        base[NAME_MAX_LENGTH];
          char       *display;
+         const char *mapped;
 
          if (!full || !*full)
             continue;
          fill_pathname_base(base, full, sizeof(base));
          if (!*base || base[0] == '.')
             continue;
-         pastime_display_name_strip_rom_extension(base);
-         if (!*base)
+         if (string_is_equal(base, "map.txt"))
             continue;
+
+         /* Map lookup before extension strip — key includes extension */
+         mapped = pastime_rommap_lookup(user_map, base);
+         if (!mapped)
+            mapped = pastime_rommap_lookup(baked_map, base);
+
+         if (mapped && mapped[0] == '.')
+            continue; /* hidden ROM */
+
+         if (!mapped)
+         {
+            pastime_display_name_strip_rom_extension(base);
+            if (!*base)
+               continue;
+         }
 
          if (count == cap)
          {
@@ -1234,33 +1302,42 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
             char        clean[NAME_MAX_LENGTH];
             char        tag[NAME_MAX_LENGTH];
             char        sort_buf[NAME_MAX_LENGTH];
-            /* Strip No-Intro / Redump trailing tags here so the user
-             * sees "Super Mario Bros. 3" not "...(USA) (Rev A)".  The
-             * tag itself is preserved on the side so the disambig
-             * pass can re-attach it on collision. */
-            pastime_display_name_clean_keep_tag(base, clean, sizeof(clean),
-                  tag, sizeof(tag));
-            if (!*clean)
-               continue;
-            pastime_display_name_sort_key(clean, sort_buf, sizeof(sort_buf));
-            if (!(display = strdup(clean)))
-               break;
+
+            if (mapped)
+            {
+               pastime_display_name_sort_key(mapped, sort_buf,
+                     sizeof(sort_buf));
+               if (!(display = strdup(mapped)))
+                  break;
+            }
+            else
+            {
+               pastime_display_name_clean_keep_tag(base, clean,
+                     sizeof(clean), tag, sizeof(tag));
+               if (!*clean)
+                  continue;
+               pastime_display_name_sort_key(clean, sort_buf,
+                     sizeof(sort_buf));
+               if (!(display = strdup(clean)))
+                  break;
+               if (*tag && !(tag_dup = strdup(tag)))
+               {
+                  free(display);
+                  break;
+               }
+            }
+
             if (!(sort_dup = strdup(sort_buf)))
             {
                free(display);
+               free(tag_dup);
                break;
             }
             if (!(path_dup = strdup(full)))
             {
                free(display);
                free(sort_dup);
-               break;
-            }
-            if (*tag && !(tag_dup = strdup(tag)))
-            {
-               free(display);
-               free(sort_dup);
-               free(path_dup);
+               free(tag_dup);
                break;
             }
             memset(&roms[count], 0, sizeof(roms[count]));
@@ -1270,15 +1347,14 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
             roms[count].tag          = tag_dup;
             roms[count].source_idx   = (uint8_t)src_i;
             gfx_thumbnail_init_blank(&roms[count].thumbnail);
-            /* image_w/image_h left zero by memset — populated by the
-             * dim warm-up in pastime_open_system after the thumbnail
-             * manager opens, and re-populated by the per-frame drive
-             * once the index lands. */
             count++;
          }
       }
       string_list_free(raw);
+      pastime_rommap_free(user_map);
    }
+   pastime_rommap_free(cached_baked);
+   } /* end cached_baked scope */
 
    if (count > 1)
       qsort(roms, count, sizeof(*roms), pastime_rom_cmp);
@@ -1471,11 +1547,11 @@ static void pastime_recents_free(pastime_recent_t *rows, size_t count)
    free(rows);
 }
 
-/* Build display rows for the recents view.  Prefer the entry's own
- * label; fall back to the ROM filename minus extension.  Skips entries
- * with neither (corrupt history line, contentless-core stub) so they
- * can't push a blank row — pl_idx preserves the original index for
- * launch lookup. */
+/* Build display rows for the recents view.  Prefer map lookup, then
+ * the entry's own label, then ROM filename minus extension.  Skips
+ * entries with neither (corrupt history line, contentless-core stub)
+ * so they can't push a blank row — pl_idx preserves the original
+ * index for launch lookup. */
 static pastime_recent_t *pastime_build_recents(size_t *out_count)
 {
    playlist_t        *pl    = g_defaults.content_history;
@@ -1494,63 +1570,37 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
    if (!(out = (pastime_recent_t*)calloc(total, sizeof(*out))))
       return NULL;
 
+   /* Cache the baked map across iterations — most recents entries share
+    * the same core, so we avoid re-parsing the 66K-entry file per row. */
+   {
+   char              cached_baked_fn[64] = "";
+   pastime_rommap_t *cached_bmap        = NULL;
+
    for (i = 0; i < total; i++)
    {
       const struct playlist_entry *entry = NULL;
-      const char                  *src;
+      const char                  *src   = NULL;
       char                        *dup;
+      char         parent_dir[PATH_MAX_LENGTH];
+      const char  *folder;
+      char        *display     = NULL;
+      char        *ident       = NULL;
+      const char  *basename    = NULL;
+      const char  *mapped      = NULL;
+      const pastime_external_spec_t *external = NULL;
 
       playlist_get_index(pl, i, &entry);
       if (!entry)
          continue;
-      if (entry->label && *entry->label)
-         src = entry->label;
-      else if (entry->path && *entry->path)
-      {
-         fill_pathname_base(buf, entry->path, sizeof(buf));
-         pastime_display_name_strip_rom_extension(buf);
-         if (!*buf)
-            continue;
-         src = buf;
-      }
-      else
-         continue;
 
-      {
-         char clean[NAME_MAX_LENGTH];
-         pastime_display_name_clean(src, clean, sizeof(clean));
-         if (!*clean)
-            continue;
-         if (!(dup = strdup(clean)))
-            continue;
-      }
-      out[count].display_name = dup;
-      out[count].pl_idx       = i;
-      gfx_thumbnail_init_blank(&out[count].thumbnail);
-
-      /* Best-effort thumbnail-resolution metadata.  Either piece may
-       * be NULL; the recents-view drive function treats that as "no
-       * art for this row" and moves on without complaining.  Recents
-       * never kicks downloads, so an unresolvable system is silently
-       * artless until the user opens that system view (which
-       * populates the index cache via the manager). */
+      /* Extract folder/core info and ROM basename from path early
+       * so we can attempt a map lookup for the display name. */
       if (entry->path && *entry->path)
       {
-         char         parent_dir[PATH_MAX_LENGTH];
-         const char  *folder;
-         char        *display  = NULL;
-         char        *ident    = NULL;
-         const pastime_external_spec_t *external = NULL;
-         const char  *basename;
-
          basename = path_basename(entry->path);
-         if (basename && *basename)
-            out[count].rom_basename = strdup(basename);
 
          strlcpy(parent_dir, entry->path, sizeof(parent_dir));
          path_basedir_wrapper(parent_dir);
-         /* Trim trailing slash so path_basename gives the folder name
-          * itself ("Foo (core)"), not an empty tail. */
          {
             size_t plen = strlen(parent_dir);
             while (plen > 0 && (parent_dir[plen - 1] == '/'
@@ -1558,27 +1608,151 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
                parent_dir[--plen] = '\0';
          }
          folder = path_basename(parent_dir);
-         if (folder && *folder
-               && pastime_parse_system_folder(folder, &display, &ident,
-                  &external))
+         if (folder && *folder)
+            pastime_parse_system_folder(folder, &display, &ident,
+                  &external);
+
+         /* Try map lookup: user map in the ROM folder, then baked.
+          * Copy the result into buf before freeing the map — the
+          * returned pointer is owned by the map's internal buffer. */
+         if (basename && *basename && ident)
          {
-            /* Recents are libretro-only for v1; external launches are
-             * fire-and-forget and never recorded.  Defensive: should
-             * never trigger, but if a stray external folder ever lands
-             * in the playlist, just skip the db_name lookup. */
-            if (!external)
+            /* User map in the ROM folder (highest priority) */
             {
-               const char *db = pastime_metadata_resolve_db_name(display,
-                     ident);
-               if (db && *db)
-                  out[count].db_name = strdup(db);
+               char map_path[PATH_MAX_LENGTH];
+               pastime_rommap_t *umap;
+               strlcpy(map_path, entry->path, sizeof(map_path));
+               path_basedir_wrapper(map_path);
+               strlcat(map_path, "map.txt", sizeof(map_path));
+               umap = pastime_rommap_load(map_path);
+               if (umap)
+               {
+                  const char *val = pastime_rommap_lookup(umap, basename);
+                  if (val && val[0] != '.')
+                  {
+                     strlcpy(buf, val, sizeof(buf));
+                     mapped = buf;
+                     src    = buf;
+                  }
+               }
+               pastime_rommap_free(umap);
             }
-            free(display);
-            free(ident);
+            /* Baked map via core routing (fallback, cached across rows) */
+            if (!mapped)
+            {
+               const char *baked_fn = pastime_rommap_route(ident);
+               if (baked_fn)
+               {
+                  if (!string_is_equal(baked_fn, cached_baked_fn))
+                  {
+                     settings_t *settings = config_get_ptr();
+                     pastime_rommap_free(cached_bmap);
+                     cached_bmap = NULL;
+                     cached_baked_fn[0] = '\0';
+                     if (settings && *settings->paths.directory_assets)
+                     {
+                        char map_path[PATH_MAX_LENGTH];
+                        char maps_dir[PATH_MAX_LENGTH];
+                        fill_pathname_join_special(maps_dir,
+                              settings->paths.directory_assets,
+                              "pastime/maps", sizeof(maps_dir));
+                        fill_pathname_join_special(map_path, maps_dir,
+                              baked_fn, sizeof(map_path));
+                        cached_bmap = pastime_rommap_load(map_path);
+                        strlcpy(cached_baked_fn, baked_fn,
+                              sizeof(cached_baked_fn));
+                     }
+                  }
+                  if (cached_bmap)
+                  {
+                     const char *val = pastime_rommap_lookup(cached_bmap,
+                           basename);
+                     if (val && val[0] != '.')
+                     {
+                        strlcpy(buf, val, sizeof(buf));
+                        mapped = buf;
+                        src    = buf;
+                     }
+                  }
+               }
+            }
          }
       }
+
+      /* Fallback: playlist label or cleaned filename */
+      if (!src)
+      {
+         if (entry->label && *entry->label)
+            src = entry->label;
+         else if (basename)
+         {
+            fill_pathname_base(buf, entry->path, sizeof(buf));
+            pastime_display_name_strip_rom_extension(buf);
+            if (!*buf)
+            {
+               free(display);
+               free(ident);
+               continue;
+            }
+            src = buf;
+         }
+         else
+         {
+            free(display);
+            free(ident);
+            continue;
+         }
+      }
+
+      {
+         char clean[NAME_MAX_LENGTH];
+         if (mapped)
+         {
+            if (!(dup = strdup(mapped)))
+            {
+               free(display);
+               free(ident);
+               continue;
+            }
+         }
+         else
+         {
+            pastime_display_name_clean(src, clean, sizeof(clean));
+            if (!*clean)
+            {
+               free(display);
+               free(ident);
+               continue;
+            }
+            if (!(dup = strdup(clean)))
+            {
+               free(display);
+               free(ident);
+               continue;
+            }
+         }
+      }
+      out[count].display_name = dup;
+      out[count].pl_idx       = i;
+      gfx_thumbnail_init_blank(&out[count].thumbnail);
+
+      if (basename && *basename)
+         out[count].rom_basename = strdup(basename);
+
+      /* Best-effort thumbnail-resolution metadata. */
+      if (!external && ident)
+      {
+         const char *db = pastime_metadata_resolve_db_name(display,
+               ident);
+         if (db && *db)
+            out[count].db_name = strdup(db);
+      }
+      free(display);
+      free(ident);
       count++;
    }
+   pastime_rommap_free(cached_bmap);
+   } /* end cached_bmap scope */
 
    if (count == 0)
    {
@@ -2033,7 +2207,6 @@ static void pastime_system_dispose(void *user, void *side)
 static void dp_warm_roms_dims(pastime_handle_t *dp)
 {
    size_t      i;
-   const char *base;
    uint16_t    w;
    uint16_t    h;
    bool        any_hit = false;
@@ -2041,12 +2214,12 @@ static void dp_warm_roms_dims(pastime_handle_t *dp)
       return;
    for (i = 0; i < dp->rom_count; i++)
    {
-      base = path_basename(dp->roms[i].full_path);
+      const char *lookup = dp->roms[i].display_name;
       w    = 0;
       h    = 0;
-      if (!base || !*base)
+      if (!lookup || !*lookup)
          continue;
-      if (pastime_thumbs_peek(dp->current_thumbs, base,
+      if (pastime_thumbs_peek(dp->current_thumbs, lookup,
                &w, &h, NULL, NULL))
       {
          dp->roms[i].image_w = w;
@@ -2109,7 +2282,7 @@ static void pastime_open_system(pastime_handle_t *dp, size_t sys_idx)
             ? dp->rom_count : DP_SPECULATIVE_PREFETCH_ROWS;
       for (i = 0; i < cap; i++)
       {
-         const char *b = path_basename(dp->roms[i].full_path);
+         const char *b = dp->roms[i].display_name;
          if (b && *b)
             names[n++] = b;
       }
@@ -2813,32 +2986,21 @@ static int pastime_draw_text_pill(gfx_display_t *p_disp, void *userdata,
 }
 
 /* INGAME-only: dark pill at the top-left holding the loaded content's
- * display name (basename minus extension).  Sized to the row font so
- * the title visually anchors the menu the way "Continue/Quit" do. */
+ * display name.  Uses the pre-resolved running_game_title (set at
+ * launch time from the map or No-Intro clean logic) so arcade ROMs
+ * show their friendly name, not the opaque zip filename. */
 static void pastime_draw_title_pill(gfx_display_t *p_disp, void *userdata,
       font_data_t *font, int centre_offset, int height,
       const pastime_layout_t *L, uintptr_t cap_tex,
-      int right_limit)
+      int right_limit, const char *title)
 {
-   const char *content = path_get(RARCH_PATH_CONTENT);
-   char        title[NAME_MAX_LENGTH];
-   char        clean[NAME_MAX_LENGTH];
-   int         max_w;
+   char  clean[NAME_MAX_LENGTH];
+   int   max_w;
 
-   if (!content || !*content)
+   if (!title || !*title)
       return;
-   fill_pathname_base(title, content, sizeof(title));
-   pastime_display_name_strip_rom_extension(title);
-   if (!*title)
-      return;
-   /* Same cleanup as the system list rows: strip "(USA) (Rev 1) [!]"
-    * tails and rotate ", The" articles to the front. */
-   pastime_display_name_clean(title, clean, sizeof(clean));
-   if (!*clean)
-      return;
+   strlcpy(clean, title, sizeof(clean));
 
-   /* Title spans from the left margin to right_limit, so on long
-    * content names it grows almost the full width of the screen. */
    max_w = right_limit - L->margin_x;
    if (max_w < height)
       max_w = height;
@@ -5189,10 +5351,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
       uintptr_t              tex = 0;
       unsigned               w   = 0;
       unsigned               h   = 0;
-      /* Peek the thumbhash for the placeholder fallback.  Cheap; no
-       * I/O.  base_path may be NULL very early; in that case th
-       * stays NULL and dp_resolve_preview_tex returns no fallback. */
-      base = rom->full_path ? path_basename(rom->full_path) : NULL;
+      base = rom->display_name;
       if (dp->current_thumbs && base && *base)
          pastime_thumbs_peek(dp->current_thumbs, base,
                NULL, NULL, &th, &thlen);
@@ -5392,7 +5551,7 @@ static void pastime_drive_system_thumbnails(pastime_handle_t *dp)
       return; /* No db_name → no art for this system, ever. */
 
    rom  = &dp->roms[sel];
-   base = path_basename(rom->full_path);
+   base = rom->display_name;
    if (!base || !*base)
       return;
 
@@ -5483,7 +5642,7 @@ static void pastime_drive_system_thumbnails(pastime_handle_t *dp)
          if (delta == 0) continue;
          idx = (long)sel + delta;
          if (idx < 0 || idx >= (long)dp->rom_count) continue;
-         names[n++] = path_basename(dp->roms[idx].full_path);
+         names[n++] = dp->roms[idx].display_name;
       }
       if (n > 0)
          pastime_thumbs_prefetch(dp->current_thumbs, names, n);
@@ -5539,10 +5698,10 @@ static void pastime_drive_recents_thumbnails(pastime_handle_t *dp)
          re = &dp->recents[i];
          if (re->image_cached)
             continue;
-         if (!re->db_name || !re->rom_basename)
+         if (!re->db_name || !re->display_name)
             continue;
          if (pastime_thumbs_recents_resolve(dp->recents_thumbs,
-                  re->db_name, re->rom_basename, path, sizeof(path)))
+                  re->db_name, re->display_name, path, sizeof(path)))
             re->image_cached = true;
       }
    }
@@ -5564,10 +5723,10 @@ static void pastime_drive_recents_thumbnails(pastime_handle_t *dp)
          h  = 0;
          if (re->image_w || re->image_h)
             continue;
-         if (!re->db_name || !re->rom_basename)
+         if (!re->db_name || !re->display_name)
             continue;
          if (pastime_thumbs_recents_peek(dp->recents_thumbs,
-                  re->db_name, re->rom_basename,
+                  re->db_name, re->display_name,
                   &w, &h, NULL, NULL))
          {
             re->image_w = w;
@@ -5598,11 +5757,11 @@ static void pastime_drive_recents_thumbnails(pastime_handle_t *dp)
    row = &dp->recents[sel];
    if (!row->db_name || !*row->db_name)
       return;
-   if (!row->rom_basename || !*row->rom_basename)
+   if (!row->display_name || !*row->display_name)
       return;
 
    if (!pastime_thumbs_recents_resolve(dp->recents_thumbs,
-            row->db_name, row->rom_basename, path, sizeof(path)))
+            row->db_name, row->display_name, path, sizeof(path)))
       return;
 
    status = (enum gfx_thumbnail_status)
@@ -6138,9 +6297,25 @@ static void pastime_menu_frame(void *data, video_frame_info_t *video_info)
    if (dp->nav.view == PASTIME_VIEW_INGAME)
    {
       int title_right_limit = (int)dp->layout.vid_w - dp->layout.margin_x;
+      const char *pill_title = dp->running_game_title;
+      char        pill_fallback[NAME_MAX_LENGTH];
+      if (!*pill_title)
+      {
+         const char *content = path_get(RARCH_PATH_CONTENT);
+         if (content && *content)
+         {
+            fill_pathname_base(pill_fallback, content,
+                  sizeof(pill_fallback));
+            pastime_display_name_strip_rom_extension(pill_fallback);
+            pastime_display_name_clean(pill_fallback, pill_fallback,
+                  sizeof(pill_fallback));
+            pill_title = pill_fallback;
+         }
+      }
       pastime_draw_title_pill(p_disp, userdata, dp->font,
             dp->font_centre_offset, dp->layout.row_h,
-            &dp->layout, dp->pill_cap_tex, title_right_limit);
+            &dp->layout, dp->pill_cap_tex, title_right_limit,
+            pill_title);
    }
 
    switch (mode)
@@ -6303,6 +6478,8 @@ static void pastime_launch_system_selection(pastime_handle_t *dp)
    dp->launch_return_system_idx = dp->active_system;
    dp->launch_return_selection  = dp->nav.selection;
    dp->launch_return_armed      = true;
+   strlcpy(dp->running_game_title, rom->display_name,
+         sizeof(dp->running_game_title));
    pastime_apply_immersive(dp, true);
    if (src->external)
    {
@@ -6320,6 +6497,9 @@ static void pastime_launch_recents_selection(pastime_handle_t *dp)
       dp->launch_return_view      = PASTIME_VIEW_RECENTS;
       dp->launch_return_selection = 0;
       dp->launch_return_armed     = true;
+      strlcpy(dp->running_game_title,
+            dp->recents[dp->nav.selection].display_name,
+            sizeof(dp->running_game_title));
       pastime_apply_immersive(dp, true);
       pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
    }
@@ -6500,19 +6680,14 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
       case MENU_ACTION_UP:
          dp_nav_set_selection(&dp->nav,
                (dp->nav.selection + dp->total_rows - 1) % dp->total_rows);
-         return 0;
+         goto selection_changed;
       case MENU_ACTION_DOWN:
          dp_nav_set_selection(&dp->nav,
                (dp->nav.selection + 1) % dp->total_rows);
-         return 0;
+         goto selection_changed;
       case MENU_ACTION_LEFT:
       case MENU_ACTION_RIGHT:
       {
-         /* D-pad LEFT/RIGHT as page jump on launcher lists — LessUI
-          * muscle memory.  SETTINGS view already consumed LEFT/RIGHT
-          * above (option cycling), so this only fires on TOP / SYSTEM /
-          * RECENTS / SAVE_PICKER / INGAME.  Same page-size math as the
-          * shoulder-button page jump below. */
          int    dir  = (action == MENU_ACTION_RIGHT) ? +1 : -1;
          size_t page = dp->list_visible_rows;
          if (page <= 1) page = 1;
@@ -6520,17 +6695,11 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          dp_nav_set_selection(&dp->nav,
                dp_nav_page_jump(dp->nav.selection, dp->total_rows,
                      page, dir));
-         return 0;
+         goto selection_changed;
       }
       case MENU_ACTION_SCROLL_UP:
       case MENU_ACTION_SCROLL_DOWN:
       {
-         /* Framework convention (see menu_driver.c): L/R defaults to
-          * PAGE, L2/R2 to LETTER (swapped by the input_menu_swap_scroll
-          * setting).  The action delivered is the same SCROLL_UP /
-          * SCROLL_DOWN regardless; the mode flag tells us which.  Both
-          * jumps are clamped — no wrap — so fast-scrolling stops at
-          * either edge instead of skipping back across the list. */
          struct menu_state *menu_st = menu_state_get_ptr();
          int                dir     = (action == MENU_ACTION_SCROLL_DOWN)
                                       ? +1 : -1;
@@ -6542,19 +6711,19 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
          {
             size_t page = dp->list_visible_rows;
             if (page <= 1) page = 1;
-            else           page -= 1;   /* leave one row of overlap */
+            else           page -= 1;
             target = dp_nav_page_jump(dp->nav.selection, dp->total_rows,
                   page, dir);
          }
          dp_nav_set_selection(&dp->nav, target);
-         return 0;
+         goto selection_changed;
       }
       case MENU_ACTION_SCROLL_HOME:
          dp_nav_set_selection(&dp->nav, 0);
-         return 0;
+         goto selection_changed;
       case MENU_ACTION_SCROLL_END:
          dp_nav_set_selection(&dp->nav, dp->total_rows - 1);
-         return 0;
+         goto selection_changed;
       case MENU_ACTION_OK:
       case MENU_ACTION_SELECT:
          if (dp->nav.view == PASTIME_VIEW_INGAME)
@@ -6698,8 +6867,10 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
       default:
          break;
    }
-   /* Returning 0 = action not consumed but no error; the framework
-    * iterate loop treats any non-zero return as fatal and aborts. */
+   return 0;
+
+selection_changed:
+   pastime_refresh_can_resume(dp);
    return 0;
 }
 

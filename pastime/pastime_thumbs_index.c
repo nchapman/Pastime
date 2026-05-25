@@ -1730,12 +1730,32 @@ static char *dp_strip_ext(const char *in, char *out, size_t out_size)
    if (out_size == 0)
       return out;
    strlcpy(out, in ? in : "", out_size);
-   /* Caller passes a basename (no path separators), so plain strrchr
-    * on the buffer is correct.  Skip files starting with '.' — they
-    * have no real extension to strip ("." at index 0). */
+   /* Strip only if the suffix looks like a file extension: 1–4
+    * alphabetic chars after the last dot.  Real ROM extensions
+    * (zip, 7z, sfc, bin, etc.) are always alpha; this avoids
+    * mangling display names like "Super Mario Bros. 3" or
+    * "Title v1.0". */
    dot = strrchr(out, '.');
    if (dot && dot != out)
-      out[dot - out] = '\0';
+   {
+      const char *p = dot + 1;
+      size_t      ext_len = strlen(p);
+      if (ext_len >= 1 && ext_len <= 4)
+      {
+         bool valid_ext = true;
+         while (*p)
+         {
+            if (!isalpha((unsigned char)*p))
+            {
+               valid_ext = false;
+               break;
+            }
+            p++;
+         }
+         if (valid_ext)
+            out[dot - out] = '\0';
+      }
+   }
    return out;
 }
 
@@ -1880,17 +1900,51 @@ size_t dp_idx_match(
    needle_hash = dp_fnv1a32(heavy_user);
    lo = dp_lower_bound_heavy(idx, heavy_user, needle_hash);
    if (lo >= idx->entry_count)
-      return (size_t)-1;
-   /* Confirm the lower-bound hit is actually equal — lower-bound
-    * returns the first slot >= so a non-equal landing means miss. */
+      goto try_split;
    dp_idx_bheavy_at(idx, lo, &h, &ei);
    if (h != needle_hash)
-      return (size_t)-1;
+      goto try_split;
    if (strcmp(dp_idx_heavy(idx, ei), heavy_user) != 0)
-      return (size_t)-1;
+      goto try_split;
 
    dp_extract_disc_token(stem, user_disc, sizeof(user_disc));
    return dp_pick_best(idx, lo, needle_hash, heavy_user, user_disc);
+
+try_split:
+   /* Multi-name entries (e.g. "Title A / Title B" from map.txt) won't
+    * match because the index stores each alt as a separate heavy.
+    * Retry with just the first segment before " / ". */
+   {
+      const char *slash = strstr(stem, " / ");
+      if (slash)
+      {
+         char seg[512];
+         size_t seg_len = (size_t)(slash - stem);
+         if (seg_len > 0 && seg_len < sizeof(seg))
+         {
+            memcpy(seg, stem, seg_len);
+            seg[seg_len] = '\0';
+            dp_normalize_heavy(seg, heavy_user, sizeof(heavy_user));
+            if (*heavy_user)
+            {
+               needle_hash = dp_fnv1a32(heavy_user);
+               lo = dp_lower_bound_heavy(idx, heavy_user, needle_hash);
+               if (lo < idx->entry_count)
+               {
+                  dp_idx_bheavy_at(idx, lo, &h, &ei);
+                  if (h == needle_hash
+                        && strcmp(dp_idx_heavy(idx, ei), heavy_user) == 0)
+                  {
+                     dp_extract_disc_token(seg, user_disc, sizeof(user_disc));
+                     return dp_pick_best(idx, lo, needle_hash,
+                           heavy_user, user_disc);
+                  }
+               }
+            }
+         }
+      }
+   }
+   return (size_t)-1;
 }
 
 const char *pastime_thumbs_index_match(
