@@ -2375,8 +2375,7 @@ static void pastime_layout_recompute(pastime_layout_t *L,
 
    /* Settings-list dimensions.  Row height + font picked so ~10 rows
     * fit on a 480px-tall reference design with room for top/bottom
-    * margins, the status pill, the description band, and a hint
-    * footer.  Tweak after the first build on a real device. */
+    * margins, the description band, and a hint footer. */
    L->settings_row_h     = (int)(36.0f * scale);
    L->settings_font_size = 22.0f * scale;
    L->settings_value_gap = (int)(24.0f * scale);
@@ -2838,10 +2837,8 @@ static void pastime_draw_title_pill(gfx_display_t *p_disp, void *userdata,
    if (!*clean)
       return;
 
-   /* Title spans from the left margin to right_limit (the caller
-    * subtracts the status pill + a margin gap), so on long content
-    * names it grows almost the full width of the screen instead of
-    * truncating at the half mark. */
+   /* Title spans from the left margin to right_limit, so on long
+    * content names it grows almost the full width of the screen. */
    max_w = right_limit - L->margin_x;
    if (max_w < height)
       max_w = height;
@@ -3025,17 +3022,15 @@ static void pastime_close_confirm(pastime_handle_t *dp, bool fire)
 
 /* How many rows fit in the visible area for the active list.
  * Geometry mirrors pastime_draw_settings_view: top = below the
- * status row (with the same gap the launcher list uses); bottom =
- * just above the description band, which sits at the very bottom
- * margin (the SETTINGS view hides the footer hint pills so the row
- * block can extend that far).  Chevron zones are reserved at both
- * ends. */
+ * top margin with a gap; bottom = just above the description band
+ * (SETTINGS hides the footer hint pills so the row block extends
+ * that far).  Chevron zones reserved at both ends. */
 static size_t pastime_settings_visible_rows(const pastime_handle_t *dp,
       const pastime_settings_list_t *L)
 {
    const pastime_layout_t *Ly = &dp->layout;
    int chev_z   = PASTIME_SETTINGS_CHEVRON_ZONE_PX(Ly);
-   int top_y    = Ly->margin_top + Ly->row_h + (int)(16.0f * Ly->scale)
+   int top_y    = Ly->margin_top + (int)(16.0f * Ly->scale)
                 + chev_z;
    int desc_h   = (int)(Ly->chrome_font_size * 2.4f);
    int bottom_y = (int)Ly->vid_h - Ly->margin_y - desc_h - chev_z;
@@ -3198,16 +3193,14 @@ static void pastime_draw_settings_view(gfx_display_t *p_disp, void *userdata,
    }
 
    desc_band_h  = (int)(L->chrome_font_size * 2.4f);
-   /* Top edge sits just below the status pill row, with the same
-    * 16*scale gap the launcher list uses — keeps the two views
-    * visually consistent.  Bottom extends to vid_h - margin_y minus
+   /* Top edge sits below the top margin with the same 16*scale gap
+    * the launcher list uses.  Bottom extends to vid_h - margin_y minus
     * the description band; SETTINGS view hides the footer hint pills
     * so that bottom margin is purely outer padding.  Chevron zones
-    * are reserved at both ends so the up/down chevrons never collide
-    * with the status row or description band. */
+    * are reserved at both ends. */
    {
       int chev_z = PASTIME_SETTINGS_CHEVRON_ZONE_PX(L);
-      avail_top    = L->margin_top + L->row_h + (int)(16.0f * L->scale)
+      avail_top    = L->margin_top + (int)(16.0f * L->scale)
                    + chev_z;
       avail_bottom = (int)L->vid_h - L->margin_y - desc_band_h - chev_z;
       avail_h      = avail_bottom - avail_top;
@@ -4770,34 +4763,10 @@ static void pastime_draw_list_row(gfx_display_t *p_disp, void *userdata,
          (float)text_x, (float)text_y, L, txt_color, TEXT_ALIGN_LEFT);
 }
 
-/* Right-pane preview: draw `tex` (texture_w × texture_h) centred in
- * the right half of the screen with a light placeholder when the
- * texture is 0.  Reusable for any future view that wants a one-image
- * preview of the selected list entry.
- *
- * Pane geometry: the right half minus the outer right margin
- * horizontally; vertically matches the list area (below the status
- * row, above the footer hint).
- *
- * Scaling policy is a parameter so different content types can
- * request the right behaviour — savestate thumbs are typically the
- * core's native framebuffer (e.g. 256×240 NES) and want crisp
- * integer scaling; cover art / hand-drawn assets want smooth aspect-
- * fit; tiny icons might want to render at 1:1. */
-enum pastime_preview_scale
-{
-   /* Aspect-preserving fit: scale up or down so one axis touches the
-    * pane edge.  Bilinear-smoothed.  Use for non-pixel art. */
-   PASTIME_PREVIEW_SCALE_FIT = 0,
-   /* Native pixels when the texture fits; aspect-fit shrink when it
-    * overflows.  Never scales up. */
-   PASTIME_PREVIEW_SCALE_NATIVE,
-   /* Largest integer multiplier (1×, 2×, 3×…) that fits in the pane;
-    * preserves aspect implicitly because both axes scale by the same
-    * factor.  Falls back to NATIVE / aspect-fit when even 1× doesn't
-    * fit.  Right choice for retro framebuffers. */
-   PASTIME_PREVIEW_SCALE_INTEGER
-};
+/* Right-pane preview: aspect-fit `tex` (texture_w × texture_h) into
+ * the right half of the screen.  Pane spans from the right-pane left
+ * edge to the outer margin horizontally; vertically from below the
+ * top margin to above the footer hints. */
 
 /* Smoothstep fade duration for right-pane art changes (in microseconds).
  * 120 ms feels close to LessUI's 100 ms but a touch softer at our larger
@@ -4853,9 +4822,9 @@ static void dp_free_thumbhash_placeholder(pastime_handle_t *dp)
 /* Decode `thumbhash` (already-known-non-NULL) into a small BGRA
  * texture and stash it on dp.  Aspect-correct downscale to
  * DP_THUMBHASH_LONG_EDGE so the placeholder's aspect matches the
- * eventual image's; the FIT scale path in pastime_draw_right_preview
- * then produces the same on-screen rect for both, eliminating size
- * jank when the real image swaps in. */
+ * eventual image's; pastime_draw_right_preview then produces the
+ * same on-screen rect for both, eliminating size jank when the real
+ * image swaps in. */
 static void dp_load_thumbhash_placeholder(
       pastime_handle_t *dp,
       const uint8_t *thumbhash, size_t th_len,
@@ -5003,9 +4972,9 @@ static void dp_resolve_preview_tex(
 
 /* Aspect-fit a (src_w × src_h) image into a (pane_w × pane_h) box;
  * return the resulting on-screen width in pixels.  Cross-product
- * comparison keeps the math integer-only and matches the body of the
- * FIT branch in pastime_draw_right_preview — same answer at the
- * preview draw and at the row-text gate, so the image's left edge
+ * comparison keeps the math integer-only and matches
+ * pastime_draw_right_preview — same answer at the preview draw
+ * and at the row-text gate, so the image's left edge
  * agrees in both places.  Returns 0 on degenerate inputs (caller
  * treats as "no art slot to reserve"). */
 static int pastime_image_pane_width(int pane_w, int pane_h,
@@ -5022,16 +4991,15 @@ static int pastime_image_pane_width(int pane_w, int pane_h,
 
 static void pastime_draw_right_preview(gfx_display_t *p_disp, void *userdata,
       const pastime_layout_t *L, pastime_handle_t *dp,
-      uintptr_t tex, unsigned texture_w, unsigned texture_h,
-      enum pastime_preview_scale scale)
+      uintptr_t tex, unsigned texture_w, unsigned texture_h)
 {
    int pane_left   = L->pane_left;
    int pane_right  = (int)L->vid_w - L->margin_x;
-   /* Symmetric 16*scale gap above the row 0 / status-pill band and below
-    * the footer-hint band so the art reads as floating in the middle of
-    * the chrome rather than crowding either edge. */
+   /* 16*scale gap above the top margin and below the footer-hint band
+    * so the art reads as floating in the chrome rather than crowding
+    * either edge. */
    int pane_gap    = (int)(16.0f * L->scale);
-   int pane_top    = L->margin_top + L->row_h + pane_gap;
+   int pane_top    = L->margin_top + pane_gap;
    int pane_bottom = (int)L->vid_h - L->margin_y - L->row_h - pane_gap;
    int pane_w      = pane_right  - pane_left;
    int pane_h      = pane_bottom - pane_top;
@@ -5039,7 +5007,6 @@ static void pastime_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    int img_h       = 0;
    int img_x;
    int img_y;
-   bool fits_natively;
    retro_time_t now;
    float        t;
    float        alpha;
@@ -5059,36 +5026,11 @@ static void pastime_draw_right_preview(gfx_display_t *p_disp, void *userdata,
    if (pane_w < L->row_h || pane_h < L->row_h)
       return;
 
-   fits_natively = (texture_w <= (unsigned)pane_w
-                && texture_h <= (unsigned)pane_h);
-
-   if (scale == PASTIME_PREVIEW_SCALE_INTEGER && fits_natively)
-   {
-      /* Largest integer multiplier where both axes still fit. */
-      int mx = pane_w / (int)texture_w;
-      int my = pane_h / (int)texture_h;
-      int m  = mx < my ? mx : my;
-      if (m < 1)
-         m = 1;
-      img_w = (int)texture_w * m;
-      img_h = (int)texture_h * m;
-   }
-   else if (scale == PASTIME_PREVIEW_SCALE_NATIVE && fits_natively)
-   {
-      img_w = (int)texture_w;
-      img_h = (int)texture_h;
-   }
+   img_w = pastime_image_pane_width(pane_w, pane_h, texture_w, texture_h);
+   if (img_w == pane_w)
+      img_h = (int)((unsigned)pane_w * texture_h / texture_w);
    else
-   {
-      /* Aspect-fit (FIT, or NATIVE/INTEGER fallback when too big).
-       * Helper keeps the same math used by the per-row text gate so
-       * the image's left edge agrees at both sites. */
-      img_w = pastime_image_pane_width(pane_w, pane_h, texture_w, texture_h);
-      if (img_w == pane_w)
-         img_h = (int)((unsigned)pane_w * texture_h / texture_w);
-      else
-         img_h = pane_h;
-   }
+      img_h = pane_h;
    if (img_w < 1 || img_h < 1)
       return;
 
@@ -5151,9 +5093,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
 {
    size_t   i;
    /* INGAME draws a left-anchored title pill on the top row, so the
-    * list has to start one row below.  Other views leave that row
-    * to the (right-anchored, short) status pill, which sits beside
-    * the left-anchored row 0. */
+    * list starts one row below.  Other views start at margin_top. */
    bool     has_title  = (dp->nav.view == PASTIME_VIEW_INGAME);
    int      list_top   = L->margin_top
                        + (has_title ? L->row_h : 0);
@@ -5174,42 +5114,36 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
    size_t   row_idx;
    int      row_y;
    int      row_w;
-   /* Two-pane truncation gate.  In SYSTEM and SAVE_PICKER views, an
-    * unselected row whose art we *know* is on disk reserves space for
-    * the preview pane.  In SYSTEM view the reservation is per-row,
-    * derived from the entry's actual image dimensions in the
-    * thumbnail index — portrait box-art leaves more text room than
-    * square box-art, and the row never reflows when the image lands
-    * (its width was set up-front from the index, not measured after
-    * decode).  In SAVE_PICKER, dims aren't known until the texture
-    * loads, so the gate is binary on `thumb_tex != 0` and uses the
-    * full-pane fallback width.  The selected row keeps full width
-    * unconditionally — its pill deliberately overlaps its image. */
+   /* Two-pane truncation gate.  Only rows that vertically overlap
+    * the selected image get truncated; others keep full text width.
+    * The selected row keeps full width unconditionally — its pill
+    * deliberately overlaps its image. */
    bool     art_pane_active = (dp->nav.view == PASTIME_VIEW_SYSTEM
                             || dp->nav.view == PASTIME_VIEW_RECENTS
                             || dp->nav.view == PASTIME_VIEW_SAVE_PICKER);
    int      pane_right      = (int)L->vid_w - L->margin_x;
    int      pane_full_w     = pane_right - L->pane_left;
-   /* Pane height = vid_h - margin_top - margin_y - 2*row_h - 2*pane_gap
-    * (chrome row + one pane_gap at each edge).  Mirrors the calc in
-    * draw_right_preview — kept in sync there; this mirror is what
-    * determines the per-row reservation for SYSTEM. */
+   /* Pane height mirrors draw_right_preview: vid_h minus top margin,
+    * bottom margin, one row_h (footer hints), and a gap at each edge.
+    * Kept in sync there; this mirror determines per-row reservation. */
    int      pane_gap        = (int)(16.0f * L->scale);
    int      pane_h          = (int)L->vid_h
                               - L->margin_top - L->margin_y
-                              - 2 * L->row_h
-                            - 2 * pane_gap;
-   /* SAVE_PICKER fallback width: image fills the full pane (square-ish
-    * thumbnails — INTEGER-scale path in draw_right_preview).  One
+                              - L->row_h
+                              - 2 * pane_gap;
+   /* SAVE_PICKER fallback width: image fills the full pane.  One
     * row_text_indent of breathing room between the truncated label and
-    * the image pane.  Asymmetric vs full-width row_max_w (which
-    * doesn't subtract this) by design — the image sits right next to
-    * where the truncated text ends; we want a visible gap there. */
+    * the image pane. */
    int      row_max_w_full_pane = L->pane_left - L->margin_x
                                 - L->row_text_indent;
-   int      top_row_max_w = row_max_w;
-   if (top_row_max_w < 0)
-      top_row_max_w = 0;
+   /* Vertical extent of the selected row's image in screen coords.
+    * Populated below; rows whose y-band doesn't overlap [img_top,
+    * img_bottom) keep full text width. */
+   int      pane_top     = L->margin_top + pane_gap;
+   int      img_top      = -1;
+   int      img_bottom   = -1;
+   if (row_max_w < 0)
+      row_max_w = 0;
    if (row_max_w_full_pane < 0)
       row_max_w_full_pane = 0;
    if (pane_h < 1)
@@ -5242,8 +5176,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
    {
       const pastime_save_entry_t *e = &dp->save_picker[dp->nav.selection];
       pastime_draw_right_preview(p_disp, userdata, L, dp,
-            e->thumb_tex, e->thumb_w, e->thumb_h,
-            PASTIME_PREVIEW_SCALE_INTEGER);
+            e->thumb_tex, e->thumb_w, e->thumb_h);
    }
    else if (dp->nav.view == PASTIME_VIEW_SYSTEM
          && dp->roms && dp->nav.selection < dp->rom_count)
@@ -5265,8 +5198,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
                NULL, NULL, &th, &thlen);
       dp_resolve_preview_tex(dp, t, th, thlen,
             rom->image_w, rom->image_h, &tex, &w, &h);
-      pastime_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
-            PASTIME_PREVIEW_SCALE_FIT);
+      pastime_draw_right_preview(p_disp, userdata, L, dp, tex, w, h);
    }
    else if (dp->nav.view == PASTIME_VIEW_RECENTS
          && dp->recents && dp->nav.selection < dp->recent_row_count)
@@ -5286,8 +5218,7 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
        * per-row text-truncation gate so the layout is correct. */
       dp_resolve_preview_tex(dp, t, NULL, 0,
             re->image_w, re->image_h, &tex, &w, &h);
-      pastime_draw_right_preview(p_disp, userdata, L, dp, tex, w, h,
-            PASTIME_PREVIEW_SCALE_FIT);
+      pastime_draw_right_preview(p_disp, userdata, L, dp, tex, w, h);
    }
    else
    {
@@ -5299,28 +5230,64 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
          dp_free_thumbhash_placeholder(dp);
    }
 
+   /* Compute the selected image's vertical extent for the overlap gate.
+    * Only rows whose y-band intersects [img_top, img_bottom) will have
+    * their text truncated for the art pane. */
+   if (art_pane_active)
+   {
+      unsigned sel_img_w = 0, sel_img_h = 0;
+      if (dp->nav.view == PASTIME_VIEW_SYSTEM
+            && dp->roms && dp->nav.selection < dp->rom_count)
+      {
+         sel_img_w = dp->roms[dp->nav.selection].image_w;
+         sel_img_h = dp->roms[dp->nav.selection].image_h;
+      }
+      else if (dp->nav.view == PASTIME_VIEW_RECENTS
+            && dp->recents && dp->nav.selection < dp->recent_row_count
+            && dp->recents[dp->nav.selection].image_cached)
+      {
+         sel_img_w = dp->recents[dp->nav.selection].image_w;
+         sel_img_h = dp->recents[dp->nav.selection].image_h;
+      }
+      else if (dp->nav.view == PASTIME_VIEW_SAVE_PICKER
+            && dp->nav.selection < dp->save_picker_count)
+      {
+         sel_img_w = dp->save_picker[dp->nav.selection].thumb_w;
+         sel_img_h = dp->save_picker[dp->nav.selection].thumb_h;
+      }
+      if (sel_img_w > 0 && sel_img_h > 0)
+      {
+         int fit_w = pastime_image_pane_width(pane_full_w, pane_h,
+               sel_img_w, sel_img_h);
+         int fit_h = (fit_w == pane_full_w)
+                   ? (int)((unsigned)pane_full_w * sel_img_h / sel_img_w)
+                   : pane_h;
+         img_top    = pane_top + (pane_h - fit_h) / 2;
+         img_bottom = img_top + fit_h;
+      }
+   }
+
    /* Rows on top of the preview so the selected row's full-width pill
     * visibly covers the art it overlaps. */
    for (i = 0; i < visible && scroll + i < dp->total_rows; i++)
    {
       bool selected;
-      int  row_max_w_art = 0;  /* >0 means "this row has art; clamp here" */
+      int  row_max_w_art = 0;
 
       row_idx = scroll + i;
       row_y   = list_top + (int)(i * (size_t)L->row_h);
-      row_w   = (i == 0) ? top_row_max_w : row_max_w;
+      row_w   = row_max_w;
       selected = (row_idx == dp->nav.selection);
 
-      if (art_pane_active && !selected)
+      if (art_pane_active && !selected
+            && img_top >= 0
+            && row_y < img_bottom && row_y + L->row_h > img_top)
       {
          if (dp->nav.view == PASTIME_VIEW_SYSTEM
                && dp->roms && row_idx < dp->rom_count
                && dp->roms[row_idx].image_w > 0
                && dp->roms[row_idx].image_h > 0)
          {
-            /* Per-row width: aspect-fit the index-known dims into the
-             * preview pane to find the image's left edge, then clamp
-             * the row's text to leave breathing room before it. */
             int img_w = pastime_image_pane_width(pane_full_w, pane_h,
                   dp->roms[row_idx].image_w,
                   dp->roms[row_idx].image_h);
@@ -5334,9 +5301,6 @@ static void pastime_draw_list(gfx_display_t *p_disp, void *userdata,
                && dp->recents[row_idx].image_w > 0
                && dp->recents[row_idx].image_h > 0)
          {
-            /* Recents truncates only when the image is actually on
-             * disk — recents never fetches, so a non-cached row will
-             * never show art and shouldn't sacrifice text width. */
             int img_w = pastime_image_pane_width(pane_full_w, pane_h,
                   dp->recents[row_idx].image_w,
                   dp->recents[row_idx].image_h);
