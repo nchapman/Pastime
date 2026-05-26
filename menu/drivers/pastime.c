@@ -62,6 +62,7 @@
 #include "../../pastime/pastime_metadata.h"
 #include "../../pastime/pastime_nav.h"
 #include "../../pastime/pastime_rommap.h"
+#include "../../pastime/pastime_scan.h"
 #include "../../pastime/pastime_setup.h"
 #include "../../pastime/pastime_storage.h"
 #include "../../pastime/pastime_thumbs.h"
@@ -1136,11 +1137,8 @@ static pastime_system_t *pastime_scan_systems(const char *content_root,
       if (raw->elems[i].attr.i != RARCH_DIRECTORY)
          continue;
       fill_pathname_base(base, raw->elems[i].data, sizeof(base));
-      {
-         size_t blen = strlen(base);
-         if (blen > 9 && strcmp(base + blen - 9, ".disabled") == 0)
-            continue;
-      }
+      if (pastime_name_is_disabled(base, strlen(base)))
+         continue;
       if (!pastime_parse_system_folder(base, &display, &ident, &external))
          continue;
       if (!pastime_folder_has_content(raw->elems[i].data))
@@ -1407,55 +1405,29 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
    if (!sys || !sys->sources || sys->source_count == 0)
       return NULL;
 
-   /* Cache baked map across sources — multi-source systems often share
-    * a core, so we avoid re-parsing the large map file per source. */
    {
-   char              cached_baked_fn[64] = "";
-   pastime_rommap_t *cached_baked       = NULL;
+   pastime_baked_cache_t baked;
+   const char           *assets_dir;
+   settings_t           *settings = config_get_ptr();
+
+   assets_dir = (settings && *settings->paths.directory_assets)
+         ? settings->paths.directory_assets : NULL;
+   pastime_baked_cache_init(&baked);
 
    for (src_i = 0; src_i < sys->source_count; src_i++)
    {
       const char         *system_path = sys->sources[src_i].full_path;
       struct string_list *raw;
-      pastime_rommap_t   *user_map  = NULL;
-      pastime_rommap_t   *baked_map = NULL;
+      pastime_rommap_t   *user_map = NULL;
 
       if (!system_path || !*system_path)
          continue;
 
-      /* Load name maps: user override in ROM folder, baked via core routing */
       {
          char map_path[PATH_MAX_LENGTH];
-         const char *baked_fn;
-
          fill_pathname_join_special(map_path, system_path, "map.txt",
                sizeof(map_path));
          user_map = pastime_rommap_load(map_path);
-
-         baked_fn = pastime_rommap_route(sys->sources[src_i].core_ident);
-         if (baked_fn)
-         {
-            if (!string_is_equal(baked_fn, cached_baked_fn))
-            {
-               settings_t *settings = config_get_ptr();
-               pastime_rommap_free(cached_baked);
-               cached_baked = NULL;
-               cached_baked_fn[0] = '\0';
-               if (settings && *settings->paths.directory_assets)
-               {
-                  char maps_dir[PATH_MAX_LENGTH];
-                  fill_pathname_join_special(maps_dir,
-                        settings->paths.directory_assets, "pastime/maps",
-                        sizeof(maps_dir));
-                  fill_pathname_join_special(map_path, maps_dir, baked_fn,
-                        sizeof(map_path));
-                  cached_baked = pastime_rommap_load(map_path);
-                  strlcpy(cached_baked_fn, baked_fn,
-                        sizeof(cached_baked_fn));
-               }
-            }
-            baked_map = cached_baked;
-         }
       }
 
       raw = dir_list_new(system_path, NULL,
@@ -1468,10 +1440,16 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
 
       for (i = 0; i < raw->size; i++)
       {
-         const char *full = raw->elems[i].data;
-         char        base[NAME_MAX_LENGTH];
-         char       *display;
-         const char *mapped;
+         const char            *full = raw->elems[i].data;
+         char                   base[NAME_MAX_LENGTH];
+         char                   display_buf[NAME_MAX_LENGTH];
+         char                   sort_buf[NAME_MAX_LENGTH];
+         char                   tag_buf[NAME_MAX_LENGTH];
+         pastime_rom_resolved_t res;
+         char                  *display;
+         char                  *sort_dup;
+         char                  *tag_dup = NULL;
+         char                  *path_dup;
 
          if (!full || !*full)
             continue;
@@ -1480,26 +1458,18 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
             continue;
          if (string_is_equal(base, "map.txt"))
             continue;
-         {
-            size_t blen = strlen(base);
-            if (blen > 9 && strcmp(base + blen - 9, ".disabled") == 0)
-               continue;
-         }
+         if (pastime_name_is_disabled(base, strlen(base)))
+            continue;
 
-         /* Map lookup before extension strip — key includes extension */
-         mapped = pastime_rommap_lookup(user_map, base);
-         if (!mapped)
-            mapped = pastime_rommap_lookup(baked_map, base);
+         res = pastime_resolve_rom_name(base, user_map,
+               sys->sources[src_i].core_ident, &baked, assets_dir,
+               PASTIME_RESOLVE_KEEP_TAG,
+               display_buf, sizeof(display_buf),
+               sort_buf, sizeof(sort_buf),
+               tag_buf, sizeof(tag_buf));
 
-         if (mapped && mapped[0] == '.')
-            continue; /* hidden ROM */
-
-         if (!mapped)
-         {
-            pastime_display_name_strip_rom_extension(base);
-            if (!*base)
-               continue;
-         }
+         if (res.hidden || res.skip)
+            continue;
 
          if (count == cap)
          {
@@ -1511,66 +1481,41 @@ static pastime_rom_t *pastime_scan_roms(const pastime_system_t *sys,
             roms = grown;
             cap  = new_cap;
          }
+
+         if (!(display = strdup(display_buf)))
+            break;
+         if (*tag_buf && !(tag_dup = strdup(tag_buf)))
          {
-            char       *path_dup;
-            char       *sort_dup;
-            char       *tag_dup = NULL;
-            char        clean[NAME_MAX_LENGTH];
-            char        tag[NAME_MAX_LENGTH];
-            char        sort_buf[NAME_MAX_LENGTH];
-
-            if (mapped)
-            {
-               pastime_display_name_sort_key(mapped, sort_buf,
-                     sizeof(sort_buf));
-               if (!(display = strdup(mapped)))
-                  break;
-            }
-            else
-            {
-               pastime_display_name_clean_keep_tag(base, clean,
-                     sizeof(clean), tag, sizeof(tag));
-               if (!*clean)
-                  continue;
-               pastime_display_name_sort_key(clean, sort_buf,
-                     sizeof(sort_buf));
-               if (!(display = strdup(clean)))
-                  break;
-               if (*tag && !(tag_dup = strdup(tag)))
-               {
-                  free(display);
-                  break;
-               }
-            }
-
-            if (!(sort_dup = strdup(sort_buf)))
-            {
-               free(display);
-               free(tag_dup);
-               break;
-            }
-            if (!(path_dup = strdup(full)))
-            {
-               free(display);
-               free(sort_dup);
-               free(tag_dup);
-               break;
-            }
-            memset(&roms[count], 0, sizeof(roms[count]));
-            roms[count].display_name = display;
-            roms[count].sort_key     = sort_dup;
-            roms[count].full_path    = path_dup;
-            roms[count].tag          = tag_dup;
-            roms[count].source_idx   = (uint8_t)src_i;
-            gfx_thumbnail_init_blank(&roms[count].thumbnail);
-            count++;
+            free(display);
+            break;
          }
+         if (!(sort_dup = strdup(sort_buf)))
+         {
+            free(display);
+            free(tag_dup);
+            break;
+         }
+         if (!(path_dup = strdup(full)))
+         {
+            free(display);
+            free(sort_dup);
+            free(tag_dup);
+            break;
+         }
+         memset(&roms[count], 0, sizeof(roms[count]));
+         roms[count].display_name = display;
+         roms[count].sort_key     = sort_dup;
+         roms[count].full_path    = path_dup;
+         roms[count].tag          = tag_dup;
+         roms[count].source_idx   = (uint8_t)src_i;
+         gfx_thumbnail_init_blank(&roms[count].thumbnail);
+         count++;
       }
       string_list_free(raw);
       pastime_rommap_free(user_map);
    }
-   pastime_rommap_free(cached_baked);
-   } /* end cached_baked scope */
+   pastime_baked_cache_free(&baked);
+   }
 
    if (count > 1)
       qsort(roms, count, sizeof(*roms), pastime_rom_cmp);
@@ -1809,31 +1754,32 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
    if (!(out = (pastime_recent_t*)calloc(total, sizeof(*out))))
       return NULL;
 
-   /* Cache the baked map across iterations — most recents entries share
-    * the same core, so we avoid re-parsing the 66K-entry file per row. */
    {
-   char              cached_baked_fn[64] = "";
-   pastime_rommap_t *cached_bmap        = NULL;
+   pastime_baked_cache_t baked;
+   const char           *assets_dir;
+   settings_t           *settings = config_get_ptr();
+
+   assets_dir = (settings && *settings->paths.directory_assets)
+         ? settings->paths.directory_assets : NULL;
+   pastime_baked_cache_init(&baked);
 
    for (i = 0; i < total; i++)
    {
       const struct playlist_entry *entry = NULL;
       const char                  *src   = NULL;
+      bool         map_hit  = false;
       char                        *dup;
       char         parent_dir[PATH_MAX_LENGTH];
       const char  *folder;
       char        *display     = NULL;
       char        *ident       = NULL;
       const char  *basename    = NULL;
-      const char  *mapped      = NULL;
       const pastime_external_spec_t *external = NULL;
 
       playlist_get_index(pl, i, &entry);
       if (!entry)
          continue;
 
-      /* Extract folder/core info and ROM basename from path early
-       * so we can attempt a map lookup for the display name. */
       if (entry->path && *entry->path)
       {
          basename = path_basename(entry->path);
@@ -1851,69 +1797,33 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
             pastime_parse_system_folder(folder, &display, &ident,
                   &external);
 
-         /* Try map lookup: user map in the ROM folder, then baked.
-          * Copy the result into buf before freeing the map — the
-          * returned pointer is owned by the map's internal buffer. */
          if (basename && *basename && ident)
          {
-            /* User map in the ROM folder (highest priority) */
+            char               map_path[PATH_MAX_LENGTH];
+            pastime_rommap_t  *umap;
+            pastime_rom_resolved_t res;
+
+            strlcpy(map_path, entry->path, sizeof(map_path));
+            path_basedir_wrapper(map_path);
+            strlcat(map_path, "map.txt", sizeof(map_path));
+            umap = pastime_rommap_load(map_path);
+
+            res = pastime_resolve_rom_name(basename, umap, ident,
+                  &baked, assets_dir, 0,
+                  buf, sizeof(buf), NULL, 0, NULL, 0);
+            pastime_rommap_free(umap);
+
+            /* Hidden-mapped entries are excluded from recents entirely */
+            if (res.hidden)
             {
-               char map_path[PATH_MAX_LENGTH];
-               pastime_rommap_t *umap;
-               strlcpy(map_path, entry->path, sizeof(map_path));
-               path_basedir_wrapper(map_path);
-               strlcat(map_path, "map.txt", sizeof(map_path));
-               umap = pastime_rommap_load(map_path);
-               if (umap)
-               {
-                  const char *val = pastime_rommap_lookup(umap, basename);
-                  if (val && val[0] != '.')
-                  {
-                     strlcpy(buf, val, sizeof(buf));
-                     mapped = buf;
-                     src    = buf;
-                  }
-               }
-               pastime_rommap_free(umap);
+               free(display);
+               free(ident);
+               continue;
             }
-            /* Baked map via core routing (fallback, cached across rows) */
-            if (!mapped)
+            if (res.mapped)
             {
-               const char *baked_fn = pastime_rommap_route(ident);
-               if (baked_fn)
-               {
-                  if (!string_is_equal(baked_fn, cached_baked_fn))
-                  {
-                     settings_t *settings = config_get_ptr();
-                     pastime_rommap_free(cached_bmap);
-                     cached_bmap = NULL;
-                     cached_baked_fn[0] = '\0';
-                     if (settings && *settings->paths.directory_assets)
-                     {
-                        char map_path[PATH_MAX_LENGTH];
-                        char maps_dir[PATH_MAX_LENGTH];
-                        fill_pathname_join_special(maps_dir,
-                              settings->paths.directory_assets,
-                              "pastime/maps", sizeof(maps_dir));
-                        fill_pathname_join_special(map_path, maps_dir,
-                              baked_fn, sizeof(map_path));
-                        cached_bmap = pastime_rommap_load(map_path);
-                        strlcpy(cached_baked_fn, baked_fn,
-                              sizeof(cached_baked_fn));
-                     }
-                  }
-                  if (cached_bmap)
-                  {
-                     const char *val = pastime_rommap_lookup(cached_bmap,
-                           basename);
-                     if (val && val[0] != '.')
-                     {
-                        strlcpy(buf, val, sizeof(buf));
-                        mapped = buf;
-                        src    = buf;
-                     }
-                  }
-               }
+               src     = buf;
+               map_hit = true;
             }
          }
       }
@@ -1945,9 +1855,9 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
 
       {
          char clean[NAME_MAX_LENGTH];
-         if (mapped)
+         if (map_hit)
          {
-            if (!(dup = strdup(mapped)))
+            if (!(dup = strdup(buf)))
             {
                free(display);
                free(ident);
@@ -1990,8 +1900,8 @@ static pastime_recent_t *pastime_build_recents(size_t *out_count)
       free(ident);
       count++;
    }
-   pastime_rommap_free(cached_bmap);
-   } /* end cached_bmap scope */
+   pastime_baked_cache_free(&baked);
+   }
 
    if (count == 0)
    {
@@ -2574,15 +2484,15 @@ static pastime_col_rom_t *pastime_parse_collection_file(
    char               line_buf[PATH_MAX_LENGTH];
    char               full_path[PATH_MAX_LENGTH];
    char               parent_dir[PATH_MAX_LENGTH];
-   char               base[NAME_MAX_LENGTH];
-   char               clean[NAME_MAX_LENGTH];
+   char               display_buf[NAME_MAX_LENGTH];
    char               sort_buf[NAME_MAX_LENGTH];
    RFILE             *fp;
    pastime_col_rom_t *roms = NULL;
    size_t             cap  = 0;
    size_t             count = 0;
-   const char        *cached_baked_fn = NULL;
-   pastime_rommap_t  *cached_bmap     = NULL;
+   pastime_baked_cache_t baked;
+   const char           *assets_dir;
+   settings_t           *settings;
 
    *out_count = 0;
    if (!pastime_paths_get_root(root, sizeof(root)))
@@ -2593,6 +2503,11 @@ static pastime_col_rom_t *pastime_parse_collection_file(
    if (!fp)
       return NULL;
 
+   settings  = config_get_ptr();
+   assets_dir = (settings && *settings->paths.directory_assets)
+         ? settings->paths.directory_assets : NULL;
+   pastime_baked_cache_init(&baked);
+
    while (filestream_gets(fp, line_buf, sizeof(line_buf)))
    {
       char  *nl;
@@ -2601,7 +2516,9 @@ static pastime_col_rom_t *pastime_parse_collection_file(
       char  *ident     = NULL;
       char  *rom_base;
       const pastime_external_spec_t *external = NULL;
-      const char *mapped = NULL;
+      pastime_rom_resolved_t         res;
+      pastime_rommap_t              *umap;
+      char                           map_path[PATH_MAX_LENGTH];
 
       /* Trim trailing newline/CR */
       nl = strrchr(line_buf, '\n');
@@ -2634,9 +2551,8 @@ static pastime_col_rom_t *pastime_parse_collection_file(
          continue;
       if (!pastime_parse_system_folder(folder, &display, &ident, &external))
       {
-         /* Try stripping .disabled suffix */
          size_t flen = strlen(folder);
-         if (flen > 9 && strcmp(folder + flen - 9, ".disabled") == 0)
+         if (pastime_name_is_disabled(folder, flen))
          {
             char stripped_folder[NAME_MAX_LENGTH];
             strlcpy(stripped_folder, folder, sizeof(stripped_folder));
@@ -2658,81 +2574,34 @@ static pastime_col_rom_t *pastime_parse_collection_file(
          continue;
       }
 
-      /* Map lookup (same chain as scan_roms: user map → baked map) */
-      if (ident)
+      /* Resolve display name via map lookup or filename clean */
+      strlcpy(map_path, full_path, sizeof(map_path));
+      path_basedir_wrapper(map_path);
+      strlcat(map_path, "map.txt", sizeof(map_path));
+      umap = pastime_rommap_load(map_path);
+
+      res = pastime_resolve_rom_name(rom_base, umap, ident,
+            &baked, assets_dir, 0,
+            display_buf, sizeof(display_buf),
+            sort_buf, sizeof(sort_buf),
+            NULL, 0);
+      pastime_rommap_free(umap);
+
+      /* Collections are user-curated: if the map hides a ROM, fall through
+       * to filename-clean rather than dropping the entry entirely. */
+      if (res.hidden)
+         res = pastime_resolve_rom_name(rom_base, NULL, NULL,
+               NULL, NULL, 0,
+               display_buf, sizeof(display_buf),
+               sort_buf, sizeof(sort_buf),
+               NULL, 0);
+
+      if (res.skip)
       {
-         char map_path[PATH_MAX_LENGTH];
-         pastime_rommap_t *umap;
-
-         strlcpy(map_path, full_path, sizeof(map_path));
-         path_basedir_wrapper(map_path);
-         strlcat(map_path, "map.txt", sizeof(map_path));
-         umap = pastime_rommap_load(map_path);
-         if (umap)
-         {
-            const char *val = pastime_rommap_lookup(umap, rom_base);
-            if (val && val[0] != '.')
-            {
-               strlcpy(clean, val, sizeof(clean));
-               mapped = clean;
-            }
-            pastime_rommap_free(umap);
-         }
-         if (!mapped)
-         {
-            const char *baked_fn = pastime_rommap_route(ident);
-            if (baked_fn)
-            {
-               if (!cached_baked_fn || strcmp(cached_baked_fn, baked_fn) != 0)
-               {
-                  pastime_rommap_free(cached_bmap);
-                  cached_bmap    = NULL;
-                  cached_baked_fn = baked_fn;
-                  {
-                     settings_t *settings = config_get_ptr();
-                     if (settings && *settings->paths.directory_assets)
-                     {
-                        char baked_path[PATH_MAX_LENGTH];
-                        char maps_dir[PATH_MAX_LENGTH];
-                        fill_pathname_join_special(maps_dir,
-                              settings->paths.directory_assets,
-                              "pastime/maps", sizeof(maps_dir));
-                        fill_pathname_join_special(baked_path, maps_dir,
-                              baked_fn, sizeof(baked_path));
-                        cached_bmap = pastime_rommap_load(baked_path);
-                     }
-                  }
-               }
-               if (cached_bmap)
-               {
-                  const char *val = pastime_rommap_lookup(
-                        cached_bmap, rom_base);
-                  if (val && val[0] != '.')
-                  {
-                     strlcpy(clean, val, sizeof(clean));
-                     mapped = clean;
-                  }
-               }
-            }
-         }
+         free(display);
+         free(ident);
+         continue;
       }
-
-      if (!mapped)
-      {
-         fill_pathname_base(base, full_path, sizeof(base));
-         pastime_display_name_strip_rom_extension(base);
-         pastime_display_name_clean(base, clean, sizeof(clean));
-         if (!*clean)
-         {
-            free(display);
-            free(ident);
-            continue;
-         }
-         mapped = clean;
-      }
-
-      /* Build sort key */
-      pastime_display_name_sort_key(mapped, sort_buf, sizeof(sort_buf));
 
       /* Grow array */
       if (count == cap)
@@ -2751,7 +2620,7 @@ static pastime_col_rom_t *pastime_parse_collection_file(
       }
 
       memset(&roms[count], 0, sizeof(roms[count]));
-      roms[count].display_name = strdup(mapped);
+      roms[count].display_name = strdup(display_buf);
       roms[count].sort_key     = strdup(sort_buf);
       roms[count].full_path    = strdup(full_path);
       if (!roms[count].display_name || !roms[count].sort_key
@@ -2774,7 +2643,7 @@ static pastime_col_rom_t *pastime_parse_collection_file(
       count++;
    }
    filestream_close(fp);
-   pastime_rommap_free(cached_bmap);
+   pastime_baked_cache_free(&baked);
 
    /* Preserve file order — collections are user-curated lists. */
    *out_count = count;

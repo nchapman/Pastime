@@ -106,6 +106,13 @@ $CC $CFLAGS $INC \
     -o test_rommap
 BUILT+=(test_rommap)
 
+# --- scan primitives (baked cache, resolve, .disabled) ---
+echo "== building test_scan"
+$CC $CFLAGS $INC \
+    test_scan.c \
+    -o test_scan
+BUILT+=(test_scan)
+
 # --- run only what we just built ---
 fail=0
 for bin in "${BUILT[@]}"; do
