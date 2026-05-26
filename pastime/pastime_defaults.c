@@ -337,6 +337,11 @@ void pastime_defaults_apply(void)
     * LessUI "chew through a long list quickly" feel. */
    settings->bools.menu_scroll_fast = true;
 
+   /* Disable the touch overlay — Pastime targets gamepad-equipped
+    * handhelds, so screen taps just cause accidental input. */
+   settings->bools.input_overlay_enable              = false;
+   settings->bools.input_overlay_enable_autopreferred = false;
+
    if (!pastime_paths_get_root(root, sizeof(root)))
    {
       RARCH_WARN("[Pastime] could not resolve Pastime/ root; "
