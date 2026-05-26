@@ -259,3 +259,47 @@ size_t dp_nav_letter_jump(size_t cur, size_t total, int dir,
       }
    }
 }
+
+/* ---------- TOP view row dispatch ---------- */
+
+dp_top_row_t dp_nav_top_row_dispatch(size_t row, bool has_recents,
+      size_t collection_count, size_t system_count)
+{
+   dp_top_row_t r;
+   size_t offset   = row;
+   size_t col_rows = (collection_count > 0)
+         ? (system_count == 0 ? collection_count : 1)
+         : 0;
+
+   if (has_recents)
+   {
+      if (offset == 0)
+      {
+         r.section = DP_TOP_RECENTS;
+         r.index   = 0;
+         return r;
+      }
+      offset--;
+   }
+
+   if (offset < col_rows)
+   {
+      r.section = DP_TOP_COLLECTIONS;
+      r.index   = offset;
+      return r;
+   }
+   offset -= col_rows;
+
+   r.section = DP_TOP_SYSTEM;
+   r.index   = offset;
+   return r;
+}
+
+size_t dp_nav_top_row_count(bool has_recents,
+      size_t collection_count, size_t system_count)
+{
+   size_t col_rows = (collection_count > 0)
+         ? (system_count == 0 ? collection_count : 1)
+         : 0;
+   return (has_recents ? 1 : 0) + col_rows + system_count;
+}

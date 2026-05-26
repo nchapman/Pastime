@@ -172,6 +172,40 @@ typedef const char *(*dp_nav_label_fn)(void *user, size_t row);
 size_t dp_nav_letter_jump(size_t cur, size_t total, int dir,
       dp_nav_label_fn label, void *user);
 
+/* ---------- TOP view row dispatch (pure) ---------- */
+
+/* Identifies which logical section a TOP view row belongs to. */
+enum dp_top_section
+{
+   DP_TOP_RECENTS = 0,
+   DP_TOP_COLLECTIONS,
+   DP_TOP_SYSTEM
+};
+
+typedef struct
+{
+   enum dp_top_section section;
+   size_t              index;
+} dp_top_row_t;
+
+/* Map a TOP view row index to its logical section + within-section index.
+ *
+ * Row order: [Recents(0..1)] + [Collections(col_rows)] + [Systems].
+ *   - has_recents: true if the Recents row is present (row 0)
+ *   - collection_count: number of .txt collection files
+ *   - system_count: number of system folders
+ *
+ * When system_count > 0, collections is one aggregate row (col_rows=1).
+ * When system_count == 0, each collection gets its own row (promotion).
+ *
+ * Returns DP_TOP_SYSTEM with index=0 when row is out of range. */
+dp_top_row_t dp_nav_top_row_dispatch(size_t row, bool has_recents,
+      size_t collection_count, size_t system_count);
+
+/* Total row count for the TOP view given the same parameters. */
+size_t dp_nav_top_row_count(bool has_recents,
+      size_t collection_count, size_t system_count);
+
 RETRO_END_DECLS
 
 #endif

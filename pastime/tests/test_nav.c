@@ -730,6 +730,94 @@ static void test_null_after_change_is_safe(void)
 }
 
 /* ============================================================
+ * TOP view row dispatch tests
+ * ============================================================ */
+
+static void test_top_row_dispatch(void)
+{
+   dp_top_row_t r;
+
+   /* Typical: recents + 3 collections + 5 systems */
+   r = dp_nav_top_row_dispatch(0, true, 3, 5);
+   ASSERT_EQ(r.section, DP_TOP_RECENTS);
+   ASSERT_EQ(r.index, 0);
+
+   r = dp_nav_top_row_dispatch(1, true, 3, 5);
+   ASSERT_EQ(r.section, DP_TOP_COLLECTIONS);
+   ASSERT_EQ(r.index, 0);
+
+   r = dp_nav_top_row_dispatch(2, true, 3, 5);
+   ASSERT_EQ(r.section, DP_TOP_SYSTEM);
+   ASSERT_EQ(r.index, 0);
+
+   r = dp_nav_top_row_dispatch(6, true, 3, 5);
+   ASSERT_EQ(r.section, DP_TOP_SYSTEM);
+   ASSERT_EQ(r.index, 4);
+
+   /* No recents: collections row at 0 */
+   r = dp_nav_top_row_dispatch(0, false, 3, 5);
+   ASSERT_EQ(r.section, DP_TOP_COLLECTIONS);
+   ASSERT_EQ(r.index, 0);
+
+   r = dp_nav_top_row_dispatch(1, false, 3, 5);
+   ASSERT_EQ(r.section, DP_TOP_SYSTEM);
+   ASSERT_EQ(r.index, 0);
+
+   /* Promotion: no systems, each collection gets its own row */
+   r = dp_nav_top_row_dispatch(0, true, 3, 0);
+   ASSERT_EQ(r.section, DP_TOP_RECENTS);
+
+   r = dp_nav_top_row_dispatch(1, true, 3, 0);
+   ASSERT_EQ(r.section, DP_TOP_COLLECTIONS);
+   ASSERT_EQ(r.index, 0);
+
+   r = dp_nav_top_row_dispatch(2, true, 3, 0);
+   ASSERT_EQ(r.section, DP_TOP_COLLECTIONS);
+   ASSERT_EQ(r.index, 1);
+
+   r = dp_nav_top_row_dispatch(3, true, 3, 0);
+   ASSERT_EQ(r.section, DP_TOP_COLLECTIONS);
+   ASSERT_EQ(r.index, 2);
+
+   /* No collections */
+   r = dp_nav_top_row_dispatch(0, true, 0, 5);
+   ASSERT_EQ(r.section, DP_TOP_RECENTS);
+
+   r = dp_nav_top_row_dispatch(1, true, 0, 5);
+   ASSERT_EQ(r.section, DP_TOP_SYSTEM);
+   ASSERT_EQ(r.index, 0);
+
+   /* Nothing but systems */
+   r = dp_nav_top_row_dispatch(0, false, 0, 5);
+   ASSERT_EQ(r.section, DP_TOP_SYSTEM);
+   ASSERT_EQ(r.index, 0);
+
+   r = dp_nav_top_row_dispatch(4, false, 0, 5);
+   ASSERT_EQ(r.section, DP_TOP_SYSTEM);
+   ASSERT_EQ(r.index, 4);
+
+   printf("  %-52s  ok    (+%d -0)\n", "test_top_row_dispatch", 17);
+}
+
+static void test_top_row_count(void)
+{
+   /* recents + 1 collection row + 5 systems */
+   ASSERT_EQ(dp_nav_top_row_count(true, 3, 5), 7);
+   /* no recents */
+   ASSERT_EQ(dp_nav_top_row_count(false, 3, 5), 6);
+   /* promotion: no systems, collections expand */
+   ASSERT_EQ(dp_nav_top_row_count(true, 3, 0), 4);
+   /* nothing */
+   ASSERT_EQ(dp_nav_top_row_count(false, 0, 0), 0);
+   /* only recents */
+   ASSERT_EQ(dp_nav_top_row_count(true, 0, 0), 1);
+   /* only systems */
+   ASSERT_EQ(dp_nav_top_row_count(false, 0, 10), 10);
+
+   printf("  %-52s  ok    (+%d -0)\n", "test_top_row_count", 6);
+}
+
+/* ============================================================
  * Runner
  * ============================================================ */
 
@@ -795,6 +883,9 @@ int main(void)
    RUN_TEST(test_letter_jump_with_articles);
 
    test_null_after_change_is_safe();
+
+   test_top_row_dispatch();
+   test_top_row_count();
 
    printf("\n%d passed, %d failed\n", g_pass, g_fail);
    return g_fail > 0 ? 1 : 0;

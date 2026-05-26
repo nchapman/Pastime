@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
@@ -291,4 +292,61 @@ void pastime_display_name_sort_key(const char *display,
    for (i = 0; i + 1 < out_size && src[i]; i++)
       out[i] = (char)tolower((unsigned char)src[i]);
    out[i] = '\0';
+}
+
+void pastime_format_relative_time(int64_t mtime, int64_t now,
+      char *out, size_t out_len)
+{
+   int64_t delta;
+   int     n;
+
+   if (!out || out_len == 0)
+      return;
+   out[0] = '\0';
+   if (mtime <= 0)
+   {
+      snprintf(out, out_len, "Unknown");
+      return;
+   }
+
+   delta = now - mtime;
+   if (delta < 0)
+      delta = 0;
+
+   if (delta < 60)
+      snprintf(out, out_len, "Just now");
+   else if (delta < 60 * 60)
+   {
+      n = (int)(delta / 60);
+      snprintf(out, out_len, "%d minute%s ago", n, n == 1 ? "" : "s");
+   }
+   else if (delta < 24 * 60 * 60)
+   {
+      n = (int)(delta / (60 * 60));
+      snprintf(out, out_len, "%d hour%s ago", n, n == 1 ? "" : "s");
+   }
+   else if (delta < 2 * 24 * 60 * 60)
+      snprintf(out, out_len, "Yesterday");
+   else
+   {
+      n = (int)(delta / (24 * 60 * 60));
+      snprintf(out, out_len, "%d days ago", n);
+   }
+}
+
+const char *pastime_display_name_strip_sort_prefix(const char *name)
+{
+   const char *p = name;
+   if (!p)
+      return p;
+   if (!(*p >= '0' && *p <= '9'))
+      return name;
+   while (*p >= '0' && *p <= '9')
+      p++;
+   if (*p != ')')
+      return name;
+   p++;
+   while (*p == ' ' || *p == '\t')
+      p++;
+   return p;
 }

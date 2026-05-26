@@ -113,6 +113,13 @@ $CC $CFLAGS $INC \
     -o test_scan
 BUILT+=(test_scan)
 
+# --- system folder parser ---
+echo "== building test_system"
+$CC $CFLAGS -DPASTIME_EXTERNAL_TEST_BUILD -DPASTIME_SYSTEM_TEST_BUILD $INC \
+    test_system.c \
+    -o test_system
+BUILT+=(test_system)
+
 # --- run only what we just built ---
 fail=0
 for bin in "${BUILT[@]}"; do

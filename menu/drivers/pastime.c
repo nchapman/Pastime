@@ -63,6 +63,7 @@
 #include "../../pastime/pastime_nav.h"
 #include "../../pastime/pastime_rommap.h"
 #include "../../pastime/pastime_scan.h"
+#include "../../pastime/pastime_system.h"
 #include "../../pastime/pastime_setup.h"
 #include "../../pastime/pastime_storage.h"
 #include "../../pastime/pastime_thumbs.h"
@@ -688,27 +689,6 @@ static const char *pastime_ingame_label(enum pastime_ingame_action a)
    return "";
 }
 
-/* Strip a leading numeric sort prefix ("01) ", "2) ", "123) ") from a
- * display name at render time.  Returns a pointer into the original
- * string past the prefix, or the original pointer if no valid prefix.
- * Matches LessUI's trimSortingMeta: digits + ')' + optional whitespace. */
-static const char *pastime_strip_sort_prefix(const char *name)
-{
-   const char *p = name;
-   if (!p)
-      return p;
-   if (!(*p >= '0' && *p <= '9'))
-      return name;
-   while (*p >= '0' && *p <= '9')
-      p++;
-   if (*p != ')')
-      return name;
-   p++;
-   while (*p == ' ' || *p == '\t')
-      p++;
-   return p;
-}
-
 static const char *pastime_row_label(const pastime_handle_t *dp, size_t row)
 {
    size_t sys_idx;
@@ -730,213 +710,55 @@ static const char *pastime_row_label(const pastime_handle_t *dp, size_t row)
    if (dp->nav.view == PASTIME_VIEW_SYSTEM)
    {
       if (dp->roms && row < dp->rom_count)
-         return pastime_strip_sort_prefix(dp->roms[row].display_name);
+         return pastime_display_name_strip_sort_prefix(dp->roms[row].display_name);
       return "";
    }
 
    if (dp->nav.view == PASTIME_VIEW_RECENTS)
    {
       if (dp->recents && row < dp->recent_row_count)
-         return pastime_strip_sort_prefix(dp->recents[row].display_name);
+         return pastime_display_name_strip_sort_prefix(dp->recents[row].display_name);
       return "";
    }
 
    if (dp->nav.view == PASTIME_VIEW_COLLECTIONS)
    {
       if (dp->collections && row < dp->collection_count)
-         return pastime_strip_sort_prefix(dp->collections[row].display_name);
+         return pastime_display_name_strip_sort_prefix(dp->collections[row].display_name);
       return "";
    }
 
    if (dp->nav.view == PASTIME_VIEW_COLLECTION)
    {
       if (dp->col_roms && row < dp->col_rom_count)
-         return pastime_strip_sort_prefix(dp->col_roms[row].display_name);
+         return pastime_display_name_strip_sort_prefix(dp->col_roms[row].display_name);
       return "";
    }
 
-   /* TOP view row order: [Recents] + [Collections] + [Systems].
-    * Collections is a single row when systems exist, or promoted
-    * (each collection as its own row) when no systems exist. */
    {
-      size_t offset = row;
-      size_t col_rows;
-
-      if (pastime_has_recents_row(dp))
+      dp_top_row_t r = dp_nav_top_row_dispatch(row,
+            pastime_has_recents_row(dp),
+            dp->collection_count, dp->system_count);
+      switch (r.section)
       {
-         if (offset == 0)
+         case DP_TOP_RECENTS:
             return PASTIME_RECENTS_LABEL;
-         offset--;
+         case DP_TOP_COLLECTIONS:
+            if (dp->system_count == 0 && dp->collections
+                  && r.index < dp->collection_count)
+               return pastime_display_name_strip_sort_prefix(
+                     dp->collections[r.index].display_name);
+            return "Collections";
+         case DP_TOP_SYSTEM:
+            if (dp->systems && r.index < dp->system_count)
+               return pastime_display_name_strip_sort_prefix(
+                     dp->systems[r.index].display_name);
+            break;
       }
-
-      col_rows = (dp->collection_count > 0)
-         ? (dp->system_count == 0 ? dp->collection_count : 1)
-         : 0;
-
-      if (offset < col_rows)
-      {
-         if (dp->system_count == 0)
-            return pastime_strip_sort_prefix(
-                  dp->collections[offset].display_name);
-         return "Collections";
-      }
-      offset -= col_rows;
-
-      if (dp->systems && offset < dp->system_count)
-         return pastime_strip_sort_prefix(dp->systems[offset].display_name);
    }
    return "";
 }
 
-/* Parse a Roms/ subfolder name per the convention from PLAN.md.
- *
- * Folder name → (display_name, libretro core_ident) OR
- * (display_name, external preset).
- *
- *   "Super Nintendo (snes9x)"          → display="Super Nintendo",
- *                                        ident="snes9x", external=NULL
- *   "Dreamcast (ext-com.flycast.emulator)"
- *                                      → display="Dreamcast",
- *                                        ident=NULL,
- *                                        external=<preset row>
- *
- * Returns false (and the caller hides the folder) when the trailing
- * parenthetical is missing/malformed, or when an `ext-` marker names a
- * package that isn't in our generated preset table — strict folder
- * convention, same as today for unknown core_idents.
- */
-static bool pastime_parse_system_folder(const char *folder,
-      char **display_out, char **ident_out,
-      const pastime_external_spec_t **external_out)
-{
-   const char *open;
-   const char *ident_start;
-   size_t      folder_len;
-   size_t      display_len;
-   size_t      ident_len;
-   size_t      i;
-   bool        is_external = false;
-   char       *display     = NULL;
-   char       *ident       = NULL;
-   const pastime_external_spec_t *spec = NULL;
-
-   if (external_out)
-      *external_out = NULL;
-
-   if (!folder)
-      return false;
-   folder_len = strlen(folder);
-   if (folder_len < 4 || folder[folder_len - 1] != ')')
-      return false;
-
-   /* Match the LAST " (" so display names with their own parens still
-    * work, e.g. "Game Boy Advance (hacks) (mgba)".  folder_len >= 4 above
-    * guarantees no size_t wraparound on (folder_len - 1). */
-   open = NULL;
-   for (i = folder_len - 1; i > 0; i--)
-   {
-      if (folder[i] == '(' && folder[i - 1] == ' ')
-      {
-         open = folder + i;
-         break;
-      }
-   }
-   if (!open)
-      return false;
-
-   ident_start = open + 1;
-   ident_len   = (folder + folder_len - 1) - ident_start;
-   if (ident_len == 0)
-      return false;
-
-   /* Materialise the parenthetical into a NUL-terminated string before
-    * dispatching — both the external marker parser and the libretro
-    * char-class check consume a real C string. */
-   if (!(ident = (char*)malloc(ident_len + 1)))
-      return false;
-   memcpy(ident, ident_start, ident_len);
-   ident[ident_len] = '\0';
-
-   if (ident_len > 4 && strncmp(ident, "ext-", 4) == 0)
-   {
-      const char *payload = NULL;
-      is_external = true;
-      if (!pastime_external_parse_marker(ident, &payload))
-      {
-         RARCH_WARN("[Pastime] malformed ext- marker in folder '%s'\n",
-               folder);
-         free(ident);
-         return false;
-      }
-      /* Dispatch on form: full package (contains '.') vs shortname.
-       * Both lookups are O(N) over the ~94-entry preset table; cheap. */
-      spec = pastime_external_payload_is_shortname(payload)
-         ? pastime_external_lookup_shortname(payload)
-         : pastime_external_lookup(payload);
-      if (!spec)
-      {
-         RARCH_WARN("[Pastime] external emulator '%s' is not in the "
-               "preset table; hiding folder '%s'\n", payload, folder);
-         free(ident);
-         return false;
-      }
-      /* Hide when the resolved app isn't installed — matches the
-       * libretro-folder convention (folders whose core isn't available
-       * stay hidden, no broken-row UX).  Desktop / test stub returns
-       * true so external folders stay visible for development. */
-      if (!pastime_external_is_installed(spec->package))
-      {
-         RARCH_LOG("[Pastime] external app '%s' not installed; hiding "
-               "folder '%s'\n", spec->package, folder);
-         free(ident);
-         return false;
-      }
-   }
-   else
-   {
-      /* libretro core_ident: strict [a-z0-9_]+ */
-      for (i = 0; i < ident_len; i++)
-      {
-         char c = ident[i];
-         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
-         {
-            free(ident);
-            return false;
-         }
-      }
-   }
-
-   /* Display name is everything before the " (".  open points at '(', so
-    * the trailing space sits at open - 1; strip it. */
-   display_len = (size_t)(open - 1 - folder);
-   if (display_len == 0)
-   {
-      free(ident);
-      return false;
-   }
-
-   if (!(display = (char*)malloc(display_len + 1)))
-   {
-      free(ident);
-      return false;
-   }
-   memcpy(display, folder, display_len);
-   display[display_len] = '\0';
-
-   *display_out = display;
-   if (is_external)
-   {
-      free(ident);
-      *ident_out    = NULL;
-      *external_out = spec;
-   }
-   else
-   {
-      *ident_out    = ident;
-      *external_out = NULL;
-   }
-   return true;
-}
 
 static int pastime_system_cmp(const void *a, const void *b)
 {
@@ -1571,16 +1393,8 @@ static void pastime_recompute_total_rows(pastime_handle_t *dp)
       return;
    }
    else
-   {
-      size_t col_rows = 0;
-      if (dp->collection_count > 0)
-         col_rows = (dp->system_count == 0)
-            ? dp->collection_count   /* promoted: each collection is a row */
-            : 1;                     /* grouped: single "Collections" row */
-      dp->total_rows = (pastime_has_recents_row(dp) ? 1 : 0)
-                     + dp->system_count
-                     + col_rows;
-   }
+      dp->total_rows = dp_nav_top_row_count(pastime_has_recents_row(dp),
+            dp->collection_count, dp->system_count);
 
    /* Selection clamp: keep dp->nav.selection in [0, total_rows).
     * dp_nav_set_selection writes both the cache and the top frame
@@ -1935,50 +1749,10 @@ static int64_t pastime_file_mtime(const char *path)
  * since for our use case (10 manual slots that rotate) entries older
  * than a few weeks are a corner case, not the norm.  Returns the
  * string unconditionally (always NUL-terminated). */
-static void pastime_format_relative_time(int64_t mtime,
+static void pastime_format_relative_time_now(int64_t mtime,
       char *out, size_t out_len)
 {
-   int64_t now;
-   int64_t delta;
-   int     n;
-
-   if (out_len == 0)
-      return;
-   out[0] = '\0';
-   if (mtime <= 0)
-   {
-      strlcpy(out, "Unknown", out_len);
-      return;
-   }
-
-   /* time_t is 32-bit on some old Android ABIs (armeabi-v7a, older
-    * NDKs); st.st_mtime there is also 32-bit.  The (int64_t) casts on
-    * both sides truncate identically so the delta is safe — we're not
-    * doing absolute-epoch comparisons that would care about wrap. */
-   now   = (int64_t)time(NULL);
-   delta = now - mtime;
-   if (delta < 0)
-      delta = 0;
-
-   if (delta < 60)
-      strlcpy(out, "Just now", out_len);
-   else if (delta < 60 * 60)
-   {
-      n = (int)(delta / 60);
-      snprintf(out, out_len, "%d minute%s ago", n, n == 1 ? "" : "s");
-   }
-   else if (delta < 24 * 60 * 60)
-   {
-      n = (int)(delta / (60 * 60));
-      snprintf(out, out_len, "%d hour%s ago", n, n == 1 ? "" : "s");
-   }
-   else if (delta < 2 * 24 * 60 * 60)
-      strlcpy(out, "Yesterday", out_len);
-   else
-   {
-      n = (int)(delta / (24 * 60 * 60));
-      snprintf(out, out_len, "%d days ago", n);
-   }
+   pastime_format_relative_time(mtime, (int64_t)time(NULL), out, out_len);
 }
 
 /* Free GPU textures held by the picker entries and zero the array.
@@ -2079,7 +1853,7 @@ static void pastime_savestate_enumerate(pastime_save_entry_t *out,
       out[count].slot   = slot;
       out[count].mtime  = mtime;
       out[count].locked = false;
-      pastime_format_relative_time(mtime,
+      pastime_format_relative_time_now(mtime,
             out[count].label, sizeof(out[count].label));
       /* Tag the autosave so the user can tell it apart from manual
        * saves (esp. when "Just now" matches a recent quit). */
@@ -7009,18 +6783,26 @@ static const char *pastime_nav_label_adapter(void *user, size_t row)
 }
 
 /* Caller guarantees SYSTEM view with valid dp->roms and selection. */
+static void pastime_arm_launch_return(pastime_handle_t *dp,
+      enum pastime_view view, size_t selection, size_t system_idx,
+      const char *display_name)
+{
+   dp->launch_return_view       = view;
+   dp->launch_return_selection  = selection;
+   dp->launch_return_system_idx = system_idx;
+   dp->launch_return_armed      = true;
+   strlcpy(dp->running_game_title, display_name,
+         sizeof(dp->running_game_title));
+   pastime_apply_immersive(dp, true);
+}
+
 static void pastime_launch_system_selection(pastime_handle_t *dp)
 {
    const pastime_system_t *sys = &dp->systems[dp->active_system];
    const pastime_rom_t    *rom = &dp->roms[dp->nav.selection];
    const pastime_source_t *src = &sys->sources[rom->source_idx];
-   dp->launch_return_view       = PASTIME_VIEW_SYSTEM;
-   dp->launch_return_system_idx = dp->active_system;
-   dp->launch_return_selection  = dp->nav.selection;
-   dp->launch_return_armed      = true;
-   strlcpy(dp->running_game_title, rom->display_name,
-         sizeof(dp->running_game_title));
-   pastime_apply_immersive(dp, true);
+   pastime_arm_launch_return(dp, PASTIME_VIEW_SYSTEM,
+         dp->nav.selection, dp->active_system, rom->display_name);
    if (src->external)
    {
       pastime_defaults_cancel_auto_load();
@@ -7034,13 +6816,8 @@ static void pastime_launch_recents_selection(pastime_handle_t *dp)
 {
    if (dp->recents && dp->nav.selection < dp->recent_row_count)
    {
-      dp->launch_return_view      = PASTIME_VIEW_RECENTS;
-      dp->launch_return_selection = 0;
-      dp->launch_return_armed     = true;
-      strlcpy(dp->running_game_title,
-            dp->recents[dp->nav.selection].display_name,
-            sizeof(dp->running_game_title));
-      pastime_apply_immersive(dp, true);
+      pastime_arm_launch_return(dp, PASTIME_VIEW_RECENTS, 0, 0,
+            dp->recents[dp->nav.selection].display_name);
       pastime_launch_recent(dp->recents[dp->nav.selection].pl_idx);
    }
 }
@@ -7050,12 +6827,8 @@ static void pastime_launch_collection_selection(pastime_handle_t *dp)
    if (dp->col_roms && dp->nav.selection < dp->col_rom_count)
    {
       const pastime_col_rom_t *rom = &dp->col_roms[dp->nav.selection];
-      dp->launch_return_view      = PASTIME_VIEW_COLLECTION;
-      dp->launch_return_selection = dp->nav.selection;
-      dp->launch_return_armed     = true;
-      strlcpy(dp->running_game_title, rom->display_name,
-            sizeof(dp->running_game_title));
-      pastime_apply_immersive(dp, true);
+      pastime_arm_launch_return(dp, PASTIME_VIEW_COLLECTION,
+            dp->nav.selection, 0, rom->display_name);
       if (rom->external)
       {
          pastime_defaults_cancel_auto_load();
@@ -7364,38 +7137,27 @@ static int pastime_entry_action(void *userdata, menu_entry_t *entry,
             pastime_launch_collection_selection(dp);
             return 0;
          }
-         /* TOP view: [Recents] + [Collections] + [Systems].
-          * Order mirrors row layout in pastime_row_label. */
          {
-            size_t offset = dp->nav.selection;
-            size_t col_rows;
-
-            if (pastime_has_recents_row(dp))
+            dp_top_row_t r = dp_nav_top_row_dispatch(dp->nav.selection,
+                  pastime_has_recents_row(dp),
+                  dp->collection_count, dp->system_count);
+            switch (r.section)
             {
-               if (offset == 0)
-               {
+               case DP_TOP_RECENTS:
                   pastime_open_recents(dp);
-                  return 0;
-               }
-               offset--;
+                  break;
+               case DP_TOP_COLLECTIONS:
+                  if (dp->system_count == 0
+                        && r.index < dp->collection_count)
+                     pastime_open_collection(dp, r.index);
+                  else
+                     pastime_open_collections(dp);
+                  break;
+               case DP_TOP_SYSTEM:
+                  if (r.index < dp->system_count)
+                     pastime_open_system(dp, r.index);
+                  break;
             }
-
-            col_rows = (dp->collection_count > 0)
-               ? (dp->system_count == 0 ? dp->collection_count : 1)
-               : 0;
-
-            if (offset < col_rows)
-            {
-               if (dp->system_count == 0)
-                  pastime_open_collection(dp, offset);
-               else
-                  pastime_open_collections(dp);
-               return 0;
-            }
-            offset -= col_rows;
-
-            if (offset < dp->system_count)
-               pastime_open_system(dp, offset);
          }
          return 0;
       case MENU_ACTION_CANCEL:

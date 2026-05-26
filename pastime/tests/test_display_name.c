@@ -325,6 +325,127 @@ static void test_strip_rom_extension(void)
    }
 }
 
+/* ---- relative time formatting ---- */
+
+static void reltime_eq(int64_t mtime, int64_t now, const char *want)
+{
+   char buf[64];
+   pastime_format_relative_time(mtime, now, buf, sizeof(buf));
+   ASSERT_STR_EQ(buf, want);
+}
+
+static void test_reltime_just_now(void)
+{
+   reltime_eq(1000000, 1000000, "Just now");
+   reltime_eq(999941, 1000000, "Just now");
+}
+
+static void test_reltime_minutes(void)
+{
+   reltime_eq(999940, 1000000, "1 minute ago");
+   reltime_eq(999100, 1000000, "15 minutes ago");
+   reltime_eq(996401, 1000000, "59 minutes ago");
+}
+
+static void test_reltime_hours(void)
+{
+   reltime_eq(996399, 1000000, "1 hour ago");
+   reltime_eq(964000, 1000000, "10 hours ago");
+}
+
+static void test_reltime_yesterday(void)
+{
+   reltime_eq(913600, 1000000, "Yesterday");
+}
+
+static void test_reltime_days(void)
+{
+   reltime_eq(827200, 1000000, "2 days ago");
+   reltime_eq(100000, 1000000, "10 days ago");
+}
+
+static void test_reltime_unknown(void)
+{
+   reltime_eq(0, 1000000, "Unknown");
+   reltime_eq(-1, 1000000, "Unknown");
+}
+
+static void test_reltime_future(void)
+{
+   /* mtime in the future → delta clamped to 0 → "Just now" */
+   reltime_eq(1000001, 1000000, "Just now");
+}
+
+static void test_reltime_null_safe(void)
+{
+   pastime_format_relative_time(100, 200, NULL, 0);
+   g_pass++;
+}
+
+/* ---- sort prefix stripping ---- */
+
+static void prefix_eq(const char *input, const char *want)
+{
+   const char *got = pastime_display_name_strip_sort_prefix(input);
+   ASSERT_STR_EQ(got, want);
+}
+
+static void test_sort_prefix_basic(void)
+{
+   prefix_eq("1) Game Title",    "Game Title");
+   prefix_eq("01) Game Boy",     "Game Boy");
+   prefix_eq("123) Arcade",      "Arcade");
+   prefix_eq("9) X",             "X");
+}
+
+static void test_sort_prefix_no_space(void)
+{
+   prefix_eq("1)Game",           "Game");
+   prefix_eq("99)Tight",         "Tight");
+}
+
+static void test_sort_prefix_tab_separator(void)
+{
+   prefix_eq("1)\tTabbed",       "Tabbed");
+}
+
+static void test_sort_prefix_no_prefix(void)
+{
+   prefix_eq("Game Title",       "Game Title");
+   prefix_eq("No Prefix",        "No Prefix");
+   prefix_eq("",                  "");
+}
+
+static void test_sort_prefix_missing_paren(void)
+{
+   prefix_eq("1 Game",           "1 Game");
+   prefix_eq("12 Foo",           "12 Foo");
+}
+
+static void test_sort_prefix_only_prefix(void)
+{
+   prefix_eq("1) ",              "");
+   prefix_eq("1)",               "");
+}
+
+static void test_sort_prefix_null(void)
+{
+   const char *got = pastime_display_name_strip_sort_prefix(NULL);
+   g_pass++;
+   (void)got;
+}
+
+static void test_sort_prefix_non_digit_start(void)
+{
+   prefix_eq("A) Not a number",  "A) Not a number");
+   prefix_eq(") No digits",      ") No digits");
+}
+
+static void test_sort_prefix_multi_space(void)
+{
+   prefix_eq("1)   Lots of space", "Lots of space");
+}
+
 int main(void)
 {
    test_clean_strips_parens();
@@ -350,6 +471,23 @@ int main(void)
    test_sort_zero_size_does_not_crash();
    test_sort_truncates_oversize_input();
    test_strip_rom_extension();
+   test_reltime_just_now();
+   test_reltime_minutes();
+   test_reltime_hours();
+   test_reltime_yesterday();
+   test_reltime_days();
+   test_reltime_unknown();
+   test_reltime_future();
+   test_reltime_null_safe();
+   test_sort_prefix_basic();
+   test_sort_prefix_no_space();
+   test_sort_prefix_tab_separator();
+   test_sort_prefix_no_prefix();
+   test_sort_prefix_missing_paren();
+   test_sort_prefix_only_prefix();
+   test_sort_prefix_null();
+   test_sort_prefix_non_digit_start();
+   test_sort_prefix_multi_space();
 
    printf("test_display_name: %d passed, %d failed\n", g_pass, g_fail);
    return g_fail ? 1 : 0;

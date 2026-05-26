@@ -20,6 +20,7 @@
 #define PASTIME_DISPLAY_NAME_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,6 +59,18 @@ void pastime_display_name_strip_rom_extension(char *name);
  * shown to the user.  Safe with display == NULL or empty. */
 void pastime_display_name_sort_key(const char *display,
       char *out, size_t out_size);
+
+/* Strip a leading numeric sort prefix from a display name.  Format:
+ * `<digits>)<optional whitespace><name>`.  Returns a pointer into the
+ * original string past the prefix, or the original pointer unchanged
+ * if no valid prefix is found.  No allocation.  NULL-safe. */
+const char *pastime_display_name_strip_sort_prefix(const char *name);
+
+/* Format a relative time string from an mtime and the current time.
+ * Writes "Just now", "5 minutes ago", "Yesterday", "3 days ago", etc.
+ * mtime <= 0 → "Unknown".  Pure — no I/O, deterministic. */
+void pastime_format_relative_time(int64_t mtime, int64_t now,
+      char *out, size_t out_len);
 
 #ifdef __cplusplus
 }
