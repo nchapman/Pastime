@@ -618,13 +618,9 @@ void ANativeActivity_onCreate(ANativeActivity* activity,
    activity->callbacks->onInputQueueDestroyed   = onInputQueueDestroyed;
    activity->callbacks->onContentRectChanged    = onContentRectChanged;
 
-   /* These are set only for the native activity,
-    * and are reset when it ends. */
-   /* PASTIME: dropped AWINDOW_FLAG_FULLSCREEN so the Java side can
-    * toggle the Android status bar per-mode (visible in the launcher,
-    * hidden in-game).  Game-mode hiding is handled in Java by
-    * SYSTEM_UI_FLAG_FULLSCREEN via attemptToggleImmersiveMode. */
-   ANativeActivity_setWindowFlags(activity, AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
+   /* PASTIME: dropped both AWINDOW_FLAG_FULLSCREEN (Java side toggles
+    * immersive mode per-view) and AWINDOW_FLAG_KEEP_SCREEN_ON (let the
+    * device's normal sleep timer apply — games pause on focus loss). */
 
    if (pthread_key_create(&thread_key, jni_thread_destruct))
       RARCH_ERR("Error initializing pthread_key.\n");
