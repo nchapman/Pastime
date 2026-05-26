@@ -48,7 +48,14 @@ static bool string_is_equal(const char *a, const char *b)
    if (!a || !b) return a == b;
    return strcmp(a, b) == 0;
 }
-#ifndef strlcpy
+#if defined(__APPLE__)
+#define PASTIME_HAVE_STRLCPY 1
+#elif defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 38)
+#define PASTIME_HAVE_STRLCPY 1
+#endif
+#endif
+#if !defined(strlcpy) && !defined(PASTIME_HAVE_STRLCPY)
 static size_t strlcpy(char *dst, const char *src, size_t size)
 {
    size_t len = strlen(src);
